@@ -54,13 +54,21 @@ pub(crate) fn central(project: &Path, since: Option<i64>) -> Result<(BTreeMap<St
                 Value::Object(values) => values.into_iter().collect(),
                 body => serde_json::from_value(body)?,
             };
-            if let Some(tasks) = metrics.remove("_tasks") { return Ok((metrics, tasks)); }
+            if let Some(tasks) = metrics.remove("_tasks") {
+                if !metrics.contains_key("M30") {
+                    let state = super::read_only(&project.join(".state/state.db"))?;
+                    let evidence = task_evidence(&state)?;
+                    let replay = replay_tasks(&state)?;
+                    metrics.insert("M30".to_owned(), super::analytics::lifecycle::first_candidate_report(&state, &evidence, &replay, since)?);
+                }
+                return Ok((metrics, tasks));
+            }
         }
     }
-    central_uncached(project, since, true)
+    central_uncached(project, since, true, true)
 }
 
-pub(crate) fn central_uncached(project: &Path, since: Option<i64>, aggregates: bool) -> Result<(BTreeMap<String, Value>, Value)> {
+pub(crate) fn central_uncached(project: &Path, since: Option<i64>, aggregates: bool, first_candidates: bool) -> Result<(BTreeMap<String, Value>, Value)> {
     let path = project.join(".state/state.db");
     let db = super::read_only(&path)?;
     let table = |name: &str| db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [name], |r| r.get::<_, bool>(0));
@@ -74,9 +82,7 @@ pub(crate) fn central_uncached(project: &Path, since: Option<i64>, aggregates: b
     // Contracts §6 `T` and `A`: evidence for the task's current contract revision.
     // Replay candidates are evaluation artefacts (M49 only), never in `T`.
     let tasks = task_evidence(&db)?;
-    let replay: BTreeSet<String> = if table("replay_candidates")? {
-        db.prepare("SELECT task_id FROM replay_candidates")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
-    } else { BTreeSet::new() };
+    let replay = replay_tasks(&db)?;
     let (mut terminal, mut accepted, mut open, mut without_evidence, mut outside, mut replayed) = (BTreeSet::new(), 0, 0, 0, 0, 0);
     for (task, state, evidence) in &tasks {
         if replay.contains(task) { replayed += 1; continue; }
@@ -88,6 +94,7 @@ pub(crate) fn central_uncached(project: &Path, since: Option<i64>, aggregates: b
     }
     let cohort: Vec<&Attempt> = attempts.iter().filter(|a| terminal.contains(a.task.as_str())).collect();
     let mut metrics = BTreeMap::new();
+    if first_candidates { metrics.insert("M30", super::analytics::lifecycle::first_candidate_report(&db, &tasks, &replay, since)?); }
     metrics.insert("M02", ratio("M02", accepted, terminal.len(), json!({"excluded": {"open": open, "outside_window": outside, "replay_candidate": replayed}})));
     metrics.insert("M07", ratio("M07", cohort.len(), accepted, json!({"attempts_without_decision": cohort.iter().filter(|a| a.decided.is_none()).count(),
         "excluded": {"replay_candidate": replayed}})));
@@ -102,6 +109,11 @@ pub(crate) fn central_uncached(project: &Path, since: Option<i64>, aggregates: b
     for (id, name) in NAMES { if let Some(m) = metrics.get_mut(id) { m["name"] = json!(name); } }
     let metrics: BTreeMap<String, Value> = metrics.into_iter().map(|(id, m)| (id.to_owned(), m)).collect();
     Ok((metrics, json!({"accepted": accepted, "open": open, "succeeded_without_evidence": without_evidence, "terminal": terminal.len(), "replay_candidates": replayed})))
+}
+
+fn replay_tasks(db: &Connection) -> Result<BTreeSet<String>> {
+    let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='replay_candidates')", [], |r| r.get(0))?;
+    Ok(if exists { db.prepare("SELECT task_id FROM replay_candidates")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()? } else { BTreeSet::new() })
 }
 
 /// M08, M09, M15 over certified bound sessions (activity window by session

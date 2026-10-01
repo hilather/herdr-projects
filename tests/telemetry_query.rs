@@ -121,7 +121,7 @@ fn nd(m: &Value) -> (Value, Value, Value) { (m["numerator"].clone(), m["denomina
 fn registry_declares_every_metric_and_gates_families() {
     let p = Planted::new();
     let registry = p.json(&["metrics", "registry", "--json"]);
-    assert_eq!(registry["registry"], "analytics-registry.v2");
+    assert_eq!(registry["registry"], "analytics-registry.v3");
     assert_eq!(registry["rejected_cohorts"], json!({"completed_task": "ambiguous_cohort"}));
     let metrics = registry["metrics"].as_array().unwrap();
     let ids: Vec<&str> = metrics.iter().map(|m| m["id"].as_str().unwrap()).collect();
@@ -506,6 +506,11 @@ fn hot_queries_use_indexes() {
     }
     // Correlated lookups never scan; a missing persistent index in another
     // owner's store is described with its DDL, never created here.
+    for name in ["first_candidate_submissions", "first_candidate_policies", "first_candidate_verdicts"] {
+        let plan = all.iter().find(|q| q["name"] == name).unwrap();
+        assert_eq!(plan["unexpected_scans"], json!([]), "{plan}");
+        assert_eq!(plan["automatic_indexes"], json!([]), "{plan}");
+    }
     let acceptance = all.iter().find(|q| q["name"] == "lifecycle_acceptance_times").unwrap();
     assert_eq!(acceptance["unexpected_scans"], json!([]), "{acceptance}");
     for plan in all.iter().filter(|q| q["verdict"] == "needs_index") {
@@ -653,6 +658,17 @@ fn first_candidate_verification_submission_cohort() {
     assert_eq!(nd(&empty), (json!(0), json!(0), Value::Null));
     assert_eq!(empty["reason"], "empty_denominator");
     assert_eq!(p.query(&["--metric", "M30.v1"])["reason"], "no_producer", "old absent definition stays servable");
+    let m02 = p.query(&["--metric", "M02"]);
+    let m30 = p.query(&["--metric", "M30"]);
+    for metrics in ["M02,M30", "M30,M02"] {
+        let mixed = p.json(&["query", "--json", "--metric", metrics]);
+        for (id, expected) in [("M02", &m02), ("M30", &m30)] {
+            let actual = mixed["results"].as_array().unwrap().iter().find(|r| r["metric_id"] == id).unwrap();
+            for key in ["value", "numerator", "denominator", "coverage", "exclusions", "content_digest", "source_watermarks"] {
+                assert_eq!(actual[key], expected[key], "{metrics}: {id}.{key}");
+            }
+        }
+    }
     let report = p.json(&["report", "--json"]);
     assert_eq!(report["metrics"]["M30"]["value"], "1/2");
     assert_eq!(p.query(&["--metric", "M30"])["detail"], report["metrics"]["M30"]);
@@ -663,11 +679,14 @@ fn first_candidate_verification_submission_cohort() {
     let revision = refreshed["appended"].as_array().unwrap().iter().find(|v| v["cell"]["metric"] == "M30").unwrap()["revision"].as_i64().unwrap();
     assert_eq!(nd(&p.query(&["--metric", "M30", "--as-of-seq", &revision.to_string()])), (json!(1), json!(2), json!("1/2")));
     assert!(p.json(&["analytics", "rebuild", "--verify"])["identical"].as_bool().unwrap());
+    let cached_report = p.json(&["report", "--json"]);
+    assert_eq!(cached_report["metrics"]["M30"], report["metrics"]["M30"]);
     let db = p.db();
     candidate_verdict(&db, "pending", "first", "ci", true, 4000);
     candidate_verdict(&db, "pending", "first", "review", true, 4001);
     drop(db);
     assert_eq!(nd(&p.query(&["--metric", "M30"])), (json!(2), json!(3), json!("2/3")));
+    assert_eq!(p.json(&["report", "--json"])["metrics"]["M30"]["value"], "2/3", "canonical changes invalidate maintained report bodies");
     let restated = p.json(&["analytics", "refresh", "--metric", "M30"]);
     let cell = restated["appended"].as_array().unwrap().iter().find(|v| v["cell"]["metric"] == "M30").unwrap();
     assert_eq!(cell["kind"], "restatement");

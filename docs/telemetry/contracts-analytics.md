@@ -8,11 +8,11 @@ are [contracts.md](contracts.md) §0. Code: `src/telemetry/analytics/`
 (TM4.3). Telemetry never grants launch, changes budgets or accepts results;
 nothing here writes `state.db`.
 
-## 1. Metric registry (`analytics-registry.v2`)
+## 1. Metric registry (`analytics-registry.v3`)
 
 `telemetry <slug> metrics registry [--json]` prints one declared table
 (`registry.rs`) of every metric `telemetry report` or `query` can name:
-M01–M50 and lane C's `flaky_tests`. A change is a new registry version, never
+M01–M50 and lane C's `flaky_tests` and `verification_flip_rate`. A change is a new registry version, never
 an edit in place of a published definition. Per metric:
 
 | field | meaning |
@@ -125,7 +125,7 @@ Plan doc 07 §1. `T`/`A` evidence is exactly contracts §6 (`metrics::task_evide
 
 ### DG1: first-candidate independent verification (M30)
 
-Registry v2 adds native `M30.submission-v1`; the historical absent `M30.v1`
+Registry v3 adds native `M30.submission-v1`; the historical absent `M30.v1`
 remains explicitly servable as `no_producer`. This follows dictionary doc 07
 M30: accepted first candidates / adjudicated first candidates, rather than
 all submitted tasks. No minimum applies to the descriptive query/report ratio.
@@ -159,6 +159,15 @@ values and rankings are suppressed as `insufficient_data`. Policy-body digest
 mixes are reported per arm and differing mixes prevent rankings, as differing difficulty
 mixes already do. Query policy/task-class strata remain separately available.
 There are no new tables, migrations or retention/backup classifications.
+
+First-candidate history is loaded only for M30 native queries/comparisons or
+report derivation. Other lifecycle queries retain the original lifecycle
+watermark; canonical file/head identities invalidate candidate-dependent
+aggregates. Policies and per-submission verdict lookups are prepared once and
+use canonical indexes. Reports reuse central task evidence and maintain the
+M30 body in the validated central-provider aggregate; stale or missing bodies
+fall back to the identical evaluator without a second rich lifecycle load.
+
 
 ## 4. Aggregate revisions (stream `analytics`, version 3)
 

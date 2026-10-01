@@ -341,7 +341,7 @@ it is done. Most of the log already maps to registry metrics:
 
 Cards (gaps that stop those questions being answered):
 - **DG1 M30 first-candidate verification rate — done.** Native
-  `M30.submission-v1` in analytics registry v2 measures accepted first
+  `M30.submission-v1` in analytics registry v3 measures accepted first
   candidates / adjudicated first candidates (dictionary doc 07), with pending
   cases shown separately. First submission time fixes the window; all required
   policies need independent verified receipts. Query, report, export, revisions

@@ -39,6 +39,7 @@ struct Evaluated {
 
 fn evaluate_all(project: &Path, cells: &[Cell]) -> Result<(Vec<Evaluated>, Value)> {
     let mut sources = Sources::new(project)?;
+    sources.include_first_candidate_report = cells.iter().any(|cell| cell.metric.id == "M30");
     sources.use_aggregates = false;
     let watermarks = sources.watermarks()?;
     let mut out = Vec::new();
@@ -172,6 +173,7 @@ pub fn refresh(project: &Path, extra: Option<Cell>) -> Result<Value> {
     let canonical_before = super::inputs::canonical_current(project)?;
     let snapshot = crate::telemetry::EvaluationReads::begin(project)?;
     let mut sources = Sources::new(project)?;
+    sources.include_first_candidate_report = cells.iter().any(|cell| cell.metric.id == "M30");
     if canonical_before != sources.canonical_inputs {
         let keys = cells.iter().map(Cell::key).collect::<Vec<_>>();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).context("acquire analytics writer")?;
@@ -430,7 +432,7 @@ pub fn plans(project: &Path) -> Result<Value> {
         // Acceptance times join every verified result once: with the canonical
         // `verified_results_by_submission` index (0067) SQLite may drive the join from `r`.
         let inherent: &'static [&'static str] = match name { "lifecycle_attempts" => &["a"], "lifecycle_classes" => &["task_classifications"], "lifecycle_replay_candidates" => &["replay_candidates"],
-            "lifecycle_acceptance_times" => &["c", "r"], _ => &["c"] };
+            "lifecycle_acceptance_times" => &["c", "r"], "first_candidate_submissions" => &["a"], "first_candidate_policies" | "first_candidate_verdicts" => &[], _ => &["c"] };
         let proposed = (name == "lifecycle_acceptance_times").then_some("CREATE INDEX verified_results_by_submission ON verified_results(submission_id)");
         out.push(explain(&state, &Plan { name, store: "state.db", owner: "canonical (steward; read-only here)", sql, inherent, proposed })?);
     }

@@ -1027,12 +1027,13 @@ fn scale_2_queries() {
         ("workspace show (pane, fresh process)", vec!["workspace", "show", "--json"]),
         ("workspace digest (fresh process)", vec!["workspace", "digest"]),
     ];
-    // `SCALE_QUERY_SET=light|heavy` splits the list so each run stays under ten
+    // `SCALE_QUERY_SET=light|heavy|dg1` splits the list so each run stays under ten
     // minutes at a million events: heavy = the fleet surfaces, health, report, compare.
     let heavy = |name: &str| ["workspace", "health", "report", "compare"].iter().any(|h| name.starts_with(h));
     let set = std::env::var("SCALE_QUERY_SET").unwrap_or_else(|_| "all".into());
-    let queries: Vec<(&str, Vec<&str>)> = queries.into_iter().filter(|(name, _)| match set.as_str() { "light" => !heavy(name), "heavy" => heavy(name), _ => true }).collect();
-    let in_process = set != "light";
+    let queries: Vec<(&str, Vec<&str>)> = queries.into_iter().filter(|(name, _)| match set.as_str() { "light" => !heavy(name), "heavy" => heavy(name), "dg1" => *name == "report" || *name == "query M02 terminal_cohort", _ => true }).collect();
+    let in_process = !matches!(set.as_str(), "light" | "dg1");
+    let query_bin = std::env::var_os("SCALE_QUERY_BIN");
     let mut samples: std::collections::BTreeMap<String, Vec<Run>> = Default::default();
     let mut rounds: std::collections::BTreeMap<String, Vec<f64>> = Default::default();
     let mut digest_lines = 0;
@@ -1044,7 +1045,14 @@ fn scale_2_queries() {
         for &q in &order {
             let (name, args) = &queries[q];
             for _ in 0..per {
-                let run = telemetry(&d, args).ok();
+                let run = if let Some(binary) = &query_bin {
+                    // Preserve the normal fixture environment when comparing
+                    // a preserved release CLI on the same disk dataset.
+                    let mut c = Command::new(binary);
+                    c.env_clear().env("HOME", d.home()).env("PATH", "/usr/bin:/bin").env("HERDR_BIN_PATH", "/bin/false")
+                        .args(["--root", d.root.to_str().unwrap(), "telemetry", "demo"]).args(args);
+                    measure(c).ok()
+                } else { telemetry(&d, args).ok() };
                 round_samples.entry(name.to_string()).or_default().push(run.wall_ms);
                 samples.entry(name.to_string()).or_default().push(run);
             }
@@ -1087,7 +1095,7 @@ fn scale_2_queries() {
         "round_p50_noise": noise(&rounds[name]),
     }))).collect::<serde_json::Map<_, _>>().into();
     let startup: Vec<f64> = (0..repeats * per).map(|_| cli(&d, &["--version"]).wall_ms).collect();
-    let out = json!({"scale": d.scale, "query_set": set, "loadavg_start": load0, "results": results, "process_startup_ms": dist(&startup),
+    let out = json!({"scale": d.scale, "query_set": set, "query_binary": query_bin.as_ref().map(|b| b.to_string_lossy()).unwrap_or_else(|| BIN.into()), "loadavg_start": load0, "results": results, "process_startup_ms": dist(&startup),
         "digest_section": {"lines": digest_lines, "bytes": digest_bytes}, "context_peek": context, "context_available": context_works, "loadavg_end": load_average()});
     write_results(&dir, &format!("queries-{}", std::env::var("SCALE_TAG").unwrap_or_default()), &out);
 }

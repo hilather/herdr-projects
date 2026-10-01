@@ -93,8 +93,9 @@ fn table(db: &rusqlite::Connection, name: &str) -> rusqlite::Result<bool> {
     db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [name], |r| r.get(0))
 }
 
-fn load(project: &Path) -> Result<Sources> {
-    let tasks = lifecycle::load(project)?;
+fn load(project: &Path, first_candidates: bool) -> Result<Sources> {
+    let mut tasks = lifecycle::load(project)?;
+    if first_candidates { lifecycle::load_first_candidates(project, &mut tasks)?; }
     let db = crate::telemetry::read_only(&project.join(".state/state.db"))?;
     let db = db.unchecked_transaction()?;
     let dispatch_log = table(&db, "dispatch_decisions")?;
@@ -349,7 +350,7 @@ pub(crate) fn workspace(project: &Path, args: &Args) -> Result<Value> { run_repo
 
 fn run_report(project: &Path, args: &Args, workspace: bool) -> Result<Value> {
     let r = request(args)?;
-    let sources = load(project)?;
+    let sources = load(project, r.metrics.iter().any(|m| m.0 == "M30"))?;
     let sidecar = crate::telemetry::sidecar::read(project)?;
     let (body, lineage) = lifecycle::evaluate(&sources.tasks, &lifecycle::Request { metric: r.metrics[0].0, cohort: r.cohort, from: r.from, to: r.to, horizon: r.horizon, by: None });
     let by_id: BTreeMap<&str, &Task> = sources.tasks.iter().map(|t| (t.id.as_str(), t)).collect();

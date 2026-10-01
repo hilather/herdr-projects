@@ -92,6 +92,9 @@ pub fn queries(db: &Connection) -> Result<Vec<(&'static str, String)>> {
     if table(db, "task_classifications")? {
         out.push(("lifecycle_classes", "SELECT task_id,class FROM task_classifications ORDER BY task_id,created_unix_ms,revision".to_owned()));
     }
+    out.extend([("first_candidate_submissions", FIRST_SUBMISSIONS.to_owned()),
+        ("first_candidate_policies", FIRST_POLICIES.to_owned()),
+        ("first_candidate_verdicts", FIRST_VERDICTS.to_owned())]);
     Ok(out)
 }
 
@@ -116,41 +119,75 @@ pub fn load(project: &Path) -> Result<Vec<Task>> {
         Some(sql) => db.prepare(&sql)?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?,
         None => BTreeSet::new(),
     };
-    // Read runs once; repeatedly scanning them for every policy/task would
-    // make every query and report quadratic in the verification history.
-    let mut verdicts = BTreeMap::<(String, String, String), (bool, bool)>::new();
-    let mut runs = db.prepare("SELECT v.submission_id,v.policy_id,v.policy_digest,v.state,
-        r.result_id IS NOT NULL FROM verification_runs v
-        LEFT JOIN verified_results r ON r.run_id=v.run_id AND r.submission_id=v.submission_id AND r.policy_digest=v.policy_digest")?;
-    for row in runs.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, bool>(4)?)))? {
-        let (submission, policy, digest, state, receipt) = row?;
-        let verdict = verdicts.entry((submission, policy, digest)).or_default();
-        verdict.0 |= state == "accepted" && receipt;
-        verdict.1 |= state == "rejected";
-    }
+    Ok(evidence.into_iter().map(|(id, state, accepted)| {
+        let route = routes.get(&id).cloned();
+        let accepted_at = accepted.then(|| times.get(&id).and_then(|(verified, integrated)| if route.as_deref() == Some("verify_only") { *verified } else { *integrated })).flatten();
+        Task { first_candidate: None, attempts: attempts.remove(&id).unwrap_or_default(), class: classes.get(&id).cloned(), route, accepted, accepted_at, replay: replay.contains(&id), state, id }
+    }).collect())
+}
+
+/// First submissions are ordered across all attempts and contract revisions.
+/// Walk attempts once and use the canonical attempt index for their submissions.
+const FIRST_SUBMISSIONS: &str = "SELECT a.task_id,s.submission_id,s.attempt_id,s.contract_revision,s.created_unix_ms
+    FROM attempts a CROSS JOIN result_submissions s WHERE s.attempt_id=a.id
+    ORDER BY a.task_id,s.created_unix_ms,s.submission_id";
+const FIRST_POLICIES: &str = "SELECT policy_id,body FROM acceptance_policies
+    WHERE task_id=?1 AND contract_revision=?2 ORDER BY policy_id";
+const FIRST_VERDICTS: &str = "SELECT v.policy_id,v.policy_digest,v.state,
+    EXISTS(SELECT 1 FROM verified_results r WHERE r.submission_id=v.submission_id
+        AND r.run_id=v.run_id AND r.policy_digest=v.policy_digest)
+    FROM verification_runs v WHERE v.submission_id=?1";
+
+/// Only M30 reads candidate/policy/verdict history. Prepare each lookup once;
+/// retries belonging to later submissions cannot contribute to the first.
+fn first_candidates(db: &Connection) -> Result<BTreeMap<String, FirstCandidate>> {
     let mut firsts = BTreeMap::new();
-    let mut stmt = db.prepare("SELECT task_id,submission_id,attempt_id,contract_revision,created_unix_ms
-        FROM result_submissions ORDER BY task_id,created_unix_ms,submission_id")?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?)))?;
+    let mut submissions = db.prepare(FIRST_SUBMISSIONS)?;
+    let mut policies_stmt = db.prepare(FIRST_POLICIES)?;
+    let mut verdicts_stmt = db.prepare(FIRST_VERDICTS)?;
+    let rows = submissions.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?)))?;
     for row in rows {
         let (task, submission, attempt, revision, at) = row?;
         if firsts.contains_key(&task) { continue; }
-        let policies: Vec<(String, String)> = db.prepare("SELECT policy_id,body FROM acceptance_policies WHERE task_id=?1 AND contract_revision=?2 ORDER BY policy_id")?
-            .query_map(rusqlite::params![task, revision], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        let policies: Vec<(String, String)> = policies_stmt.query_map(rusqlite::params![task, revision], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        let mut verdicts = BTreeMap::<(String, String), (bool, bool)>::new();
+        for row in verdicts_stmt.query_map([&submission], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, bool>(3)?)))? {
+            let (policy, digest, state, receipt) = row?;
+            let verdict = verdicts.entry((policy, digest)).or_default();
+            verdict.0 |= state == "accepted" && receipt;
+            verdict.1 |= state == "rejected";
+        }
         let (mut passed, mut rejected) = (0usize, false);
         for (policy, body) in &policies {
             let digest = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(body.as_bytes()));
-            let (accepted, failed) = verdicts.get(&(submission.clone(), policy.clone(), digest)).copied().unwrap_or_default();
+            let (accepted, failed) = verdicts.get(&(policy.clone(), digest)).copied().unwrap_or_default();
             if accepted { passed += 1; } else if failed { rejected = true; }
         }
         let outcome = if policies.is_empty() { "policy_unknown" } else if passed == policies.len() { "accepted" } else if rejected { "rejected" } else { "pending" };
         firsts.insert(task, FirstCandidate { at, attempt, policy: policies.iter().map(|p| p.0.as_str()).collect::<Vec<_>>().join(","), policy_digest: super::sha256(serde_json::to_string(&policies)?.as_bytes()), outcome });
     }
-    Ok(evidence.into_iter().map(|(id, state, accepted)| {
-        let route = routes.get(&id).cloned();
-        let accepted_at = accepted.then(|| times.get(&id).and_then(|(verified, integrated)| if route.as_deref() == Some("verify_only") { *verified } else { *integrated })).flatten();
-        Task { first_candidate: firsts.remove(&id), attempts: attempts.remove(&id).unwrap_or_default(), class: classes.get(&id).cloned(), route, accepted, accepted_at, replay: replay.contains(&id), state, id }
-    }).collect())
+    Ok(firsts)
+}
+
+pub(crate) fn load_first_candidates(project: &Path, tasks: &mut [Task]) -> Result<()> {
+    let db = crate::telemetry::read_only(&project.join(".state/state.db"))?;
+    let mut firsts = first_candidates(&db)?;
+    for task in tasks { task.first_candidate = firsts.remove(&task.id); }
+    Ok(())
+}
+
+/// Report needs no rich lifecycle load: reuse central's task evidence and
+/// replay set. Its M30 body then participates in P2's validated provider cache.
+pub(crate) fn first_candidate_report(db: &Connection, evidence: &[(String, String, bool)], replay: &BTreeSet<String>, since: Option<i64>) -> Result<Value> {
+    let mut firsts = first_candidates(db)?;
+    let tasks: Vec<Task> = evidence.iter().map(|(id, state, accepted)| Task {
+        id: id.clone(), state: state.clone(), accepted: *accepted, accepted_at: None,
+        route: None, class: None, attempts: Vec::new(), replay: replay.contains(id), first_candidate: firsts.remove(id),
+    }).collect();
+    let (mut body, _) = evaluate(&tasks, &Request { metric: "M30", cohort: Cohort::Activity, from: since, to: None, horizon: None, by: None });
+    body["definition"] = json!("M30.submission-v1");
+    body["name"] = json!("first_candidate_verification_rate");
+    Ok(body)
 }
 
 /// Canonical input digest of the extracted rows: the lifecycle source watermark.
@@ -159,7 +196,6 @@ pub fn digest(tasks: &[Task]) -> String {
     let rows: Vec<Value> = tasks.iter().map(|t| {
         let mut row = json!([t.id, t.state, t.accepted, t.accepted_at, t.route, t.class,
             t.attempts.iter().map(|a| json!([a.id, a.state, a.decided, a.reserved, a.ended, a.kind])).collect::<Vec<_>>()]);
-        if let Some(f) = &t.first_candidate && let Value::Array(row) = &mut row { row.push(json!([f.at, f.attempt, f.policy, f.policy_digest, f.outcome])); }
         if t.replay && let Value::Array(row) = &mut row { row.push(json!("replay_candidate")); }
         row
     }).collect();
@@ -168,7 +204,7 @@ pub fn digest(tasks: &[Task]) -> String {
 
 /// Latest event time among the extracted rows (occurrence time, not observation).
 pub fn last_event(tasks: &[Task]) -> Option<i64> {
-    tasks.iter().flat_map(|t| t.attempts.iter().flat_map(|a| [a.decided, a.reserved, a.ended]).chain([t.accepted_at, t.first_candidate.as_ref().map(|f| f.at)])).flatten().max()
+    tasks.iter().flat_map(|t| t.attempts.iter().flat_map(|a| [a.decided, a.reserved, a.ended]).chain([t.accepted_at])).flatten().max()
 }
 
 /// One lineage row: `(entity_kind, entity_id, attrs)`.

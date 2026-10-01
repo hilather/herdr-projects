@@ -1408,6 +1408,126 @@ Files for the P2e resolution/follow-up: accounting migration 0015;
 certificate and the collection/common/analytics contracts. Main's backup
 inventory is preserved without edits.
 
+### 4.15 DG1b: lazy M30 candidates and maintained report bodies (100k only)
+
+Rebased DG1 onto already-fetched `origin/main` **8ec057a**; no fetch, no 1M
+run. **Pending the steward's serial 1M certification.** Registry **v3** adds
+M30 after DG6's registry v2; comparison **v2** follows main's comparison v1.
+This addresses M30's added contribution to L3, without closing L3 at 1M.
+
+Lifecycle extraction no longer reads submissions, verification runs or
+policies for M02/M06/M07 or non-M30 comparisons. Native M30 enriches the
+already-loaded tasks once, including mixed-metric requests in either order.
+The first-submission query walks attempts once and searches
+`result_submissions_by_attempt`; policies and verdicts are prepared once,
+with policy-primary-key and `verification_runs_by_submission` searches.
+Receipt checks use the unique run index. Existing acceptance reads retain
+`verified_results_by_submission`; DG6's tree/policy index and flake producer
+are preserved. Tree-equivalent runs on another submission cannot adjudicate
+M30: its lookup must retain submission identity. Public `analytics plans`
+reports no unexpected scans or automatic indexes for these three new reads;
+the CLI E2E plan test checks the same actual query plans.
+
+Report derives the identical M30 body from central's existing task evidence,
+then maintains it in P2's validated central-provider aggregate. Warm reports
+read that body, with no second rich lifecycle load. Stale/missing projections
+fall back to the same evaluator. Non-M30 central fallback queries do not
+compute M30; refresh includes its report body only when M30 is in the requested
+or tracked set. Canonical file/head identities, input generations and registry
+version validate caches. The ordinary lifecycle watermark keeps main's exact
+serialization independent of lazy candidate enrichment; stored as-of revisions
+are unchanged.
+
+All releases used §1's build command (`--locked --offline -j 3`). Phases 0/1
+prepared one seed-5100 on-disk dataset: 100,000 requested events, 64 active,
+10,000 retained bindings, original producer facts. Every fixture home and
+dataset stayed under `$PWD/bench-data/`; no source or canonical fact was
+regenerated between comparisons. Warm `analytics refresh` runs are outside
+measurement. Phase 2 used `SCALE_EVENTS=100000 SCALE_ACTIVE=64
+SCALE_REPEATS=3`, four samples per round (n=12 per surface), one bench process
+at a time, with no overlapping build or test. Full-phase results are
+`results-queries-dg1-before|main|after.json`; milliseconds:
+
+| Full query phase | Before DG1b p50 / p95 | origin/main p50 / p95 | After DG1b p50 / p95 |
+| --- | ---: | ---: | ---: |
+| Report | 436.44 / 476.14 | 254.11 / 447.56 | 335.02 / 411.16 |
+| M02 terminal cohort query | 369.80 / 397.37 | 297.97 / 321.07 | 339.36 / 371.32 |
+
+Load averages (1/5/15 minutes, start → end): before
+**0.95/2.68/3.28 → 1.11/2.25/3.07**; main
+**1.69/2.69/3.05 → 2.18/2.73/3.04**; after
+**5.29/4.68/3.82 → 3.06/4.18/3.74**. Report p95 decreased; M02 is slower
+than this main sample on the substantially busier after host. That first
+comparison does not establish M02's no-regression requirement.
+
+To resolve that concern, phase 2 adds optional `SCALE_QUERY_SET=dg1` (only
+report and M02, no in-process workspace/context work) and `SCALE_QUERY_BIN`
+(the preserved release CLI; identical isolated environment). Default phase
+behavior and the scale gate are unchanged. A fixed serial order, selected
+before observing its results, ran **main-pre → before → after → main-post**
+on that same dataset. Each phase still uses three repeats / four samples per
+round. Result tags are `dg1-pair-main-pre|before|after|main-post`; milliseconds:
+
+| Focused phase | Report p50 / p95 | M02 p50 / p95 | Load 1/5/15, start → end |
+| --- | ---: | ---: | --- |
+| Main-pre | 299.45 / 306.73 | 344.86 / 365.58 | 4.15/3.68/3.41 → 4.30/3.72/3.43 |
+| Before DG1b | 627.71 / 806.38 | 404.78 / 573.08 | 4.28/3.73/3.43 → 3.99/3.69/3.42 |
+| After DG1b | 263.95 / 285.52 | 298.77 / 307.12 | 3.75/3.64/3.41 → 3.53/3.60/3.39 |
+| Main-post | 232.66 / 242.37 | 277.57 / 282.08 | 3.33/3.56/3.38 → 3.14/3.51/3.37 |
+
+Focused after p95 is below main-pre and the original main p95 for both
+surfaces, and below the unchanged 500 ms target at 100k. The quieter main-post
+is faster than after, and identical main code itself moves by 21%/23% in
+report/M02 p95 across the bracket. All measurements are retained: this is
+provisional evidence that removes the candidate-loading regression, not an
+unqualified speedup or a closed 1M/noise-independent no-regression certificate.
+
+Reproduce focused phases after §1's release build, using the same dataset and
+preserved CLI for each tag:
+
+```
+env PATH=/usr/bin:/bin HERDR_BIN_PATH=/bin/false TMPDIR=$PWD/bench-data/tmp \
+    SCALE_DATA=$PWD/bench-data/dg1 SCALE_EVENTS=100000 SCALE_ACTIVE=64 SCALE_REPEATS=3 \
+    SCALE_QUERY_SET=dg1 SCALE_QUERY_BIN=$PWD/bench-data/<before|main|after>-cli \
+    SCALE_TAG=dg1-pair-<tag> \
+    target/release/deps/telemetry_scale-* --exact scale_2_queries --ignored --test-threads=1 --nocapture
+```
+
+Correctness: deterministic first-submission timestamp/ID ordering, immutable
+policy-body digests, accepted-receipt precedence over rejection, pending and
+unknown-policy exclusions, and the evaluator are unchanged. The full 100k M30
+report body is identical before/after: 5,942 pending first candidates, zero
+adjudicated candidates, null / `empty_denominator`, partial coverage. This
+capacity fixture does not certify positive M30 adjudication; the CLI fixture
+covers accepted/rejected/pending multi-policy candidates, retries, dimensions,
+frozen comparison arms and old as-of revisions. Its extensions check mixed
+M02/M30 ordering and cache invalidation after a real verdict change.
+
+All fifteen requested correctness suites ran with the exact locked/offline
+`-j 3` command and one test thread: **180 passed, 12 ignored, four socket-only
+failures** (`Operation not permitted` at Unix socket bind):
+
+- `telemetry::attempts_show_attention_summary`
+- `telemetry_accounting::attention_intervals_union_and_censor`
+- `telemetry_health::recommendations_and_notices_change_no_canonical_state_and_no_dispatch`
+- `telemetry_workspace::thread_start_records_the_dispatch_reason_and_the_sidebar_suffix`
+
+`scale_gates_hold_under_load` passed unchanged: exact totals, one acceptance,
+pinned as-of reproducibility, byte-identical rebuild and canonical digest.
+Every existing expected metric value is preserved; only registry/comparison
+version pins advance. No unit/source-text coverage, crate or source process
+spawn was added. The final release gate also passed unchanged in **11.36 s**.
+Clippy (`--locked --offline -j 3 --features state-store --test telemetry_query
+--test telemetry_scale --test telemetry_operations`) completed with **zero
+warning locations on lines changed from origin/main**; 98 existing unrelated
+diagnostics remain. Benchmark data is removed before committing.
+
+Files: `src/telemetry/analytics/{lifecycle,query,compare,store,registry}.rs`,
+`src/telemetry/metrics.rs`, `tests/telemetry_{query,scale,health,export}.rs`,
+registry pins in the analytics/export/quality contracts and phase-2 lanes,
+and this certificate. The rebased original DG1 retains its comparison contract
+and CLI cohort coverage.
+
 ## 5. Inefficiencies found and fixed
 
 The first measurement (same generator, same host) missed the query and
@@ -1554,6 +1674,13 @@ owner. None is hidden by loosening the target.
   66.41/93.83/413.84/158.43 ms; refresh 1,630.35 → 1,319.66 ms,
   pending the steward's 1M certification** (§4.14, with phase loads).
   M08 p95 increased; no general speedup or L3 closure is claimed.
+  **DG1b removes M30's unconditional candidate history and second report
+  lifecycle load (§4.15). At 100k/64, focused before → after report/M02 p95
+  806.38/573.08 → 285.52/307.12 ms, at 1-minute loads 4.28 → 3.99 before
+  and 3.75 → 3.53 after; pending the steward's serial 1M certification.**
+  After is below main-pre (306.73/365.58 ms), but quieter main-post
+  (242.37/282.08 ms) and the first busier full-phase M02 result prevent an
+  unqualified no-regression/speedup claim. L3 remains open.
   Owners: accounting lane, analytics (TM4.1).
 - **L4: the ticker's telemetry pass exceeds the 256 MiB envelope at 10,000
   bindings.** The collector itself stays within it (58–115 MB) and its byte

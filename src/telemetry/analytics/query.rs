@@ -43,11 +43,6 @@ pub fn report(project: &Path, since: Option<i64>) -> Result<Value> {
         Ok((metrics, tasks, lanes, after))
     })?;
     for (_, lane) in lanes { metrics.extend(lane); }
-    let (mut first, _) = lifecycle::evaluate(&lifecycle::load(project)?, &lifecycle::Request {
-        metric: "M30", cohort: Cohort::Activity, from: since, to: None, horizon: None, by: None });
-    first["definition"] = json!("M30.submission-v1");
-    first["name"] = json!("first_candidate_verification_rate");
-    metrics.insert("M30".into(), first);
     let mut report = json!({"metrics": metrics, "since_unix_ms": since, "tasks": tasks});
     if !after.is_empty() { report["after_termination"] = json!(after); }
     Ok(report)
@@ -210,8 +205,10 @@ pub struct Sources<'a> {
     pub project: &'a Path,
     pub tasks: Vec<Task>,
     tasks_loaded: bool,
+    first_candidates_loaded: bool,
     watermarks: Option<Value>,
     pub(crate) use_aggregates: bool,
+    pub(crate) include_first_candidate_report: bool,
     pub(crate) bodies: BTreeMap<(Option<i64>, String), BTreeMap<String, Value>>,
     pub(crate) canonical_inputs: Value,
     pub(crate) input_generations: BTreeMap<String, i64>,
@@ -222,7 +219,7 @@ impl<'a> Sources<'a> {
         let canonical_inputs = super::inputs::canonical(project)?;
         let input_generations = crate::telemetry::sidecar::read(project)?.as_deref()
             .map(super::inputs::generations).transpose()?.flatten().unwrap_or_default();
-        Ok(Sources { project, tasks: Vec::new(), tasks_loaded: false, watermarks: None, bodies: BTreeMap::new(), canonical_inputs, input_generations, use_aggregates: true })
+        Ok(Sources { project, tasks: Vec::new(), tasks_loaded: false, first_candidates_loaded: false, watermarks: None, bodies: BTreeMap::new(), canonical_inputs, input_generations, use_aggregates: true, include_first_candidate_report: false })
     }
 
     fn load_tasks(&mut self) -> Result<()> {
@@ -278,7 +275,7 @@ impl<'a> Sources<'a> {
                 && let Some(body) = super::inputs::cached_metric(&db, group, id, since, &stamp)? { return Ok(Some(body)); }
             let map = match provider {
                     Provider::Central => {
-                        let (mut map, tasks) = crate::telemetry::metrics::central_uncached(self.project, since, self.use_aggregates)?;
+                        let (mut map, tasks) = crate::telemetry::metrics::central_uncached(self.project, since, self.use_aggregates, self.include_first_candidate_report)?;
                         map.insert("_tasks".to_owned(), tasks);
                         map
                     },
@@ -322,6 +319,10 @@ pub fn evaluate(sources: &mut Sources, cell: &Cell) -> Result<(Value, Lineage)> 
     match cell.version.provider {
         Provider::Native => {
             sources.load_tasks()?;
+            if cell.metric.id == "M30" && !sources.first_candidates_loaded {
+                lifecycle::load_first_candidates(sources.project, &mut sources.tasks)?;
+                sources.first_candidates_loaded = true;
+            }
             let request = lifecycle::Request { metric: cell.metric.id, cohort: cell.cohort, from: cell.from, to: cell.to, horizon: cell.horizon, by: cell.by.as_deref() };
             let (mut core, lineage) = lifecycle::evaluate(&sources.tasks, &request);
             if core["cells"].as_array().is_some_and(|cells| cells.len() > MAX_CELLS) {
