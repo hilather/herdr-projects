@@ -164,7 +164,7 @@ fn usage_metrics(sidecar: Option<&Connection>, attempts: &[Attempt], since: Opti
             "SELECT input_tokens,output_tokens,reasoning_tokens,records,models FROM accounting_native_totals WHERE session_id=?1"
         } else {
             "SELECT coalesce(sum(input_tokens),0),coalesce(sum(output_tokens),0),coalesce(sum(reasoning_output_tokens),0),count(*),count(model)
-                FROM codex_usage WHERE session_id=?1 AND accepted=1 AND NOT EXISTS(SELECT 1 FROM codex_usage e WHERE e.session_id=codex_usage.session_id AND e.accepted=1 AND e.response_id IS NOT NULL AND e.response_id=codex_usage.response_id AND e.payload_digest=codex_usage.payload_digest AND e.ordinal<codex_usage.ordinal)"
+                FROM codex_usage WHERE session_id=?1 AND accepted=1 AND NOT EXISTS(SELECT 1 FROM codex_usage e WHERE e.session_id=codex_usage.session_id AND e.accepted=1 AND e.response_id IS NOT NULL AND e.response_id=codex_usage.response_id AND unhex(substr(e.payload_digest,8)) IS unhex(substr(codex_usage.payload_digest,8)) AND e.payload_digest=codex_usage.payload_digest AND e.ordinal<codex_usage.ordinal)"
         };
         let mut totals = db.prepare(sql)?;
         for session in &certified {

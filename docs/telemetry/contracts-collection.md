@@ -2032,3 +2032,15 @@ binds. The steward must rerun these outside the hard sandbox. Final
 completed successfully; existing unrelated warnings remain, with no warnings
 in changed files or lines. No live agent/data access was attempted. A usable
 Cursor collector remains unbuilt pending evidence of an eligible signal.
+## P5 storage layout (ingest 0012; logical contract unchanged)
+
+`source_observations` is now a logical view over compact `WITHOUT ROWID` rows
+and integer string/payload dictionaries. All §3 columns, exact sanitized JSON,
+original digests, timestamps, exceptional IDs and envelope byte counts remain
+servable; no extracted fact substitutes for reported evidence. Canonical
+SHA-256 text is losslessly represented as bytes. Four small Codex payload kinds
+share exact payload/digest pairs; other payloads stay inline. Native metadata
+tables without a public rowid also use `WITHOUT ROWID`. Incremental accounting
+and analytics input triggers remain installed on their physical tables.
+Retention deletes dictionary entries only after their last reference disappears.
+See certificate-scale §4.15 for measured size and operator retention limits.

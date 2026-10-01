@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 
 const STREAMS_TABLE: &str = "CREATE TABLE IF NOT EXISTS telemetry_streams (stream TEXT PRIMARY KEY, version INTEGER NOT NULL CHECK (version >= 0)) STRICT;";
 const CODEX: &[&str] = &[include_str!("../../migrations/telemetry/0001_codex_usage.sql"), include_str!("../../migrations/telemetry/0002_reevaluation.sql"),
-    include_str!("../../migrations/telemetry/0003_read_indexes.sql")];
+    include_str!("../../migrations/telemetry/0003_read_indexes.sql"),
+    include_str!("../../migrations/telemetry/0004_compact_native.sql")];
 
 /// Every stream and its migrations; index + 1 is the stream version.
 fn streams() -> impl Iterator<Item = (&'static str, &'static [&'static str])> {
@@ -79,6 +80,11 @@ pub fn open(project: &Path, create: bool) -> Result<Option<Connection>> {
     }
     let mut db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
     db.busy_timeout(std::time::Duration::from_secs(5))?;
+    // New stores can enable page reclamation without a rewriting VACUUM.
+    // Existing stores retain their mode; switching them remains an operator
+    // maintenance operation because it rewrites the entire file.
+    let pages: i64 = db.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+    if pages == 0 { db.pragma_update(None, "auto_vacuum", "INCREMENTAL")?; }
     // Changing journal mode takes a read lock before upgrading it. Racing
     // first openers can therefore get SQLITE_BUSY without the busy handler
     // running. Retry the standalone pragma after its read lock is released;
@@ -122,7 +128,31 @@ pub(crate) fn migrate(db: &mut Connection) -> Result<()> {
         if from > 0 { tx.execute("INSERT OR IGNORE INTO telemetry_streams(stream,version) VALUES(?1,?2)", rusqlite::params![stream, from])?; }
         for (index, migration) in migrations.iter().enumerate().skip(from) {
             upgraded = true;
-            tx.execute_batch(migration)?;
+            // These storage migrations are already installed when a legacy
+            // stream inventory was lost. Keep the logical views and their rows.
+            let compact = match (stream, index + 1) {
+                ("ingest", 12) => Some("source_observations"),
+                ("analytics", 4) => Some("analytics_lineage"),
+                _ => None,
+            };
+            let installed = compact.map(|name| tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='view' AND name=?1)",
+                [name], |r| r.get::<_, bool>(0))).transpose()?.unwrap_or(false);
+            if !installed {
+                // Rebuilding native tables drops their triggers. Preserve the
+                // original accounting/frontier SQL, then reinstall it on the
+                // replacement tables in this same migration transaction.
+                let triggers: Vec<(String, String)> = if matches!((stream, index + 1), ("codex", 4) | ("ingest", 12) | ("accounting", 16)) {
+                    tx.prepare("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND sql IS NOT NULL")?
+                        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+                } else { Vec::new() };
+                tx.execute_batch(migration)?;
+                for (name, sql) in triggers {
+                    if name.starts_with("analytics_input_source_observations_") { continue; }
+                    let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?1)", [&name], |r| r.get(0))?;
+                    if !exists { tx.execute_batch(&sql)?; }
+                }
+            }
             tx.execute("INSERT INTO telemetry_streams(stream,version) VALUES(?1,?2) ON CONFLICT(stream) DO UPDATE SET version=excluded.version",
                 rusqlite::params![stream, index + 1])?;
         }
@@ -317,7 +347,7 @@ pub(super) fn attempt_usage(db: &Connection, attempt: &str) -> Result<Value> {
     let mut records = 0;
     for (session, ..) in &bound {
         let row: Option<[i64; 7]> = db.prepare_cached("SELECT count(*),sum(input_tokens),sum(cached_input_tokens),sum(cache_write_input_tokens),
-            sum(output_tokens),sum(reasoning_output_tokens),sum(total_tokens) FROM codex_usage WHERE session_id=?1 AND accepted=1 AND NOT EXISTS(SELECT 1 FROM codex_usage e WHERE e.session_id=codex_usage.session_id AND e.accepted=1 AND e.response_id IS NOT NULL AND e.response_id=codex_usage.response_id AND e.payload_digest=codex_usage.payload_digest AND e.ordinal<codex_usage.ordinal)")?.query_row([session],
+            sum(output_tokens),sum(reasoning_output_tokens),sum(total_tokens) FROM codex_usage WHERE session_id=?1 AND accepted=1 AND NOT EXISTS(SELECT 1 FROM codex_usage e WHERE e.session_id=codex_usage.session_id AND e.accepted=1 AND e.response_id IS NOT NULL AND e.response_id=codex_usage.response_id AND unhex(substr(e.payload_digest,8)) IS unhex(substr(codex_usage.payload_digest,8)) AND e.payload_digest=codex_usage.payload_digest AND e.ordinal<codex_usage.ordinal)")?.query_row([session],
             |r| Ok([r.get(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0), r.get::<_, Option<i64>>(2)?.unwrap_or(0), r.get::<_, Option<i64>>(3)?.unwrap_or(0),
                 r.get::<_, Option<i64>>(4)?.unwrap_or(0), r.get::<_, Option<i64>>(5)?.unwrap_or(0), r.get::<_, Option<i64>>(6)?.unwrap_or(0)])).optional()?;
         if let Some(row) = row {

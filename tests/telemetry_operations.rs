@@ -148,6 +148,7 @@ fn retention_classes_are_declared_with_doc09_defaults() {
 fn deleted_sessions_are_tombstoned_and_never_collected_again() {
     let f = collected();
     assert_eq!(f.count("codex_usage"), 2);
+    assert_eq!(f.sidecar().query_row("PRAGMA auto_vacuum", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
     // Fresh and bound to a live attempt: nothing is due.
     assert_eq!(class(&plan(&f), "sidecar.normalized_sessions")["eligible_count"], 0);
     f.sidecar().execute("UPDATE rollout_sources SET observed_unix_ms=observed_unix_ms-?1", [91 * DAY]).unwrap();
@@ -182,7 +183,7 @@ fn deleted_sessions_are_tombstoned_and_never_collected_again() {
     let applied = json_of(&f, &["maintenance", "apply", "--confirm", &digest, "--json"]);
     assert_eq!((applied["deleted"].clone(), applied["tombstones_added"].clone(), applied["canonical_written"].clone()),
         (json!({"sidecar.normalized_sessions": 1}), json!(2), json!(false)));
-    for table in ["codex_usage", "rollout_sources", "collect_offsets", "source_observations", "source_cursors", "usage_entries", "usage_dispositions", "codex_turns", "codex_rate_limits"] {
+    for table in ["codex_usage", "rollout_sources", "collect_offsets", "source_observations", "source_cursors", "source_observation_rows", "source_observation_strings", "source_observation_payloads", "usage_entries", "usage_dispositions", "codex_turns", "codex_rate_limits"] {
         assert_eq!(f.count(table), 0, "{table}");
     }
     // The rollout is still on disk: collect, a copy of the session under another
@@ -215,7 +216,7 @@ fn accounting_intents_stay_until_their_disposition() {
     // Accepted usage not yet in the ledger has no disposition: it stays.
     assert_eq!(class(&plan(&f), "sidecar.normalized_sessions")["blocked"], json!([{"key": format!("session:{SID}"), "reason": "ledger_not_synced"}]));
     f.cli_args(&["accounting", "sync"]);
-    f.sidecar().execute("UPDATE usage_dispositions SET disposition='unresolved' WHERE rowid=(SELECT min(rowid) FROM usage_dispositions)", []).unwrap();
+    f.sidecar().execute("UPDATE usage_dispositions SET disposition='unresolved' WHERE (entry_id,path_digest)=(SELECT entry_id,path_digest FROM usage_dispositions ORDER BY entry_id,path_digest LIMIT 1)", []).unwrap();
     assert_eq!(class(&plan(&f), "sidecar.normalized_sessions")["blocked"], json!([{"key": format!("session:{SID}"), "reason": "accounting_disposition_pending"}]));
     f.cli_args(&["accounting", "sync"]);
     assert_eq!(class(&plan(&f), "sidecar.normalized_sessions")["eligible_count"], 1, "the rebuilt ledger disposed of every entry");
@@ -279,7 +280,7 @@ fn attention_health_and_analytics_expire_without_losing_current_views() {
         CREATE TRIGGER analytics_workspace_metrics_no_delete BEFORE DELETE ON analytics_workspace_metrics BEGIN SELECT RAISE(ABORT,'legacy immutable'); END;
         CREATE TRIGGER analytics_workspace_comparisons_no_delete BEFORE DELETE ON analytics_workspace_comparisons BEGIN SELECT RAISE(ABORT,'legacy immutable'); END;").unwrap();
     f.cli_args(&["analytics", "refresh"]);
-    assert_eq!(json_of(&f, &["analytics", "status"])["version"], 3);
+    assert_eq!(json_of(&f, &["analytics", "status"])["version"], 4);
     let due = plan(&f);
     assert_eq!(class(&due, "sidecar.attention_samples")["eligible"], json!([{"key": "attempt:gone-attempt", "samples": 2}]));
     assert_eq!(class(&due, "sidecar.attention_samples")["blocked"], json!([{"key": format!("attempt:{}", f.attempt), "reason": "attempt_not_terminal"}]));
@@ -764,4 +765,79 @@ fn runbook_transcripts_are_the_fixture_run() {
     seen.sort();
     assert_eq!(seen, expected, "every transcript appears once");
     if std::env::var_os("HERDR_RUNBOOK_WRITE").is_some() { fs::write(RUNBOOK, rewritten).unwrap(); }
+}
+
+/// Upgrade populated legacy storage through the public API, then collect late
+/// usage and reproduce pinned answers through the real CLI.
+#[test]
+fn compact_storage_upgrade_preserves_envelopes_lineage_and_pinned_answers() {
+    let f = collected();
+    f.cli_args(&["analytics", "refresh"]);
+    let logical_rows = |f: &Fixture, sql: &str| f.sidecar().prepare(sql).unwrap()
+        .query_map([], |r| r.get::<_, String>(0)).unwrap().map(Result::unwrap).collect::<Vec<_>>();
+    let envelopes_sql = "SELECT json_array(event_id,schema_version,producer_id,producer_epoch,producer_sequence,event_kind,
+        occurred_unix_ms,observed_unix_ms,identity,provenance,measurement,payload,payload_digest,envelope_bytes)
+        FROM source_observations ORDER BY event_id";
+    let lineage_sql = "SELECT json_array(revision,bucket,ordinal,entity_kind,entity_id,attrs) FROM analytics_lineage ORDER BY revision,bucket,ordinal";
+    let provider_sql = "SELECT json_array(provider,window_key,inputs,body) FROM analytics_provider_aggregates ORDER BY provider,window_key";
+    // Legacy cache JSON need not have the current serializer's whitespace.
+    f.sidecar().execute("UPDATE analytics_provider_aggregates SET body=' '||body||char(10)", []).unwrap();
+    let envelopes = logical_rows(&f, envelopes_sql);
+    let lineage = logical_rows(&f, lineage_sql);
+    let providers = logical_rows(&f, provider_sql);
+    let revisions = json_of(&f, &["analytics", "revisions", "--metric", "M08"]);
+    let revision = revisions["revisions"].as_array().unwrap().last().unwrap()["revision"].to_string();
+    let pinned = json_of(&f, &["query", "--metric", "M08", "--as-of-seq", &revision, "--json"])["results"].clone();
+    let canonical = logical_rows(&f, "SELECT json_array(entry_id,session_id,native,input_tokens,output_tokens) FROM usage_entries ORDER BY entry_id");
+    let state_before = fs::read(f.project.join(".state/state.db")).unwrap();
+    // Materialize real collected rows in the legacy layout. No production
+    // source or migration text is read by this fixture.
+    f.sidecar().execute_batch("BEGIN;
+        CREATE TABLE legacy_observations AS SELECT * FROM source_observations;
+        DROP VIEW source_observations;
+        DROP TABLE source_observation_rows;
+        DROP TABLE source_observation_strings;
+        DROP TABLE source_observation_payloads;
+        ALTER TABLE legacy_observations RENAME TO source_observations;
+        CREATE UNIQUE INDEX legacy_event_id ON source_observations(event_id);
+        CREATE UNIQUE INDEX legacy_source_position ON source_observations(producer_epoch,producer_sequence);
+        CREATE TABLE legacy_lineage AS SELECT * FROM analytics_lineage;
+        DROP VIEW analytics_lineage;
+        DROP TABLE analytics_lineage_rows;
+        DROP TABLE analytics_lineage_values;
+        ALTER TABLE legacy_lineage RENAME TO analytics_lineage;
+        CREATE TABLE legacy_providers AS SELECT * FROM analytics_provider_aggregates;
+        DROP VIEW analytics_provider_aggregates;
+        DROP TRIGGER analytics_provider_revision_delete;
+        DROP TABLE analytics_provider_rows;
+        ALTER TABLE legacy_providers RENAME TO analytics_provider_aggregates;
+        UPDATE telemetry_streams SET version=11 WHERE stream='ingest';
+        UPDATE telemetry_streams SET version=3 WHERE stream='analytics';
+        UPDATE telemetry_streams SET version=3 WHERE stream='codex';
+        UPDATE telemetry_streams SET version=15 WHERE stream='accounting';
+        PRAGMA user_version=3;
+        COMMIT;").unwrap();
+    let db = herdr_projects::telemetry::sidecar::open(&f.project, false).unwrap().unwrap();
+    assert!(!db.prepare("PRAGMA foreign_key_check").unwrap().exists([]).unwrap());
+    drop(db);
+    assert_eq!(logical_rows(&f, envelopes_sql), envelopes);
+    assert_eq!(logical_rows(&f, lineage_sql), lineage);
+    assert_eq!(logical_rows(&f, provider_sql), providers, "cached body bytes survive migration");
+    assert_eq!(logical_rows(&f, "SELECT json_array(entry_id,session_id,native,input_tokens,output_tokens) FROM usage_entries ORDER BY entry_id"), canonical);
+    assert_eq!(json_of(&f, &["query", "--metric", "M08", "--as-of-seq", &revision, "--json"])["results"], pinned);
+    assert!(f.sidecar().execute("DELETE FROM analytics_lineage", []).is_err());
+    assert!(f.sidecar().execute("UPDATE analytics_lineage SET attrs='{}'", []).is_err());
+    // Late collection must still queue the rebuilt native tables' triggers.
+    rollout_as(&f, "00000000-0000-4000-8000-00000000cafe", &["head.jsonl"]);
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.report()["metrics"]["M08"]["value"], 2500);
+    f.cli_args(&["analytics", "refresh"]);
+    let after = json_of(&f, &["query", "--metric", "M08", "--as-of-seq", &revision, "--json"]);
+    for field in ["value", "detail", "source_watermarks"] { assert_eq!(after["results"][0][field], pinned[0][field]); }
+    assert_eq!(after["results"][0]["projection"]["content_digest"], pinned[0]["projection"]["content_digest"]);
+    let verify = json_of(&f, &["analytics", "rebuild", "--verify"]);
+    assert_eq!(verify["identical"], true);
+    assert!(verify["cells"].as_array().unwrap().iter().all(|c| c["stored_intact"] == true));
+    assert_eq!(fs::read(f.project.join(".state/state.db")).unwrap(), state_before);
 }

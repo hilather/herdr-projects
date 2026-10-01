@@ -188,7 +188,7 @@ fn unwritable_sidecar_records_coverage_gap() {
     assert_eq!((f.count("codex_usage"), f.count("source_observations")), (1 + REPEATS as i64, 6 + 4 * REPEATS as i64));
 
     // A sidecar collected before stream `ingest` 0002: the range already read has no envelopes.
-    f.sidecar().execute_batch("DROP TABLE source_observations; DROP TABLE ingest_quarantine; DROP TABLE coverage_gaps; DROP TABLE source_cursors;
+    f.sidecar().execute_batch("DROP VIEW source_observations; DROP TABLE source_observation_rows; DROP TABLE source_observation_strings; DROP TABLE source_observation_payloads; DROP TABLE ingest_quarantine; DROP TABLE coverage_gaps; DROP TABLE source_cursors;
         UPDATE telemetry_streams SET version=1 WHERE stream='ingest'").unwrap();
     append(&path, &tail(&f, 1).replace("@SID@", SID));
     f.cli("collect");

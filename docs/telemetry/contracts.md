@@ -13,7 +13,8 @@ needs a new reviewed revision, not a silent reinterpretation.
 - Sidecar streams (phase 2, card S0): `telemetry.db` is versioned per stream
   in `telemetry_streams(stream, version)`: `codex` (§5, migrations under
   `migrations/telemetry/`, also `user_version`; 3 adds TM5.1's read indexes,
-  certificate-scale.md §5), and one stream per lane under
+  certificate-scale.md §5; 4 adds lossless storage compaction, §4.15), and
+  one stream per lane under
   `migrations/telemetry/<stream>/`: `ingest`, `accounting`, `quality` (0004 adds DG6d/e rerun observations; contracts-quality.md §6),
   `review`,
   `analytics` (TM4.1 aggregate revisions), `health` (TM4.5 alert

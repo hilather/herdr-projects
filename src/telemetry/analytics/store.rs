@@ -248,6 +248,10 @@ pub fn refresh(project: &Path, extra: Option<Cell>) -> Result<Value> {
             super::inputs::stamp(group, &sources.canonical_inputs, &sources.input_generations), serde_json::to_string(body)?)))
         .collect::<Result<Vec<_>>>()?;
     drop(snapshot);
+    let bodies = bodies.into_iter().map(|(group, window, inputs, body)| {
+        let reference = super::compact::reference(&db, &body)?;
+        Ok((group, window, inputs, body, reference))
+    }).collect::<Result<Vec<_>>>()?;
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).context("acquire analytics writer")?;
     let locked = std::time::Instant::now();
     let current = super::inputs::generations(&tx)?.unwrap_or_default();
@@ -270,11 +274,20 @@ pub fn refresh(project: &Path, extra: Option<Cell>) -> Result<Value> {
             tx.execute("INSERT INTO analytics_workspace_comparisons(body,recorded_unix_ms) VALUES(?1,?2)", rusqlite::params![comparison, now])?;
         }
     }
-    for (group, window, inputs, body) in bodies {
+    for (group, window, inputs, body, reference) in bodies {
         if inputs != super::inputs::stamp(&group, &canonical, &current) { continue; }
-        tx.prepare_cached("INSERT INTO analytics_provider_aggregates(provider,window_key,inputs,body) VALUES(?1,?2,?3,?4)
-            ON CONFLICT(provider,window_key) DO UPDATE SET inputs=excluded.inputs,body=excluded.body")?
-            .execute(rusqlite::params![group, window, inputs, body])?;
+        let reference = match reference {
+            Some(reference) if tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM analytics_revisions WHERE revision=?1)")?
+                .query_row([reference.revision], |r| r.get::<_, bool>(0))? => Some(reference),
+            _ => None,
+        };
+        let (prefix, suffix) = reference.as_ref().map(|r| (&body[..r.range.start], &body[r.range.end..])).unwrap_or((&body, ""));
+        tx.prepare_cached("INSERT INTO analytics_provider_rows(provider,window_key,inputs,body,suffix,m40_revision,m40_offset,m40_bytes)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(provider,window_key) DO UPDATE SET
+            inputs=excluded.inputs,body=excluded.body,suffix=excluded.suffix,m40_revision=excluded.m40_revision,
+            m40_offset=excluded.m40_offset,m40_bytes=excluded.m40_bytes")?
+            .execute(rusqlite::params![group, window, inputs, prefix, suffix, reference.as_ref().map(|r| r.revision),
+                reference.as_ref().map(|r| r.offset), reference.as_ref().map(|r| r.bytes)])?;
     }
     tx.commit()?;
     write_lock_ms += locked.elapsed().as_secs_f64() * 1000.0;

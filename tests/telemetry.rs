@@ -549,12 +549,12 @@ fn sidecar_streams_upgrade_v2_store() {
     let expected = |extra: (&str, i64)| {
         let mut streams: std::collections::BTreeMap<String, i64> = herdr_projects::telemetry::LANES.iter().filter(|l| !l.migrations.is_empty())
             .map(|l| (l.stream.to_owned(), l.migrations.len() as i64)).collect();
-        streams.insert("codex".to_owned(), 3);
+        streams.insert("codex".to_owned(), 4);
         streams.insert(extra.0.to_owned(), extra.1);
         streams.into_iter().collect::<Vec<_>>()
     };
-    assert_eq!(streams(&f), expected(("codex", 3)));
-    assert_eq!(user_version(&f), 3);
+    assert_eq!(streams(&f), expected(("codex", 4)));
+    assert_eq!(user_version(&f), 4);
     let before = tree(&state);
     assert_eq!(f.cli_args(&["usage", "--json"]).1, v2, "usage is byte-identical after the upgrade");
     assert_eq!(metric(&f.report(), "M08")["value"], 1000);

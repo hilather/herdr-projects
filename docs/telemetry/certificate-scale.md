@@ -29,7 +29,7 @@ for either. This is not a certification of an OTLP transport.
 | --- | --- |
 | Source | branch `telemetry/tm51-scale-certification` from `main` `20a763f`, plus the fixes in §5 |
 | Build | `cargo test --release --locked --offline -j 3 --features state-store --test telemetry_scale --no-run` (rustc 1.98.0), system SQLite 3.53.4 |
-| Stores | canonical `SCHEMA = 68`; sidecar streams `codex` 3, `ingest` 11, `accounting` 16, `quality` 3, `analytics` 3, `health` 1, `policies` 1 |
+| Stores | canonical `SCHEMA = 68`; sidecar streams `codex` 4, `ingest` 12, `accounting` 17, `quality` 4, `analytics` 4, `health` 1, `policies` 1, `otlp` 2 |
 | CPU / memory | Intel Core i7-8750H, 6 cores / 12 threads, 62 GiB RAM, zram swap |
 | Disk | Intel SSDPEKNW010T8 NVMe, LUKS, btrfs (`compress=zstd:3`). Every dataset lived under `bench-data/` on this disk, never on the RAM-backed `/tmp` |
 | OS | Linux 7.2.3-arch1-3 |
@@ -1591,6 +1591,178 @@ expectations are unchanged; only accounting stream and registry pins advance.
 Focused final M10 workflows also pass. Clippy (`--locked --offline -j 3`,
 state-store, changed test targets plus scale) has no warnings in changed lines;
 pre-existing unrelated diagnostics remain.
+### 4.15 P5 / L6 follow-up: lossless sidecar storage (100k only)
+
+Branch `perf/sidecar-size`, 2026-10-01. **Pending the steward's serial 1M
+certification.** Doc 10 sets no numeric storage target; the steward requires
+at least halving sidecar bytes per collected rollout byte. This cold-ingest
+comparison meets that target by **50.101%**. No 1M run or live service was used.
+
+Build and phases use §1's commands with `SCALE_EVENTS=100000 SCALE_ACTIVE=64
+SCALE_REPEATS=3`: release `--locked --offline -j 3`, then `scale_0_generate`
+and `scale_1_ingest`, one process at a time. The latter produces **one cold
+sample**, regardless of `SCALE_REPEATS`; these are not three-sample timing
+percentiles. Both runs restore the same initial fixture at the same absolute
+paths, including canonical bytes and source contents. Phase 0 replants the
+same simulated quality/attention facts. The 64 active files' mtimes are
+refreshed before each run to reproduce their initial freshness after the long
+builds; native event timestamps and contents are unchanged. Every dataset,
+copy and SQLite measurement lives on disk under `bench-data/`, removed before
+commit. The host is the shared i7-8750H / Linux 7.2.5-3-omarchy workstation.
+
+| `scale_1_ingest`, 100k/64 | Before | After |
+| --- | --- | --- |
+| Rollout bytes actually read | 53,714,270 | 53,714,270 |
+| Sidecar database bytes | 209,563,648 | 104,570,880 |
+| Sidecar WAL bytes at measurement | 0 | 0 |
+| Sidecar bytes / rollout bytes | 3.901452× | 1.946799× |
+| Collection wall time / peak RSS | 24,225.53 ms / 60,980 KiB | 23,498.86 ms / 60,788 KiB |
+| Accounting sync wall time / peak RSS | 3,661.90 ms / 58,468 KiB | 5,098.86 ms / 61,372 KiB |
+| Analytics refresh wall time / peak RSS | 2,736.18 ms / 210,052 KiB | 3,187.65 ms / 192,452 KiB |
+| Health evaluation wall time / peak RSS | 2,345.97 ms / 88,484 KiB | 2,721.56 ms / 88,928 KiB |
+| Load averages (1 / 5 / 15 min), start | 4.83 / 4.22 / 3.78 | 4.78 / 4.25 / 3.74 |
+| Load averages (1 / 5 / 15 min), end | 4.54 / 4.24 / 3.81 | 4.54 / 4.25 / 3.77 |
+
+Loads differ, so timings are observations, not a certified speedup. Both
+results report zero violations, unchanged canonical digests and the same
+19,800 accepted usage records: input 202,285,731; cached 50,862,666; output
+20,258,435; reasoning 5,062,106. The size target uses the physical file, not
+logical payload sums or an estimated compressed filesystem allocation.
+
+Measured with `SELECT name,sum(pgsize) FROM dbstat GROUP BY name ORDER BY 2
+DESC` (bytes; indexes listed separately):
+
+| Consumer | Before | After |
+| --- | --- | --- |
+| Envelope table / compact rows | 73,175,040 | 23,732,224 |
+| Envelope event-id index | 8,908,800 | 0 (derived identity) |
+| Envelope epoch/sequence index | 7,991,296 | 0 (compact primary key) |
+| Envelope string dictionary / unique index | — | 200,704 / 208,896 |
+| Shared sanitized payload dictionary / unique index | — | 12,288 / 12,288 |
+| Lineage table / compact rows | 18,649,088 | 2,449,408 |
+| Lineage value dictionary / entity lookup index | — | 3,002,368 / 471,040 |
+| Provider aggregate cache / compact rows | 9,486,336 | 20,480 |
+| Dispositions table | 2,953,216 | 3,010,560 |
+| Dispositions duplicate primary-key index | 2,805,760 | 0 |
+| Native response lookup index | 2,859,008 | 2,048,000 |
+| Dispatch headroom (unchanged) | 10,240,000 | 10,240,000 |
+| Immutable analytics revisions (unchanged) | 9,916,416 | 9,916,416 |
+| Accounting usage entries (unchanged) | 6,668,288 | 6,668,288 |
+| Native usage table (unchanged) | 5,087,232 | 5,087,232 |
+| Quota observations (unchanged) | 4,816,896 | 4,816,896 |
+
+The envelope and its extracted native facts are **both still kept**:
+contracts-collection §3/§5 requires sanitized reported evidence, including
+uncertified fields that extraction cannot replace. Full payload JSON, headers,
+timestamps, certification, original digests and `envelope_bytes` reconstruct
+exactly through `source_observations`. Repeated headers and four small Codex
+payload kinds share exact strings; canonical SHA-256 text uses binary bytes
+only when losslessly reversible. Noncanonical digests and exceptional event
+IDs stay inline. Native tables without a public rowid and dispositions use
+`WITHOUT ROWID`; `codex_usage` retains its rowid watermarks. Lineage shares
+exact `(entity_kind,entity_id,attrs)` values, keeping ordinals and immutable
+revision bodies. Provider caches reference an immutable M40 byte range only
+after byte equality; revision expiry evicts that disposable cache, allowing
+the existing source evaluator fallback. Legacy cache bodies migrate unchanged,
+even with different JSON whitespace. No metric, coverage or as-of rule changes.
+
+Stream versions advance to `codex` 4 / `ingest` 12 / `accounting` 17 /
+`analytics` 4. SQL `INSERT ... SELECT` copies rows in-place within the existing
+atomic migration transaction, using SQLite's bounded pager/temp storage rather
+than loading histories into Rust memory. Per-collection interning caches cap at
+128 entries each. Native-table rebuilds preserve accounting 0012 incremental
+triggers; analytics input-frontier triggers reinstall on the physical tables.
+
+`EXPLAIN QUERY PLAN` preserves the indexed paths: epoch/sequence becomes
+string-dictionary lookup plus compact primary key; lineage page becomes its
+primary key plus integer value lookup; response exclusion still searches
+`codex_usage_by_response` by session, response, binary digest, acceptance and
+ordinal, then checks the original digest text. By-path, mixed-turn, quota and
+as-of indexes remain. No useful secondary index was discarded; removed indexes
+are duplicate rowid/primary-key structures or replaced identity access paths.
+
+**Retention and page reclamation.** TM5.3 `retention.v1` already defaults to
+90 days for eligible terminal native sessions and attention, 90 days for
+health (also its existing newest-1,000 cap), and 365 days for superseded
+analytics revisions. Applying destructive retention still requires the
+operator's `maintenance plan` / `maintenance apply --confirm <digest>`.
+P5 does **not** silently enable automatic destructive expiry. Holds, active
+attempts, unresolved accounting, latest analytics revisions, valuation/import
+history and tombstones can keep data indefinitely; defaults alone do not give
+a universal finite database bound. For a stable eligible-session arrival rate
+R, the native portion retains approximately 90 × R daily bytes plus active and
+held histories; retained canonical-derived/latest and valuation history is
+additional. L6's automatic-growth requirement therefore remains an operational
+limitation, reported rather than changing the approved plan.
+
+On an isolated copy with only `rollout_sources.observed_unix_ms` aged by 91 days,
+the real default plan expires 926 terminal sessions and protects all 64 active
+ones. Approved apply deletes their native/accounting rows and unreferenced
+interned values without deleting rollout files. After reclaiming all free
+pages in bounded 128-page passes, this fixture occupies **38,195,200 bytes**
+with 64 sources remaining; the retained latest revisions/headroom/quality
+still account for most of that floor. This is a finite-fixture steady-state
+observation, not a bound for indefinitely accumulating canonical history.
+
+New empty sidecars use `auto_vacuum=INCREMENTAL` (mode 2). Existing mode-NONE
+stores retain their setting; enabling it requires an operator-scheduled
+`PRAGMA auto_vacuum=INCREMENTAL; VACUUM;`, an exclusive file rewrite and
+adequate disk space. Measured on a baseline copy, that rewrite alone shrinks
+209,563,648 → 193,880,064 bytes (2.27 s), far short of halving. A compact
+copy's optional `VACUUM` shrinks 104,570,880 → 101,269,504 bytes (1.54 s);
+this extra compaction is excluded from the cold-ingest target. Confirmed
+maintenance drains `incremental_vacuum(128)` outside deletion transactions,
+reclaiming at most 128 free pages per pass. The final isolated retention copy
+measures 104,656,896 bytes before apply → 104,132,608 after apply, exactly
+128 × 4,096 bytes reclaimed; 16,078 free pages remain reusable. Another 126
+bounded passes drain them and pointer-map pages to the 38,195,200-byte floor
+(1.24 s), with canonical bytes unchanged. Unreclaimed pages remain reusable; dictionaries follow
+surviving references instead of retaining deleted session metadata forever.
+
+The unchanged load gate, exact telemetry goldens and migration/late-collect/
+pinned-query/verified-rebuild E2E workflow validate the logical equivalence.
+The E2E upgrade compares every envelope column, lineage row, full cache body
+and ledger entry before/after public-store migration, then collects a late
+session, checks the original pinned answer and verifies stored digests/rebuilds.
+The retention E2E additionally checks incremental-vacuum mode and dictionary
+cleanup. No unit/source-text tests, crates or process spawns were added.
+
+Validation command: `cargo test --locked --offline -j 3 --features state-store
+--no-fail-fast --test telemetry --test telemetry_accounting --test
+telemetry_certification --test telemetry_collect --test telemetry_conformance
+--test telemetry_health --test telemetry_query --test telemetry_views --test
+telemetry_workspace --test telemetry_quality --test telemetry_review --test
+telemetry_compare --test telemetry_export --test telemetry_scale --test
+telemetry_operations` with `RUST_TEST_THREADS=1`; the touched Claude suite is
+also run. The requested suites pass 180 tests, including the unchanged
+`scale_gates_hold_under_load`, with four sandbox-only Unix-socket bind failures;
+Claude adds eight passes. The socket-only failures are
+`telemetry::attempts_show_attention_summary`,
+`telemetry_accounting::attention_intervals_union_and_censor`,
+`telemetry_health::recommendations_and_notices_change_no_canonical_state_and_no_dispatch`,
+and `telemetry_workspace::thread_start_records_the_dispatch_reason_and_the_sidebar_suffix`
+(each `Operation not permitted`; no sandbox workaround). Additional Gemini,
+OpenCode, OTLP and routines suites add 20 passes; OTLP's
+`http_auth_limits_malformed_and_replay` and `http_request_rate_is_bounded`
+fail only because TCP loopback bind also returns `Operation not permitted`.
+These are separate from the four requested-suite Unix-socket failures.
+The final release load gate also passes unchanged (11.34 s).
+Clippy with
+`--locked --offline -j 3 --features state-store` and the touched test targets
+reports no warning in changed lines; existing warnings remain elsewhere.
+
+Files: `migrations/telemetry/0004_compact_native.sql`,
+`migrations/telemetry/ingest/0012_compact_envelopes.sql`,
+`migrations/telemetry/accounting/0017_compact_dispositions.sql`,
+`migrations/telemetry/analytics/0004_compact_lineage.sql`;
+`src/telemetry/{sidecar,metrics}.rs`, `ingest/mod.rs`, `collectors/mod.rs`,
+`accounting/{mod,ledger}.rs`, `analytics/{mod,compact,store}.rs`,
+`maintenance/{mod,backup}.rs` (all relative to `src/telemetry/`);
+`tests/{telemetry,telemetry_accounting,telemetry_claude,telemetry_collect,
+telemetry_conformance,telemetry_operations}.rs`; this certificate,
+`contracts.md`, `contracts-collection.md`, `contracts-analytics.md` and
+`operations-runbook.md` (relative to `docs/telemetry/`). The scale harness,
+including its load-gate body, is unchanged.
 
 ## 5. Inefficiencies found and fixed
 
@@ -1809,9 +1981,16 @@ owner. None is hidden by loosening the target.
   (§4.11; pending the steward's 1M certification).
   Original 1M measurements above remain the last certified ones.
   Owners: TM4.8, TM1.8, TM4.1.
-- **L6: sidecar size.** The sidecar is 2.7–3.1 times the rollout bytes it
-  reads (1.44 GB for 1M events) and grows without retention in this build.
-  Retention and backup belong to TM5.3.
+- **L6: sidecar size — halving target met at 100k by P5; pending the
+  steward's serial 1M certification (§4.15).** The original sidecar was
+  2.7–3.1 times rollout bytes (1.44 GB at 1M). On the same current 100k
+  fixture, lossless storage reduces 209,563,648 → 104,570,880 bytes:
+  3.901452× → 1.946799×, a 50.101% reduction, at start/end 1-minute loads
+  4.83 → 4.54 before / 4.78 → 4.54 after. TM5.3's defaults require an
+  operator-confirmed apply; automatic destructive retention was not enabled.
+  Incremental page reclamation is enabled on new stores. Indefinitely retained
+  valuation/latest history, active attempts and holds still prevent a universal
+  growth bound. The original 1M result remains the last certified one.
 - **L7: workload gaps — addressed for produced signals at 100k by P6;
   pending the steward's 1M certification.** §2 declares the added 5,942 CI
   quality/proxy observations, 329 integration outcomes and 320 waiting-state

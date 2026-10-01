@@ -501,3 +501,16 @@ Limits: fixture evidence only (no live Herdr, provider or ticker); `age` is
 exercised through a deterministic local stand-in because it is not installed
 on the test host; the canonical store backup is a documented procedure, not
 a command.
+
+## P5 physical page reclamation
+
+New sidecars use SQLite `auto_vacuum=INCREMENTAL`. Confirmed maintenance also
+cleans unreferenced envelope/lineage dictionaries and drains at most 128 free
+pages outside the deletion transaction. Remaining free pages are reusable.
+Existing stores retain their vacuum mode: switching mode NONE requires an
+operator-scheduled `PRAGMA auto_vacuum=INCREMENTAL; VACUUM;` with sufficient
+space for the rewrite. No automatic destructive retention is introduced:
+90-day session/attention and 365-day superseded-revision defaults still require
+the reviewed plan and confirmed apply. Active/held sessions and retained
+valuation/latest history can grow indefinitely. Certificate-scale §4.15 records
+the 100k storage, default-retention and vacuum measurements.

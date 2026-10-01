@@ -7,6 +7,7 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::{cell::RefCell, collections::BTreeMap};
 
 /// Wire envelope version (independent of the sidecar schema).
 const SCHEMA_VERSION: i64 = 1;
@@ -41,6 +42,10 @@ pub struct Ledger {
     start: u64,
     /// No cursor existed before this pass.
     pub fresh: bool,
+    // At most 128 interned metadata values per transaction/pass. No event
+    // history is retained, and a rollback drops the cache with this writer.
+    strings: RefCell<BTreeMap<String, i64>>,
+    payloads: RefCell<BTreeMap<String, i64>>,
 }
 
 /// The source record a position holds, as far as the adapter knows it.
@@ -65,7 +70,26 @@ impl Ledger {
         if fresh && start > 0 {
             gap(db, source, 0, start, "predates_ingest", now)?;
         }
-        Ok(Self { source: source.to_owned(), start, fresh })
+        Ok(Self { source: source.to_owned(), start, fresh, strings: RefCell::new(BTreeMap::new()), payloads: RefCell::new(BTreeMap::new()) })
+    }
+
+    fn intern(&self, db: &Connection, value: &str) -> Result<i64> {
+        if let Some(id) = self.strings.borrow().get(value) { return Ok(*id); }
+        db.prepare_cached("INSERT OR IGNORE INTO source_observation_strings(value) VALUES(?1)")?.execute([value])?;
+        let id = db.prepare_cached("SELECT id FROM source_observation_strings WHERE value=?1")?.query_row([value], |r| r.get(0))?;
+        let mut cache = self.strings.borrow_mut();
+        if cache.len() < 128 { cache.insert(value.to_owned(), id); }
+        Ok(id)
+    }
+
+    fn intern_payload(&self, db: &Connection, payload: &str, digest: &str) -> Result<i64> {
+        let key = format!("{digest}:{payload}");
+        if let Some(id) = self.payloads.borrow().get(&key) { return Ok(*id); }
+        db.prepare_cached("INSERT OR IGNORE INTO source_observation_payloads(payload,payload_digest) VALUES(?1,?2)")?.execute(params![payload, digest])?;
+        let id = db.prepare_cached("SELECT id FROM source_observation_payloads WHERE payload=?1 AND payload_digest=?2")?.query_row(params![payload, digest], |r| r.get(0))?;
+        let mut cache = self.payloads.borrow_mut();
+        if cache.len() < 128 { cache.insert(key, id); }
+        Ok(id)
     }
 
     /// The envelope of the Codex record at byte `sequence`, if its kind is
@@ -94,31 +118,51 @@ impl Ledger {
         if bytes > MAX_ENVELOPE {
             return quarantine(db, &self.source, sequence, "envelope_oversized", bytes as u64, Some(&event_id), None, Some(&payload_digest), now);
         }
-        let first: Option<(String, i64, String)> = db.query_row("SELECT payload_digest,coalesce(json_extract(measurement,'$.normalization_version'),1),measurement
-            FROM source_observations WHERE event_id=?1", [&event_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
+        let source_id = self.intern(db, &self.source)?;
+        let first: Option<(String, i64, String)> = db.prepare_cached("SELECT
+            coalesce(CASE WHEN typeof(r.payload_digest)='blob' THEN 'sha256:'||lower(hex(r.payload_digest)) ELSE r.payload_digest END,p.payload_digest),
+            coalesce(json_extract(m.value,'$.normalization_version'),1),m.value
+            FROM source_observation_rows r JOIN source_observation_strings m ON m.id=r.measurement_id
+            JOIN source_observation_strings k ON k.id=r.kind_id
+            LEFT JOIN source_observation_payloads p ON p.id=r.payload_id
+            WHERE r.source_id=?1 AND r.producer_sequence=?2
+            AND coalesce(r.event_id,substr(k.value,1,instr(k.value,'.')-1)||':'||?3||':'||r.producer_sequence)=?4")?
+            .query_row(params![source_id, sequence as i64, self.source, event_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
         match first {
             Some((first, _, stored)) if first == payload_digest && stored == measurement => Ok(()),
             // The same payload read under another certification of its version
             // (A7: a version certified since, or an envelope written before
             // `measurement.certified` existed): its measurement is superseded.
             Some((first, _, _)) if first == payload_digest => {
-                db.execute("UPDATE source_observations SET observed_unix_ms=?2,measurement=?3,envelope_bytes=?4 WHERE event_id=?1",
-                    params![event_id, now, measurement, bytes as i64])?;
+                db.execute("UPDATE source_observations SET observed_unix_ms=?2,measurement=?3,envelope_bytes=?4 WHERE producer_epoch=?1 AND producer_sequence=?5",
+                    params![self.source, now, measurement, bytes as i64, sequence as i64])?;
                 Ok(())
             }
             // Written under an older allowlist of its kind: superseded in place.
             Some((_, older, _)) if older < version => {
                 db.execute("UPDATE source_observations SET event_kind=?2,occurred_unix_ms=?3,observed_unix_ms=?4,identity=?5,provenance=?6,measurement=?7,payload=?8,
-                    payload_digest=?9,envelope_bytes=?10 WHERE event_id=?1",
-                    params![event_id, kind, record.occurred_unix_ms, now, identity, provenance, measurement, payload_text, payload_digest, bytes as i64])?;
+                    payload_digest=?9,envelope_bytes=?10 WHERE producer_epoch=?1 AND producer_sequence=?11",
+                    params![self.source, kind, record.occurred_unix_ms, now, identity, provenance, measurement, payload_text, payload_digest, bytes as i64, sequence as i64])?;
                 Ok(())
             }
             Some((first, _, _)) => quarantine(db, &self.source, sequence, "digest_conflict", bytes as u64, Some(&event_id), Some(&first), Some(&payload_digest), now),
             None => {
-                db.execute("INSERT INTO source_observations(event_id,schema_version,producer_id,producer_epoch,producer_sequence,event_kind,occurred_unix_ms,
-                    observed_unix_ms,identity,provenance,measurement,payload,payload_digest,envelope_bytes) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-                    params![event_id, SCHEMA_VERSION, producer, self.source, sequence as i64, kind, record.occurred_unix_ms, now, identity, provenance,
-                        measurement, payload_text, payload_digest, bytes as i64])?;
+                let producer_id = self.intern(db, &producer)?;
+                let kind_id = self.intern(db, &kind)?;
+                let identity_id = self.intern(db, &identity)?;
+                let provenance_id = self.intern(db, &provenance)?;
+                let measurement_id = self.intern(db, &measurement)?;
+                let shared = matches!(kind.as_str(), "codex.custom_tool_call.v1" | "codex.custom_tool_call_output.v1" | "codex.task_complete.v1" | "codex.turn_context.v1");
+                let payload_id = if shared { Some(self.intern_payload(db, &payload_text, &payload_digest)?) } else { None };
+                let inline_payload = if shared { None } else { Some(payload_text.as_str()) };
+                let inline_digest = if shared { None } else { Some(payload_digest.as_str()) };
+                let override_id = (event_id != format!("{adapter}:{}:{sequence}", self.source)).then_some(event_id.as_str());
+                db.prepare_cached("INSERT INTO source_observation_rows(source_id,producer_sequence,schema_version,producer_id,kind_id,occurred_unix_ms,
+                    observed_unix_ms,identity_id,provenance_id,measurement_id,payload,payload_digest,payload_id,envelope_bytes,event_id)
+                    VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,
+                        CASE WHEN 'sha256:'||lower(hex(unhex(substr(?12,8))))=?12 THEN unhex(substr(?12,8)) ELSE ?12 END,?13,?14,?15)")?
+                    .execute(params![source_id, sequence as i64, SCHEMA_VERSION, producer_id, kind_id, record.occurred_unix_ms, now,
+                        identity_id, provenance_id, measurement_id, inline_payload, inline_digest, payload_id, bytes as i64, override_id])?;
                 Ok(())
             }
         }

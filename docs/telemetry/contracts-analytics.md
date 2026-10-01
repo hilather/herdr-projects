@@ -174,6 +174,7 @@ fall back to the identical evaluator without a second rich lifecycle load.
 
 
 ## 4. Aggregate revisions (stream `analytics`, version 3)
+## 4. Aggregate revisions (stream `analytics`, version 4)
 
 `migrations/telemetry/analytics/0001_aggregate_revisions.sql`:
 
@@ -190,8 +191,13 @@ fall back to the identical evaluator without a second rich lifecycle load.
   `{body, lineage}` (empty buckets omitted); `watermarks` is provenance, not
   content.
 - `analytics_lineage(revision, bucket, ordinal, entity_kind task|attempt,
-  entity_id, attrs)`, `WITHOUT ROWID`, append-only: the drill-down lineage of
-  each revision.
+  entity_id, attrs)`, append-only: the drill-down lineage of each revision.
+  Stream 4 exposes these exact columns through a view over `WITHOUT ROWID`
+  lineage rows and interned exact entity/attrs values; ordinal order and
+  immutable revision bodies/digests are unchanged. Disposable provider caches
+  may share an exactly equal M40 byte range with an immutable revision; expiry
+  evicts that cache and leaves the existing source-evaluation fallback. Legacy
+  JSON is copied byte for byte. See certificate-scale §4.15.
 
 Commands (writes only this stream's tables; needs an existing sidecar, else
 `unavailable: collection_not_run`):

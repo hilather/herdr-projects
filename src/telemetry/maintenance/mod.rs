@@ -155,7 +155,7 @@ const REFERENCES: &[&str] = &["valuations", "valuation_deltas", "valuation_bases
 const ANALYTICS_TRIGGERS: &str = "
 CREATE TRIGGER IF NOT EXISTS analytics_revisions_no_delete BEFORE DELETE ON analytics_revisions
 BEGIN SELECT RAISE(ABORT, 'analytics revision is immutable'); END;
-CREATE TRIGGER IF NOT EXISTS analytics_lineage_no_delete BEFORE DELETE ON analytics_lineage
+CREATE TRIGGER IF NOT EXISTS analytics_lineage_no_delete INSTEAD OF DELETE ON analytics_lineage
 BEGIN SELECT RAISE(ABORT, 'analytics lineage is immutable'); END;";
 
 /// `herdr-projects telemetry <slug> maintenance ...`
@@ -693,7 +693,7 @@ fn quotas(project: &Path, ctx: &Ctx) -> Result<Value> {
 }
 
 fn table(db: &Connection, name: &str) -> Result<bool> {
-    Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [name], |r| r.get(0))?)
+    Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name=?1)", [name], |r| r.get(0))?)
 }
 
 /// Refuse a sidecar holding a per-session table outside the declared deletion scope.
@@ -731,7 +731,8 @@ fn delete_revisions(tx: &Connection, revisions: &[i64]) -> Result<usize> {
         rows += tx.execute("DELETE FROM analytics_lineage WHERE revision=?1", [revision])?;
         rows += tx.execute("DELETE FROM analytics_revisions WHERE revision=?1", [revision])?;
     }
-    tx.execute_batch(ANALYTICS_TRIGGERS)?;
+    let view: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='view' AND name='analytics_lineage')", [], |r| r.get(0))?;
+    tx.execute_batch(&if view { ANALYTICS_TRIGGERS.to_owned() } else { ANALYTICS_TRIGGERS.replace("INSTEAD OF DELETE", "BEFORE DELETE") })?;
     Ok(rows)
 }
 
@@ -793,9 +794,27 @@ pub fn enforce(db: &mut Connection, tombstones: &Tombstones) -> Result<BTreeMap<
             }
         }
     }
-    if !out.is_empty() { super::accounting::ledger::invalidate(&tx, "retention_enforcement")?; }
+    if !out.is_empty() {
+        super::accounting::ledger::invalidate(&tx, "retention_enforcement")?;
+        compact_dictionaries(&tx)?;
+    }
     tx.commit()?;
     Ok(out)
+}
+
+/// Interned metadata follows its surviving source/revision references.
+fn compact_dictionaries(db: &Connection) -> Result<()> {
+    if table(db, "source_observation_rows")? {
+        db.execute_batch("DELETE FROM source_observation_strings WHERE id NOT IN (
+            SELECT source_id FROM source_observation_rows UNION SELECT producer_id FROM source_observation_rows
+            UNION SELECT kind_id FROM source_observation_rows UNION SELECT identity_id FROM source_observation_rows
+            UNION SELECT provenance_id FROM source_observation_rows UNION SELECT measurement_id FROM source_observation_rows);
+            DELETE FROM source_observation_payloads WHERE id NOT IN (SELECT payload_id FROM source_observation_rows WHERE payload_id IS NOT NULL);")?;
+    }
+    if table(db, "analytics_lineage_rows")? {
+        db.execute("DELETE FROM analytics_lineage_values WHERE id NOT IN (SELECT value_id FROM analytics_lineage_rows)", [])?;
+    }
+    Ok(())
 }
 
 /// Remove a tree without following links (Git leaves read-only directories).
@@ -888,6 +907,16 @@ pub fn apply(project: &Path, config_dir: &Path, confirm: Option<&str>, dry_run: 
     }
     // Finish earlier interrupted runs too: every tombstone holds.
     let enforced = match sidecar.as_mut() { Some(db) => enforce(db, &Tombstones::load(&ops)?)?, None => BTreeMap::new() };
+    if let Some(db) = sidecar.as_ref() {
+        compact_dictionaries(db)?;
+        // Reclaim at most 128 pages per operator pass, outside the deletion
+        // transaction. This pragma is a no-op for legacy auto_vacuum=NONE.
+        // The pragma yields once per reclaimed page; drain its rows rather
+        // than stopping after the first sqlite3_step.
+        let mut vacuum = db.prepare("PRAGMA incremental_vacuum(128)")?;
+        let mut pages = vacuum.query([])?;
+        while pages.next()?.is_some() {}
+    }
     let summary = json!({"deleted": deleted, "tombstones_added": tombstoned, "enforced": enforced});
     ops.execute("UPDATE maintenance_runs SET completed_unix_ms=?2,summary=?3 WHERE run_id=?1", params![run, store::now(), summary.to_string()])?;
     Ok(json!({"run_id": run, "plan_digest": plan.digest, "policy": POLICY, "principal": store::PRINCIPAL, "deleted": deleted,

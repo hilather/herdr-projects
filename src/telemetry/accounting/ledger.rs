@@ -223,7 +223,7 @@ pub fn sync(db: &mut Connection) -> Result<Value> {
         SELECT s.session_id,coalesce(sum(u.input_tokens),0),coalesce(sum(u.output_tokens),0),coalesce(sum(u.reasoning_output_tokens),0),count(u.ordinal),count(u.model)
         FROM accounting_selected s LEFT JOIN codex_usage u ON u.session_id=s.session_id AND u.accepted=1
         AND NOT EXISTS(SELECT 1 FROM codex_usage e WHERE e.session_id=u.session_id AND e.accepted=1 AND e.response_id IS NOT NULL
-            AND e.response_id=u.response_id AND e.payload_digest=u.payload_digest AND e.ordinal<u.ordinal) GROUP BY s.session_id;
+            AND e.response_id=u.response_id AND unhex(substr(e.payload_digest,8)) IS unhex(substr(u.payload_digest,8)) AND e.payload_digest=u.payload_digest AND e.ordinal<u.ordinal) GROUP BY s.session_id;
         INSERT INTO accounting_source_summary
         SELECT s.path_digest,s.session_id,
         EXISTS(SELECT 1 FROM codex_usage u WHERE u.path_digest=s.path_digest AND u.reason='cli_version_uncertified'),

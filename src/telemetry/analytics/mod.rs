@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 pub mod compare;
+mod compact;
 pub mod estimators;
 pub mod experiments;
 pub(crate) mod inputs;
@@ -22,7 +23,8 @@ pub const STREAM: &str = "analytics";
 /// `include_str!` of `migrations/telemetry/analytics/`, in order; index + 1 is the stream version.
 pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/analytics/0001_aggregate_revisions.sql"),
     include_str!("../../../migrations/telemetry/analytics/0002_workspace_projections.sql"),
-    include_str!("../../../migrations/telemetry/analytics/0003_input_frontiers.sql")];
+    include_str!("../../../migrations/telemetry/analytics/0003_input_frontiers.sql"),
+    include_str!("../../../migrations/telemetry/analytics/0004_compact_lineage.sql")];
 
 pub(crate) fn sha256(bytes: &[u8]) -> String {
     format!("sha256:{:x}", <sha2::Sha256 as sha2::Digest>::digest(bytes))
