@@ -2285,6 +2285,50 @@ http_request_rate_is_bounded
 thread_start_records_the_dispatch_reason_and_the_sidebar_suffix
 ```
 
+### 4.22 Steward 1M re-certification of L1–L7 (main `628b59f`)
+
+Run by the steward on 2026-10-01, 06:58–07:27, serially: one bench process at a
+time, nothing else from this project running. Release build per §1, Linux
+7.2.5-3-omarchy, same host. The owner's other sessions were active, so the
+1-minute load was 1.25–2.59 throughout (each phase's start/end load is in its
+results file). Dataset: `SCALE_EVENTS=1000000 SCALE_ACTIVE=64`, seed 5100,
+1,006,427 events, 538,865,463 rollout bytes. Phases ran in the order
+0, 1, 2, 3, 4, 8, 9 (health), 9 (analytics), 10, 6, 7, 5, with
+`SCALE_REPEATS=3` and `SCALE_PER_ROUND=1` (queries), and `SCALE_CADENCE_MS=1000` (freshness).
+Every correctness gate held in every phase: no violations, `canonical_unchanged`
+true, and faults and late/slow passed. This supersedes the "pending the
+steward's 1M certification" labels for the cards merged through #207.
+
+| limitation | target | original 1M | re-certified 1M | verdict |
+| --- | --- | --- | --- | --- |
+| L1 admission, telemetry on vs off (configured) | p50 ≤ +5 %, p95 ≤ +10 % | +26.4 % / +12.2 % | 5.67 → 6.48 ms (+14.3 %) / 6.74 → 13.74 ms (+104 %) | **not met** (absolute p95 +7 ms) |
+| L1 reconcile, on vs off | same | +4.0 % / +53.6 % | 3.00 → 2.84 ms (−5.3 %) / 14.86 → 13.98 ms (−5.9 %) | **met** |
+| L2 freshness at 100/s steady | p95 ≤ 5 s | 34.5 s | 40.3 s (p50 17.4 s) | **not met**; burst p95 121 s (was 54.9 s), drain 26.4 s (was 31.8 s). See below |
+| L3 lane/central metrics | p95 ≤ 500 ms | M08 2.5 s, M13 5.8 s, report 7.4 s, view health 8.4 s | M08 27.6 ms, M13 56 ms, report 308 ms, view cost 98 ms, view health 566 ms, view project 664 ms | **met** for M08/M13/report/view cost; view health/project just over |
+| L3 compare / live health | (dashboard 500 ms) | compare M02 7.2 s, health 20.6 s | compare M02 **13.8 s (regressed)**, health 14.0 s | **not met**; compare regressed ~1.9× |
+| L3 native cohort, as-of, export page | p95 ≤ 500 ms | 0.22–0.41 s | 25–344 ms | **met** |
+| L4 accounting sync (warm) | 256 MiB | 13.4–22.5 s, 244 MB | 2.05–2.26 s, 46 MiB | **met** |
+| L4 analytics refresh | 256 MiB | 9.5–11.7 s, 301 MB | p50 0.9 s / p95 2.1 s, 228 MiB | **met** |
+| L4 health evaluate | 256 MiB | 20.2 s, 227 MB | 13.6 s p50, 150 MiB | **met** (memory) |
+| L4 one ticker pass, own process | 256 MiB | 17.9 s, 294 MB | 2.9 s, 226 MiB | **met** |
+| L4 cold first `accounting sync` | 256 MiB | — | 35.2 s, 262 MiB | marginal (one-time cold rebuild) |
+| L5 workspace pane (in process / fresh) | p95 ≤ 250 ms | 16.1 s / 16.0 s | 56.9 ms / 56.5 ms | **met** |
+| L5 digest section (in process / fresh) | ≤ 100 ms | 17.0 s / 18.5 s | 52.2 ms / 57.4 ms | **met** (`context --peek` views on 57 ms vs 2.9 ms off; digest 14 lines, 1,472 B) |
+| L6 sidecar after cold ingest | halve bytes per rollout byte | 1.44 GB, 2.7× | 758.6 MB, **1.41×** | **met in effect** (−47 % vs the original 2.7×; 2.67 → 1.41) |
+| L7 fairness, light-project freshness | p95 ≤ 5 s every round | (100k only: failed round 1) | 11.2 / 16.4 / 11.0 s; hot pass p95 10.8–16.8 s | **not met** |
+| L7 M03 operating throughput | exact planted answer | — | exact `21391200000/2574895800`; query p95 94 ms, report 380 ms | **met** |
+| Collector | 256 MiB, byte caps | 85–115 MB | 81–108 MiB per 256 MiB run, caps held | **met** |
+
+**Freshness (L2) and fairness (L7) share a cause.** In the freshness passes the
+`accounting` step takes p50 0.9 s but reaches 20–22 s in every phase (steady:
+17 passes, max 20.6 s; burst p50 19.8 s), while a sync with nothing new takes
+2.1 s. The light projects in the fairness phase take ~200 ms per pass but wait
+behind the hot project's 11–17 s passes on the shared worker. Card P7
+instruments the accounting sub-steps (full vs incremental replay, quota
+rebuilds, dirty-session fan-out) and fixes the cause, then makes the worker
+fair if it is still needed. Card P8 takes the `compare` regression and live
+`health`. L8 is proved only in the TM5.4 live ramp (owner gate).
+
 ## 5. Inefficiencies found and fixed
 
 The first measurement (same generator, same host) missed the query and
@@ -2362,6 +2406,9 @@ exporter never touches a store while it writes: the query finishes, its
 connections close, then the page is written.
 
 ## 7. Reviewed limitations
+
+The steward's serial 1M re-certification of main `628b59f` (§4.22) gives the
+current verdict for each limitation below. It supersedes their "pending 1M" labels.
 
 Each target that is not met, with its cause, what it would take, and its
 owner. None is hidden by loosening the target.
@@ -2546,6 +2593,12 @@ owner. None is hidden by loosening the target.
   these volumes on this host, nothing about live workers or providers.
 
 ## 8. Verdict
+
+**Re-certification (2026-10-01, §4.22):** at 1M, L4 (memory), L5 (pane and
+digest), L6 (size, 2.7× → 1.41×) and most of L3 now meet their targets, and
+L1 reconcile is within target. Still not met: L1 admission p95, L2 freshness,
+L7 fairness, `compare` (which regressed) and live `health` (cards P7 and P8).
+Correctness held in every phase.
 
 Correctness holds at every scale and under every fault tried: exact totals,
 one acceptance per record, reproducible as-of answers, byte-identical
