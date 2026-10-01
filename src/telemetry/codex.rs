@@ -11,8 +11,10 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use super::{ingest, sanitize};
 
-/// Versions whose counters are accepted: each certified by a live run
-/// (`0.154.0`: docs/telemetry/codex-live-0.154.0.md).
+#[path = "claude.rs"]
+pub(crate) mod claude;
+
+/// Codex versions certified by a live run (docs/telemetry/codex-live-0.154.0.md).
 pub const CERTIFIED: &[&str] = &["0.154.0"];
 /// Longest line parsed; longer lines are skipped whole without being retained.
 const MAX_LINE: u64 = 16 << 20;
@@ -23,7 +25,12 @@ pub fn certified(version: &str) -> bool {
     CERTIFIED.contains(&version)
 }
 
-/// Bytes one collect may read across all rollouts; the rest waits for the next collect.
+/// Adapter-qualified versions keep fixture Claude acceptance separate from live Codex certification.
+pub fn accepted_version(version: &str) -> bool {
+    version.strip_prefix("claude-code/").map_or_else(|| certified(version), |v| claude::FIXTURE_VERSIONS.contains(&v))
+}
+
+/// Bytes one collect may read across all native sources.
 #[derive(Debug, Clone, Copy)]
 pub struct Budget {
     pub bytes: u64,
@@ -73,6 +80,8 @@ impl CanonicalAttempt {
     pub fn codex(&self) -> bool {
         self.kind.as_deref() == Some("codex")
     }
+
+    pub fn supported(&self) -> bool { self.codex() || self.kind.as_deref() == Some("claude") }
 
     pub fn id(&self) -> &str {
         &self.id
@@ -128,7 +137,7 @@ fn canonical(project: &Path) -> Result<(Vec<CanonicalAttempt>, Vec<String>)> {
             attempt.binding = latest.remove(&attempt.id).unwrap_or(Binding::None);
         }
     }
-    let mut homes: Vec<String> = attempts.iter().filter(|a| a.codex()).filter_map(|a| a.home.clone()).collect();
+    let mut homes: Vec<String> = attempts.iter().filter(|a| a.supported()).filter_map(|a| a.home.clone()).collect();
     if table("native_profiles")? {
         let mut stmt = db.prepare("SELECT report FROM native_profiles")?;
         for report in stmt.query_map([], |r| r.get::<_, String>(0))? {
@@ -246,7 +255,12 @@ pub fn collect(project: &Path, budget: Budget, create: bool) -> Result<Option<Co
     terminated_turns(&db, &attempts)?;
     for home in &homes {
         let mut files = Vec::new();
-        walk(&Path::new(home).join(".codex/sessions"), 0, &mut files);
+        if !attempts.iter().any(|a| a.kind.as_deref() == Some("claude") && a.home.as_ref() == Some(home)) || attempts.iter().any(|a| a.codex() && a.home.as_ref() == Some(home)) {
+            walk(&Path::new(home).join(".codex/sessions"), 0, &mut files);
+        }
+        if attempts.iter().any(|a| a.kind.as_deref() == Some("claude") && a.home.as_ref() == Some(home)) {
+            claude::walk(&Path::new(home).join(".claude/projects"), &mut files);
+        }
         files.sort();
         seen.extend(files.iter().map(|file| digest(file.as_os_str().as_encoded_bytes())));
         for file in files {
@@ -256,7 +270,7 @@ pub fn collect(project: &Path, budget: Budget, create: bool) -> Result<Option<Co
                 break;
             }
             let mut span = (0, 0);
-            let read = match tail(&mut db, &file, &digest(home.as_bytes()), &worktrees, remaining, budget.bytes <= Budget::TICK.bytes, &from_start, &tombstones, &mut done, &mut span) {
+            let read = match tail(&mut db, &file, &digest(home.as_bytes()), &worktrees, remaining, budget.bytes <= Budget::TICK.bytes, &from_start, &tombstones, &mut done, &mut span, file.starts_with(Path::new(home).join(".claude/projects"))) {
                 Ok(read) => read,
                 // The pass rolled back: its range is a coverage gap and later
                 // sources wait for the next collect (contracts-collection.md A2).
@@ -290,7 +304,7 @@ fn reread(db: &Connection) -> Result<std::collections::BTreeSet<String>> {
     let sources: Vec<(String, String)> = db.prepare("SELECT s.path_digest,s.cli_version FROM rollout_sources s JOIN collect_offsets o ON o.path_digest=s.path_digest
         WHERE EXISTS(SELECT 1 FROM codex_usage u WHERE u.path_digest=s.path_digest AND u.reason='cli_version_uncertified' AND u.ordinal<=o.records)")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
-    Ok(sources.into_iter().filter(|(_, version)| certified(version)).map(|(key, _)| key).collect())
+    Ok(sources.into_iter().filter(|(_, version)| accepted_version(version)).map(|(key, _)| key).collect())
 }
 
 /// Sources with a session read before the A4 metadata (ingest 0004), the A5
@@ -318,7 +332,7 @@ fn backfill(db: &Connection) -> Result<std::collections::BTreeSet<String>> {
 fn recertify(db: &Connection) -> Result<std::collections::BTreeSet<String>> {
     let sources: Vec<(String, String)> = db.prepare("SELECT s.path_digest,s.cli_version FROM rollout_sources s JOIN rollout_ingest_state x ON x.path_digest=s.path_digest
         WHERE x.uncertified_envelopes=1")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
-    Ok(sources.into_iter().filter(|(_, version)| certified(version)).map(|(key, _)| key).collect())
+    Ok(sources.into_iter().filter(|(_, version)| accepted_version(version)).map(|(key, _)| key).collect())
 }
 
 /// Regular `rollout-*.jsonl` files only; symlinks are never followed.
@@ -731,13 +745,13 @@ fn final_event(tx: &Transaction, ledger: &ingest::Ledger, key: &str, cursor: &Cu
 /// pass resumes at the last committed prefix, with the same native identities.
 #[allow(clippy::too_many_arguments)]
 fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance: u64, bounded: bool, reread: &std::collections::BTreeSet<String>,
-    tombstones: &super::maintenance::Tombstones, done: &mut Collected, span: &mut (u64, u64)) -> Result<u64> {
+    tombstones: &super::maintenance::Tombstones, done: &mut Collected, span: &mut (u64, u64), claude: bool) -> Result<u64> {
     let mut observed = None;
     let (mut pulled, files) = (0, done.files);
     let empty = std::collections::BTreeSet::new();
     loop {
         let (read, more) = tail_batch(db, file, home, worktrees, allowance - pulled, bounded,
-            if pulled == 0 { reread } else { &empty }, tombstones, done, span, &mut observed)?;
+            if pulled == 0 { reread } else { &empty }, tombstones, done, span, &mut observed, claude)?;
         pulled += read;
         // Public collect counts files, not transaction batches.
         if done.files > files { done.files = files + 1; }
@@ -751,7 +765,7 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
 /// Keeping a line atomic preserves malformed/oversized/partial-line semantics.
 #[allow(clippy::too_many_arguments)]
 fn tail_batch(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance: u64, bounded: bool, reread: &std::collections::BTreeSet<String>,
-    tombstones: &super::maintenance::Tombstones, done: &mut Collected, span: &mut (u64, u64), observed: &mut Option<i64>) -> Result<(u64, bool)> {
+    tombstones: &super::maintenance::Tombstones, done: &mut Collected, span: &mut (u64, u64), observed: &mut Option<i64>, claude: bool) -> Result<(u64, bool)> {
     let key = digest(file.as_os_str().as_encoded_bytes());
     let Ok(mut handle) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(file) else { return Ok((0, false)) };
     let meta = handle.metadata()?;
@@ -839,6 +853,16 @@ fn tail_batch(db: &mut Connection, file: &Path, home: &str, worktrees: &str, all
             ledger.malformed(&tx, at, "line_malformed", n, now)?;
             continue;
         };
+        if claude {
+            if !claude::record_line(&tx, &ledger, at, &line, file, &key, home, worktrees, &mut cursor, now, done)? {
+                ledger.malformed(&tx, at, "record_malformed", n, now)?;
+            }
+            if let Some((session, _, _)) = &cursor.session
+                && tombstones.key(super::maintenance::SESSIONS, &format!("session:{session}")).is_some() {
+                return Ok((0, false));
+            }
+            continue;
+        }
         // Unknown kinds are skipped by type tag without reading further.
         if !KINDS.contains(&kind.as_str()) { continue; }
         let first_meta = cursor.session.is_none();
@@ -991,7 +1015,7 @@ fn record(tx: &Transaction, ledger: &ingest::Ledger, at: u64, tag: &Tag, line: &
             }
             match first {
                 // Stored while uncertified, now certified: the same record, evaluated again.
-                Some((first, Some(reason))) if first == payload_digest && reason == "cli_version_uncertified" && certified(version) => {
+                Some((first, Some(reason))) if first == payload_digest && reason == "cli_version_uncertified" && accepted_version(version) => {
                     let (reason, c) = evaluate(&record.usage, version);
                     tx.execute("UPDATE codex_usage SET cache_write_input_tokens=?3,cached_input_tokens=?4,input_tokens=?5,output_tokens=?6,
                         reasoning_output_tokens=?7,total_tokens=?8,accepted=?9,reason=?10 WHERE session_id=?1 AND ordinal=?2",
@@ -1165,7 +1189,7 @@ fn record(tx: &Transaction, ledger: &ingest::Ledger, at: u64, tag: &Tag, line: &
 /// `cli_version_uncertified`; a record not accepted keeps no counters.
 fn evaluate(usage: &Usage, version: &str) -> (Option<&'static str>, [Option<i64>; 6]) {
     let valid = usage.counters().filter(|[_, cached, input, output, reasoning, total]| *total == input + output && cached <= input && reasoning <= output);
-    let reason = if valid.is_none() { Some("invariant_violation") } else if !certified(version) { Some("cli_version_uncertified") } else { None };
+    let reason = if valid.is_none() { Some("invariant_violation") } else if !accepted_version(version) { Some("cli_version_uncertified") } else { None };
     (reason, valid.filter(|_| reason.is_none()).map(|c| c.map(Some)).unwrap_or([None; 6]))
 }
 
@@ -1263,7 +1287,7 @@ fn reconcile_forks(db: &mut Connection) -> Result<()> {
             OR EXISTS(SELECT 1 FROM codex_fork_reconciliation r WHERE r.session_id=s.session_id AND r.state='origin_not_collected'))")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
     let now = jiff::Timestamp::now().as_millisecond();
-    for (session, _) in sessions.into_iter().filter(|(_, version)| certified(version)) {
+    for (session, _) in sessions.into_iter().filter(|(_, version)| accepted_version(version)) {
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         reconcile(&tx, &session, now)?;
         tx.commit()?;
@@ -1314,21 +1338,22 @@ fn terminated_turns(db: &Connection, attempts: &[CanonicalAttempt]) -> Result<()
 /// history made every collect quadratic and fsync-bound (certificate-scale.md §5).
 fn bind(db: &mut Connection, attempts: &[CanonicalAttempt]) -> Result<()> {
     let mut by_id = std::collections::BTreeMap::<&str, Vec<&CanonicalAttempt>>::new();
-    for a in attempts.iter().filter(|a| a.codex()) { by_id.entry(a.id.as_str()).or_default().push(a); }
+    for a in attempts.iter().filter(|a| a.supported()) { by_id.entry(a.id.as_str()).or_default().push(a); }
     let mut after = String::new();
     loop {
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        type Row = (String, String, Option<i64>, Option<String>, String, Option<String>, Option<String>);
-        let sources: Vec<Row> = tx.prepare("SELECT s.path_digest,s.home_digest,s.session_unix_ms,s.cwd_attempt,s.binding,s.attempt_id,b.basis
+        type Row = (String, String, Option<i64>, Option<String>, String, Option<String>, Option<String>, Option<String>);
+        let sources: Vec<Row> = tx.prepare("SELECT s.path_digest,s.home_digest,s.session_unix_ms,s.cwd_attempt,s.binding,s.attempt_id,b.basis,s.originator
             FROM rollout_sources s LEFT JOIN source_bindings b ON b.path_digest=s.path_digest
             WHERE s.path_digest>?1 ORDER BY s.path_digest LIMIT 1000")?
-            .query_map([&after], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?.collect::<rusqlite::Result<_>>()?;
+            .query_map([&after], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?.collect::<rusqlite::Result<_>>()?;
         if sources.is_empty() { break; }
         after = sources.last().expect("nonempty batch").0.clone();
-        for (key, home, at, cwd_attempt, stored, stored_attempt, stored_basis) in sources {
+        for (key, home, at, cwd_attempt, stored, stored_attempt, stored_basis, originator) in sources {
             let rule1 = |h: &Option<String>| h.as_ref().is_some_and(|h| digest(h.as_bytes()) == home);
             let (mut matches, mut refused) = (Vec::new(), None);
             for a in cwd_attempt.as_deref().and_then(|id| by_id.get(id)).into_iter().flatten().copied() {
+                if (originator.as_deref() == Some("claude-code")) != (a.kind.as_deref() == Some("claude")) { continue; }
                 let Some(at) = at.filter(|at| a.decided_unix_ms.is_some_and(|decided| *at >= decided)) else { continue };
                 match &a.binding {
                     Binding::Predates if rule1(&a.home) => matches.push((a, "predates_binding")),

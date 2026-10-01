@@ -34,6 +34,7 @@ pub fn codex_allowlist(kind: &str) -> Option<Vec<(String, Class)>> {
     let fields = |list: &[(&str, Class)]| list.iter().map(|(path, class)| (path.to_string(), *class)).collect::<Vec<_>>();
     let usage = |prefix: &'static str| USAGE.iter().map(move |f| (format!("{prefix}.{f}"), Number));
     Some(match kind {
+        "claude_line" => super::codex::claude::allowlist(),
         "session_meta" => fields(&[("id", Id), ("timestamp", Text), ("cwd", Path), ("cli_version", Text), ("originator", Text), ("source", Tag),
             ("model_provider", Text), ("forked_from_id", Id), ("subagent_kind", Tag), ("subagent_detail", Text), ("subagent_parent_thread_id", Id), ("subagent_depth", Number),
             ("parent_thread_id", Id), ("session_id", Id), ("thread_source", Tag),

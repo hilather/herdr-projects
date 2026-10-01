@@ -379,11 +379,13 @@ Cards (gaps that stop those questions being answered):
     **DG4a follow-up: launch-env wiring** supplies `OTEL_*`, authorization
     and resource attempt/harness identity for product-launched workers;
     exporter JSON compatibility and token lifecycle remain to be reviewed.
-  - **DG4b Claude Code native adapter.** Reads Claude Code session
+  - **Done (DG4b; ingest 0010, accounting 0013): Claude Code native adapter.** Reads Claude Code session
     transcripts (`~/.claude/projects/<project>/<session>.jsonl`) for per-turn
     usage (input/output/cache tokens), model, tool calls and results
     (metadata only), subagents and compaction. Claude Code is already a
     product worker kind, so this is first among the native adapters.
+    Metadata-only synthetic conformance covers 2.1.3 (`fixture`); live
+    certification remains a separate owner-gated step (contracts-collection.md DG4b).
   - **DG4c Gemini CLI native adapter.** Local session logs, plus its OTel
     export through DG4a.
   - **DG4d OpenCode native adapter.** Local session storage; multi-provider,

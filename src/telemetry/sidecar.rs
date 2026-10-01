@@ -148,7 +148,7 @@ pub fn status(project: &Path, stream: &str) -> Result<Value> {
 pub fn report(project: &Path) -> Result<Value> {
     let attempts = super::codex::canonical_attempts(project)?;
     let Some(db) = read(project)? else {
-        let attempts = attempts.iter().map(|a| json!({"attempt_id": a.id, "after_termination": if a.terminated_unix_ms().is_some() { unavailable("collection_not_run") } else { Value::Null }, "usage": unavailable(if a.codex() { "collection_not_run" } else { "adapter_absent" })}));
+        let attempts = attempts.iter().map(|a| json!({"attempt_id": a.id, "after_termination": if a.terminated_unix_ms().is_some() { unavailable("collection_not_run") } else { Value::Null }, "usage": unavailable(if a.supported() { "collection_not_run" } else { "adapter_absent" })}));
         return Ok(json!({"attempts": attempts.collect::<Vec<_>>(), "sessions": []}));
     };
     let mut sessions = Vec::new();
@@ -161,13 +161,18 @@ pub fn report(project: &Path) -> Result<Value> {
         r.get::<_, Option<String>>(10)?)))?;
     for row in rows {
         let (session, binding, attempt, version, records, cwd, originator, source, accepted, quarantined, reevaluation) = row?;
-        sessions.push(json!({"session_id": session, "binding": binding, "attempt_id": attempt, "cli_version": version,
-            "certified": super::codex::certified(&version), "records": records, "accepted": accepted, "quarantined": quarantined,
-            "cwd": cwd, "originator": originator, "source": source, "reevaluation": reevaluation}));
+        let mut row = json!({"session_id": session, "binding": binding, "attempt_id": attempt, "cli_version": version,
+            "certified": super::codex::accepted_version(&version), "records": records, "accepted": accepted, "quarantined": quarantined,
+            "cwd": cwd, "originator": originator, "source": source, "reevaluation": reevaluation});
+        if originator.as_deref() == Some("claude-code") {
+            row["adapter"] = json!("claude-code");
+            row["certification"] = json!(if super::codex::accepted_version(&version) { "fixture" } else { "none" });
+        }
+        sessions.push(row);
     }
     let mut out = Vec::new();
     for attempt in &attempts {
-        let usage = if attempt.codex() { attempt_usage(&db, &attempt.id)? } else { unavailable("adapter_absent") };
+        let usage = if attempt.supported() { attempt_usage(&db, &attempt.id)? } else { unavailable("adapter_absent") };
         let after_termination = after_termination(&db, &attempt.id, attempt.terminated_unix_ms())?;
         out.push(json!({"attempt_id": attempt.id, "usage": usage, "after_termination": after_termination}));
     }
@@ -242,9 +247,9 @@ pub(super) fn attempt_usage(db: &Connection, attempt: &str) -> Result<Value> {
     if bound.iter().any(|s| s.2) {
         return Ok(unavailable("quarantined"));
     }
-    if bound.iter().any(|s| !super::codex::certified(&s.1)) {
+    if bound.iter().any(|s| !super::codex::accepted_version(&s.1)) {
         let mut usage = unavailable("cli_version_uncertified");
-        if let Some(detail) = bound.iter().filter(|s| !super::codex::certified(&s.1)).find_map(|s| s.3.clone()) { usage["detail"] = json!(detail); }
+        if let Some(detail) = bound.iter().filter(|s| !super::codex::accepted_version(&s.1)).find_map(|s| s.3.clone()) { usage["detail"] = json!(detail); }
         return Ok(usage);
     }
     // A record that failed validation keeps no counters: summing the rest
@@ -266,8 +271,9 @@ pub(super) fn attempt_usage(db: &Connection, attempt: &str) -> Result<Value> {
             for (sum, value) in sums.iter_mut().zip(&row[1..]) { *sum += value; }
         }
     }
+    let reasoning = if bound.iter().any(|s| s.0.starts_with("claude-code:")) { unavailable("reasoning_tokens_not_reported") } else { json!(sums[4]) };
     Ok(json!({"input_tokens": sums[0], "cached_input_tokens": sums[1], "cache_write_input_tokens": sums[2],
-        "output_tokens": sums[3], "reasoning_output_tokens": sums[4], "total_tokens": sums[5], "records": records}))
+        "output_tokens": sums[3], "reasoning_output_tokens": reasoning, "total_tokens": sums[5], "records": records}))
 }
 
 fn unavailable(reason: &str) -> Value {

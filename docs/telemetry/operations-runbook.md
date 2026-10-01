@@ -49,7 +49,7 @@ column named in `age_from`).
 
 | Class | Store | Default | Basis | Action |
 | --- | --- | --- | --- | --- |
-| `sidecar.normalized_sessions` | `telemetry.db`, per Codex session: `codex_*`, `rollout_*`, `collect_offsets`, `codex_tool_sources`, `source_bindings`, `source_observations`, `ingest_quarantine`, `coverage_gaps`, `source_cursors`, `usage_entries`, `usage_dispositions`, `model_segments`, `quota_window_observations`, `session_graph_nodes` | 90 d | derivable from the native rollout (tombstoned: never again) | prune, destructive |
+| `sidecar.normalized_sessions` | `telemetry.db`, per native session: `claude_messages`, `claude_tool_results`, `codex_*`, `rollout_*`, `collect_offsets`, `codex_tool_sources`, `source_bindings`, `source_observations`, `ingest_quarantine`, `coverage_gaps`, `source_cursors`, `usage_entries`, `usage_dispositions`, `model_segments`, `quota_window_observations`, `session_graph_nodes` | 90 d | derivable from the native rollout (tombstoned: never again) | prune, destructive |
 | `sidecar.attention_samples` | `attention_samples` | 90 d | source of truth (sampled live, R4) | prune, destructive |
 | `sidecar.health_evaluations` | `health_evaluations` | 90 d | derivable | prune |
 | `sidecar.analytics_revisions` | superseded `analytics_revisions`, their `analytics_lineage` and `analytics_workspace_metrics`; `analytics_workspace_comparisons` outside the window (latest kept) | 365 d | derivable | prune (the current revision of every cell is kept) |
@@ -406,6 +406,8 @@ $ herdr-projects telemetry demo backup restore --from <tmp>/backup-2026-09-30
     "analytics_workspace_comparisons": 0,
     "analytics_workspace_metrics": 0,
     "attention_samples": 0,
+    "claude_messages": 0,
+    "claude_tool_results": 0,
     "codex_usage": 0,
     "fx_tables": 0,
     "health_evaluations": 0,

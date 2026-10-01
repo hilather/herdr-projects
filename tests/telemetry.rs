@@ -317,8 +317,8 @@ fn usage_metrics_follow_certified_sources() {
     let m09 = metric(&report, "M09");
     assert_eq!((&m09["value"], &m09["reasoning_output_tokens"]), (&180.into(), &100.into()), "reasoning is a subset, not added");
     let m13 = metric(&report, "M13");
-    assert_eq!((&m13["numerator"], &m13["denominator"], &m13["value"], &m13["adapter_absent"]), (&1.into(), &2.into(), &"1/2".into(), &1.into()));
-    assert_eq!(m13["incomplete"], serde_json::json!({"not_bound": 1}));
+    assert_eq!((&m13["numerator"], &m13["denominator"], &m13["value"], &m13["adapter_absent"]), (&1.into(), &3.into(), &"1/3".into(), &0.into()));
+    assert_eq!(m13["incomplete"], serde_json::json!({"not_bound": 2}));
     let m15 = metric(&report, "M15");
     assert_eq!((&m15["numerator"], &m15["denominator"], &m15["value"]), (&2.into(), &2.into(), &"2/2".into()));
 }

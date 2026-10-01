@@ -100,6 +100,8 @@ the envelopes of each source are written through, advanced with
 authorizes downstream development (lane D review capture, lane B) only. It
 claims neither paid-account nor production compatibility. The DG4a OTLP
 adapters below are fixture-certified only and do not inherit this live gate.
+claims neither paid-account nor production compatibility. Claude Code now has a fixture-only gate (DG4b below); its live gate remains
+owner-gated. DG4 supersedes owner decision 3 for product harness scope.
 
 **Suite.** `tests/telemetry_conformance.rs` runs the adapter on the CLI over
 one shared corpus (`CASES`: `codex-0.154.0/{head,tail}.jsonl` and
@@ -1368,3 +1370,87 @@ workers' `OTEL_*` endpoint, JSON exporter protocol, authorization header and
 resource `herdr.attempt_id`/`service.name`, with explicit token lifecycle and
 per-harness exporter compatibility. This is a separate card; DG4a does not
 modify launch environments or claim protobuf-only exporters work directly.
+## DG4b: Claude Code native session files (fixture certification)
+
+Owner decision DG4 supersedes the former Codex-only product scope. Adapter
+`claude-code`, interface `session_jsonl`, reads only execution homes retained
+by canonical attempts whose effective profile kind is `claude`. It discovers
+`<execution_home>/.claude/projects/<cwd with / replaced by ->/*.jsonl`;
+there is no fallback to the operator's HOME and no live probe. A source's
+reported absolute cwd must match that exact project slug. Binding uses A1's
+home digest, worktree attempt, decision time and active/revoked/predates
+revision rules; harness kinds must agree. No guessed binding is possible.
+
+The common reader applies the same byte budget, maximum line size, atomic
+cursor updates, incomplete-final-line wait, inode/truncation replay from zero,
+write-failure gaps and maintenance tombstones as Codex. Native session ids
+are namespaced `claude-code:<sessionId>` and stored versions are qualified
+`claude-code/<version>` so neither can collide with Codex. `originator` is
+`claude-code`; source trust remains `collector_observed`.
+
+Privacy allowlist: session id, timestamp, cwd for binding (then the same
+home-redacted source/digested source identity as Codex), version, model,
+API message id, the four native token counts, sidechain flag, tool-use ids
+and names, tool-result links and reported error booleans. The native envelope
+`claude-code.claude_line.v1` stores flattened sanitized metadata, tool id/name
+lists and error counts. Line-type counts and unknown field/type counts are
+obtained from these envelopes; unmapped entries retain **keys only** (up to
+128 names per line, plus the full unmapped count). Unknown
+subtrees are not traversed. Prompts, text, thinking, input, result content,
+`toolUseResult` and summary text are never persisted or hashed. Conformance
+plants `CLAUDE_SECRET_*` strings in every forbidden category and scans the
+sidecar including WAL/SHM after collection and replay.
+
+Ingest **0010** adds `claude_messages` (first source/offset and ordinal per
+session/API message id) and `claude_tool_results` (call id, optional reported
+`is_error`, completion timestamp). Both belong to
+`sidecar.normalized_sessions`, follow the session's retention/tombstones,
+and are included in sidecar backups and backup row inventories. Accounting
+**0013** preserves existing ledger entries/dispositions while admitting the
+`claude-code` source and disjoint cache-write normalization; the ledger stays
+`follows_sources`. No canonical schema change is required.
+
+Usage is counted once per `message.id`, even when an API response spans
+several assistant lines or is seen in another file. The first usage-bearing
+line owns the observation; its same-offset replay dedupes or quarantines a
+changed payload. `claude-code-v1` defines total input as native `input_tokens`
++ `cache_read_input_tokens` + `cache_creation_input_tokens`; new input is the
+native input alone. Total tokens add output. The shared `codex_usage` table
+is a legacy storage name, not adapter provenance; ledger source and entry ids
+identify Claude. Reasoning breakdown is unreported (the compatibility counter
+is zero in the normalized ledger and must not be interpreted as measured
+thinking usage; public attempt and M09 reasoning totals are explicitly
+`unavailable: reasoning_tokens_not_reported` when Claude is included).
+
+Tool calls populate the shared metadata tables by call id. Tool results
+provide M16 executions and M17 outcomes directly from `is_error`; missing
+booleans stay unknown. No shell exit code or run duration is fabricated.
+`isSidechain` turns contribute usage to the reported parent session and
+separate `SubAgentActivity` rows, counted as `sidechain_turns` in M16's
+collaboration breakdown. A source digest plus line byte offset identifies an activity, **not** a
+claimed child session/thread identity; transcript turn uuids are not stored. Compaction contributes a `summary` line count,
+never text or a usage reset. M08/M09 and M15 include bound fixture-version
+Claude usage. Cache-read/write counters and normalized ledger entries are
+ready for DG2's M10 producer (M10 is absent on this base branch).
+
+`collectors capabilities --json` adds a version-aware `claude-code` table.
+**2.1.3 is fixture-only**, with no live-certified version or field. Versions
+outside the fixture set retain metadata and envelopes, but usage counters
+are rejected as `cli_version_uncertified`; their attempt totals are unknown.
+Fixture acceptance is explicit in the adapter table and tool metrics. Live
+certification against a real Claude Code session is a separate owner-gated
+step and was not attempted. Coverage gaps: approval decisions, execution run
+durations, quotas, transport errors, service-tier semantics, a reasoning
+breakdown and child session identity are unavailable; no live semantics are
+claimed.
+
+End-to-end conformance: `tests/telemetry_claude.rs` drives public admission
+and store workflows, then collection/usage/accounting/report CLI entry
+points over synthetic `tests/fixtures/telemetry/claude-code/session.jsonl`
+in temporary execution homes. It covers exact token totals, split-message
+deduplication, tool failures, parent sidechain attribution, unknown keys,
+privacy scans, partial lines, truncation replay, unbound/early sessions,
+uncertified versions and unchanged Codex totals alongside Claude. It also
+proves the v12 accounting upgrade preserves a populated Codex ledger and
+Claude identity/outcome rows survive backup/restore and follow retention
+and tombstones through a later restore.

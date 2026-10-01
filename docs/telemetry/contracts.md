@@ -59,8 +59,10 @@ needs a new reviewed revision, not a silent reinterpretation.
     `ingest` 0006 tool/exec metadata, 0007 subagent detail, per-source ingest
   state, envelope `measurement.certified` and `final_event_missing` gaps,
   0008 MCP calls, subagent and collab items, aborted turns, function call
-  namespaces, fork points and fork reconciliation,
-  contracts-collection.md A6–A8), mode 0600, created on first collect. No
+  namespaces, fork points and fork reconciliation, 0009 terminated turns,
+  0010 Claude Code message identity and reported tool outcomes (DG4b);
+  accounting 0013 adds Claude ledger source/cache normalization,
+  contracts-collection.md A6–A9 and DG4b), mode 0600, created on first collect. No
   cross-database transaction or foreign key; sidecar rows reference canonical
   IDs by value and record `orphan` when the canonical row is missing.
 - **Sidecar durability and bounded collection (P4).** Writer connections use

@@ -40,6 +40,7 @@ struct Mcp { turn: Option<String>, server: Option<String>, tool: Option<String>,
 /// A session's A6 and A8 metadata rows (never content: no such column exists).
 struct Rows {
     calls: Vec<Call>,
+    claude_results: Vec<(String, Option<bool>)>,
     items: Vec<Exec>,
     mcp: Vec<Mcp>,
     /// `turn_id` → `aborted_unix_ms` of each `turn_aborted` (`None`: no line time).
@@ -186,7 +187,7 @@ fn sessions(db: &Connection, since: Option<i64>, blocked: &BTreeMap<String, Vec<
         if since.is_some_and(|since| start.is_none_or(|at| at < since)) { continue; }
         let bound: Vec<&&Source> = sources.iter().filter(|s| s.1 == "bound").collect();
         if bound.is_empty() { *excluded.entry(sources[0].1.clone()).or_default() += 1; continue; }
-        if bound.iter().any(|s| !crate::telemetry::codex::certified(&s.3)) { *excluded.entry("cli_version_uncertified".to_owned()).or_default() += 1; continue; }
+        if bound.iter().any(|s| !crate::telemetry::codex::accepted_version(&s.3)) { *excluded.entry("cli_version_uncertified".to_owned()).or_default() += 1; continue; }
         let attempts: BTreeSet<String> = bound.iter().filter_map(|s| s.2.clone()).collect();
         let tools = if !a6 { Err("predates_collection") } else if sources.iter().any(|s| !s.5) { Err("pending_reread") }
             else if !a8 { Err("predates_collection") } else if sources.iter().any(|s| !s.7) { Err("pending_reread") } else { Ok(rows(db, id)?) };
@@ -244,7 +245,11 @@ fn rows(db: &Connection, session: &str) -> Result<Rows> {
     let activities = db.prepare("SELECT item_id,agent_thread_id FROM codex_agent_items WHERE session_id=?1 AND item_type='SubAgentActivity' ORDER BY item_id")?
         .query_map([session], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
     let collab_items = db.query_row("SELECT count(*) FROM codex_agent_items WHERE session_id=?1 AND item_type='CollabAgentToolCall'", [session], |r| r.get(0))?;
-    Ok(Rows { calls, items, mcp, aborts, namespaces, activities, collab_items })
+    let claude_results = if exists(db, "claude_tool_results")? {
+        db.prepare("SELECT call_id,is_error FROM claude_tool_results WHERE session_id=?1 ORDER BY call_id")?
+            .query_map([session], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+    } else { Vec::new() };
+    Ok(Rows { claude_results, calls, items, mcp, aborts, namespaces, activities, collab_items })
 }
 
 /// Counts over observed sessions.
@@ -266,6 +271,10 @@ struct Tally {
     unattributed: usize,
     succeeded: usize,
     failed: usize,
+    claude_executed: usize,
+    claude_succeeded: usize,
+    claude_failed: usize,
+    claude_unknown: BTreeMap<&'static str, usize>,
     unknown: BTreeMap<&'static str, usize>,
     /// MCP calls (A8): per server and tool, their carrying `exec` call, outcome.
     mcp: usize,
@@ -316,6 +325,22 @@ impl Tally {
                 (Some(called), Some(output)) if output >= called => self.waits.push((c.name.clone(), s.home().map(str::to_owned), output - called)),
                 (Some(_), Some(_)) => self.negative += 1,
                 (None, Some(_)) => {}
+            }
+        }
+        for (id, error) in &rows.claude_results {
+            self.executed += 1;
+            self.claude_executed += 1;
+            *self.by_source.entry("claude-code".to_owned()).or_default() += 1;
+            if let Some(call) = calls.iter().find(|c| c.id == *id) {
+                count(&mut self.attributed, &mut self.attributed_name_unreported, &call.name);
+            } else { self.unattributed += 1; }
+            match error {
+                Some(false) => { self.succeeded += 1; self.claude_succeeded += 1; }
+                Some(true) => { self.failed += 1; self.claude_failed += 1; }
+                None => {
+                    *self.unknown.entry("is_error_unreported").or_default() += 1;
+                    *self.claude_unknown.entry("is_error_unreported").or_default() += 1;
+                }
             }
         }
         for e in items {
@@ -397,8 +422,8 @@ fn computed(list: &[Session], coverage: &Value) -> BTreeMap<String, Value> {
     for s in list { if let Ok(rows) = &s.tools { t.add(s, rows); } }
     let accepted: usize = t.accepted.values().sum();
     let aborted: usize = t.aborted.values().sum();
-    let commands = t.executed - t.mcp;
-    let m16 = json!({"value": {"issued": t.issued, "accepted": {"status": "inferred", "count": accepted, "unknown": t.accepted_unknown,
+    let commands = t.executed - t.mcp - t.claude_executed;
+    let mut m16 = json!({"value": {"issued": t.issued, "accepted": {"status": "inferred", "count": accepted, "unknown": t.accepted_unknown,
             "declined_or_aborted": aborted}, "executed": t.executed},
         "issued": {"calls": t.issued, "by_name": t.by_name, "name_unreported": t.name_unreported, "by_status": t.by_status, "status_unreported": t.status_unreported,
             "by_namespace": t.by_namespace, "without_output": t.without_output, "outputs_without_call": t.outputs_without_call, "mcp_without_call": t.mcp_without_call,
@@ -431,24 +456,40 @@ fn computed(list: &[Session], coverage: &Value) -> BTreeMap<String, Value> {
         "collaboration": {"calls": t.by_namespace.get(COLLABORATION).copied().unwrap_or(0), "spawned_threads": t.spawned.len(), "collab_items": t.collab_items,
             "basis": "function calls in namespace `collaboration` (spawn_agent, wait_agent) and the agent threads a spawn call started (its SubAgentActivity \
                 item id is the call id); not tool executions"},
-        "certified": {"calls": "live", "call_status": "live for custom_tool_call, fixture for function_call", "exec_items": "live", "mcp_calls": "live",
+        "certified": {"calls": if list.iter().any(|s| s.id.starts_with("claude-code:")) { "fixture" } else { "live" }, "call_status": "live for custom_tool_call, fixture for function_call", "exec_items": if list.iter().any(|s| s.id.starts_with("claude-code:")) { "fixture" } else { "live" }, "mcp_calls": "live",
             "turn_aborts": "live", "namespaces": "live"},
         "coverage": coverage});
+    if list.iter().any(|s| s.id.starts_with("claude-code:")) {
+        let sidechain_turns: usize = list.iter().filter(|s| s.id.starts_with("claude-code:")).filter_map(|s| s.tools.as_ref().ok())
+            .map(|r| r.activities.len()).sum();
+        m16["executed"]["scope"].as_array_mut().expect("scope array").push(json!("claude-code"));
+        m16["executed"]["by_scope"]["claude-code"] = json!(t.claude_executed);
+        m16["executed"]["claude_code_basis"] = json!("fixture: distinct tool-result link; attribution by exact call id; outcome from reported is_error");
+        m16["collaboration"]["sidechain_turns"] = json!(sidechain_turns);
+        m16["collaboration"]["claude_code_basis"] = json!("fixture: sidechain turns attributed to parent session, child identity unreported");
+    }
     let mut unknown = t.unknown.clone();
     for (reason, n) in &t.mcp_unknown { *unknown.entry(reason).or_default() += n; }
     let (succeeded, failed) = (t.succeeded + t.mcp_succeeded, t.failed + t.mcp_failed);
     let terminal = succeeded + failed;
     let scope = |succeeded: usize, failed: usize, unknown: &BTreeMap<&str, usize>| json!({"succeeded": succeeded, "failed": failed,
         "unknown": {"executions": unknown.values().sum::<usize>(), "by_reason": unknown}});
+    let mut command_unknown = t.unknown.clone();
+    command_unknown.remove("is_error_unreported");
     let mut m17 = json!({"numerator": succeeded, "denominator": terminal, "succeeded": succeeded, "failed": failed,
         "unknown": {"executions": unknown.values().sum::<usize>(), "by_reason": unknown}, "pending_calls": t.without_output,
-        "by_scope": {"command_execution": scope(t.succeeded, t.failed, &t.unknown), "mcp": scope(t.mcp_succeeded, t.mcp_failed, &t.mcp_unknown)},
+        "by_scope": {"command_execution": scope(t.succeeded - t.claude_succeeded, t.failed - t.claude_failed, &command_unknown), "mcp": scope(t.mcp_succeeded, t.mcp_failed, &t.mcp_unknown)},
         "cancelled": unavailable("cancellation_not_exposed"), "timed_out": unavailable("timeout_not_exposed"),
         "basis": "command_execution: CommandExecution items with status `completed` and exit code 0 succeeded, `completed` with a non-zero exit code or \
             `failed` with a non-zero exit code (both certified live) failed; a NULL exit code, `failed` without a non-zero exit code or another status is \
             unknown and excluded, never a success. mcp: McpToolCall items with is_error 1 failed, is_error 0 with status `completed` succeeded, else \
             unknown. A pending execution writes no item, so calls without an output are counted apart",
         "coverage": coverage});
+    if list.iter().any(|s| s.id.starts_with("claude-code:")) {
+        m17["by_scope"]["claude-code"] = scope(t.claude_succeeded, t.claude_failed, &t.claude_unknown);
+        m17["certified"] = json!({"claude-code": "fixture"});
+        m17["claude_code_basis"] = json!("is_error false succeeds, true fails, absent is unknown; no exit code inferred");
+    }
     if terminal == 0 { m17["value"] = Value::Null; m17["reason"] = json!("empty_denominator"); } else { m17["value"] = json!(format!("{succeeded}/{terminal}")); }
     let (mut by_name, mut by_home) = (BTreeMap::<String, Vec<i64>>::new(), BTreeMap::<String, Vec<i64>>::new());
     let (mut unnamed, mut ambiguous) = (Vec::new(), Vec::new());

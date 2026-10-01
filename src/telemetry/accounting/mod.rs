@@ -31,7 +31,8 @@ pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/ac
     include_str!("../../../migrations/telemetry/accounting/0009_valuation_deltas.sql"),
     include_str!("../../../migrations/telemetry/accounting/0010_charges_fx.sql"),
     include_str!("../../../migrations/telemetry/accounting/0011_quota_window_lookup.sql"),
-    include_str!("../../../migrations/telemetry/accounting/0012_incremental_sync.sql")];
+    include_str!("../../../migrations/telemetry/accounting/0012_incremental_sync.sql"),
+    include_str!("../../../migrations/telemetry/accounting/0013_claude_code.sql")];
 
 /// `herdr-projects telemetry <slug> accounting ...`
 #[derive(clap::Subcommand)]
@@ -328,7 +329,7 @@ fn usage_metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, 
     for (session, binding, attempt, version, quarantined, at, rejected) in &sources {
         if since.is_some_and(|since| at.is_none_or(|at| at < since)) { continue; }
         let reason = if binding != "bound" { binding.as_str() } else if !attempt.as_ref().is_some_and(|a| known.contains(a)) { "orphan" }
-            else if *quarantined { "quarantined" } else if !super::codex::certified(version) { "cli_version_uncertified" }
+            else if *quarantined { "quarantined" } else if !super::codex::accepted_version(version) { "cli_version_uncertified" }
             else if *rejected { "records_not_accepted" }
             else { certified.insert(session.as_str()); continue };
         *excluded.entry(reason).or_default() += 1;
@@ -343,6 +344,7 @@ fn usage_metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, 
         let Some(n) = entry.normalized else { continue };
         (input, output, reasoning) = (input + n[0], output + n[4], reasoning + n[5]);
     }
+    let reasoning = if certified.iter().any(|s| s.starts_with("claude-code:")) { unavailable("reasoning_tokens_not_reported") } else { json!(reasoning) };
     Ok(both(json!({"value": input, "coverage": coverage}), json!({"value": output, "reasoning_output_tokens": reasoning, "coverage": coverage})))
 }
 

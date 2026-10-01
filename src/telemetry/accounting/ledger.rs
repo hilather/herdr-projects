@@ -47,11 +47,11 @@ impl Entry {
 /// `codex-v1`: all six native counters present, non-negative and ≤ 2^53, with
 /// cached ⊆ input, reasoning ⊆ output and total = input + output. Cache writes
 /// are kept as reported; their overlap with input is not certified.
-fn normalize(native: [Option<i64>; 6]) -> Option<[i64; 7]> {
+fn normalize(native: [Option<i64>; 6], claude: bool) -> Option<[i64; 7]> {
     let mut c = [0; 6];
     for (slot, value) in c.iter_mut().zip(native) { *slot = value.filter(|v| (0..=MAX_SAFE).contains(v))?; }
     let [input, cached, write, output, reasoning, total] = c;
-    (cached <= input && reasoning <= output && total == input + output).then_some([input, cached, input - cached, write, output, reasoning, total])
+    (cached <= input && (!claude || cached + write <= input) && reasoning <= output && total == input + output).then_some([input, cached, input - cached - if claude { write } else { 0 }, write, output, reasoning, total])
 }
 
 /// Every entry derivable from the Codex tables, in `(session, basis, position)` order.
@@ -73,7 +73,7 @@ fn derive_scoped(db: &Connection, scoped: bool) -> Result<Vec<Entry>> {
         let (session, ordinal, first): (String, i64, String) = (r.get(0)?, r.get(1)?, r.get(2)?);
         let (accepted, reason, quarantined): (bool, Option<String>, bool) = (r.get(5)?, r.get(6)?, r.get(13)?);
         let native = [r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?];
-        let normalized = normalize(native);
+        let normalized = normalize(native, session.starts_with("claude-code:"));
         let (response, digest): (Option<String>, String) = (r.get(3)?, r.get(14)?);
         let (disposition, reason) = match (quarantined, accepted, normalized) {
             (true, ..) => ("conflict", Some("payload_digest_mismatch".to_owned())),
@@ -91,7 +91,7 @@ fn derive_scoped(db: &Connection, scoped: bool) -> Result<Vec<Entry>> {
             let (disposition, reason) = if quarantined { (disposition, reason.clone()) } else { ("duplicate", None) };
             provenance.push((other?, disposition, reason));
         }
-        entries.push(Entry { id: format!("codex:{session}:{ordinal}"), session, basis: "delta", scope: "request", precedence: 1, position: ordinal,
+        entries.push(Entry { id: format!("{}:{session}:{ordinal}", if session.starts_with("claude-code:") { "claude-code" } else { "codex" }), session, basis: "delta", scope: "request", precedence: 1, position: ordinal,
             response_id: r.get(3)?, model: r.get(4)?, native, normalized, provenance });
     }
     // Cumulative thread totals (secondary basis, reconciliation only): per
@@ -105,7 +105,7 @@ fn derive_scoped(db: &Connection, scoped: bool) -> Result<Vec<Entry>> {
         let (session, path, position, usage): (String, String, i64, String) = (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?);
         let usage: Value = serde_json::from_str(&usage)?;
         let native = NATIVE.map(|k| usage[k].as_i64());
-        let normalized = normalize(native);
+        let normalized = normalize(native, session.starts_with("claude-code:"));
         let mark = high.as_ref().filter(|h| h.0 == session).map(|h| h.1);
         let (disposition, reason) = match (normalized.map(|n| n[6]), mark) {
             (None, _) => ("unresolved", Some("invariant_violation")),
@@ -151,9 +151,9 @@ pub fn sync(db: &mut Connection) -> Result<Value> {
         let native = Value::Object(NATIVE.iter().zip(e.native).map(|(k, v)| ((*k).to_owned(), json!(v))).collect());
         tx.prepare_cached("INSERT INTO usage_entries(entry_id,source,session_id,basis,scope,normalization_version,precedence,position,response_id,model,native,
             input_tokens,cache_read_tokens,new_input_tokens,cache_write_tokens,output_tokens,reasoning_tokens,total_tokens)
-            VALUES(?1,'codex',?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)")?
-                .execute(params![e.id, e.session, e.basis, e.scope, NORMALIZATION, e.precedence, e.position, e.response_id, e.model, native.to_string(),
-                n[0], n[1], n[2], n[3], n[4], n[5], n[6]])?;
+            VALUES(?1,?18,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)")?
+                .execute(params![e.id, e.session, e.basis, e.scope, if e.session.starts_with("claude-code:") { "claude-code-v1" } else { NORMALIZATION }, e.precedence, e.position, e.response_id, e.model, native.to_string(),
+                n[0], n[1], n[2], n[3], n[4], n[5], n[6], if e.session.starts_with("claude-code:") { "claude-code" } else { "codex" }])?;
         for (path, disposition, reason) in &e.provenance {
             tx.prepare_cached("INSERT INTO usage_dispositions(entry_id,path_digest,disposition,reason) VALUES(?1,?2,?3,?4)")?
                 .execute(params![e.id, path, disposition, reason])?;

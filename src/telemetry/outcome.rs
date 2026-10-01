@@ -153,7 +153,7 @@ fn record(db: &Connection, version: u32, attempt: &str, task: &str, state: &str,
         AND (t.route='verify_only' OR EXISTS(SELECT 1 FROM integration_operations i JOIN integrated_commits c ON c.operation_id=i.operation_id WHERE i.verified_result_id=r.result_id)))")?
             .query_row([attempt, task], |r| r.get(0))?;
     // Without a sidecar; `attempts` replaces it with the sidecar's answer.
-    let usage = status("unavailable", if kind == Some("codex") { "collection_not_run" } else { "adapter_absent" });
+    let usage = status("unavailable", if matches!(kind, Some("codex" | "claude")) { "collection_not_run" } else { "adapter_absent" });
     Ok(json!({
         "accepted": accepted, "active_ms": active, "attempt_id": attempt,
         "attention": status("unavailable", "attention_not_collected"),

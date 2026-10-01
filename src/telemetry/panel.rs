@@ -56,7 +56,7 @@ pub fn render(project: &Path, now_ms: i64) -> Result<String> {
     out += &format!("\nactive attempts ({})\n", active.len());
     for (id, task, state, label, reserved, kind) in active {
         let usage = match (kind.as_deref(), &sidecar) {
-            (Some(kind), _) if kind != "codex" => "n/a (adapter_absent)".into(),
+            (Some(kind), _) if !matches!(kind, "codex" | "claude") => "n/a (adapter_absent)".into(),
             (_, None) => "n/a (collection_not_run)".into(),
             (_, Some(db)) => show_usage(&super::sidecar::attempt_usage(db, &id)?),
         };
