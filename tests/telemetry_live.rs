@@ -103,6 +103,15 @@ fn command(bin: &Path, home: &Path, cwd: &Path) -> Command {
         let token = std::fs::read_to_string(&file).expect("HERDR_LIVE_TOKEN_FILE readable");
         cmd.env(name, token.trim());
     }
+    // Optional non-secret settings, one `NAME=value` per line, e.g. Muse's
+    // `MUSE_AUTH_PATH` pointing at the owner's login file in place (owner
+    // decision 2026-10-01: no copy, so token refreshes stay in one file).
+    if let Ok(extra) = std::env::var("HERDR_LIVE_ENV") {
+        for line in extra.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let (name, value) = line.split_once('=').expect("HERDR_LIVE_ENV lines are NAME=value");
+            cmd.env(name, value);
+        }
+    }
     cmd
 }
 fn ready(process: &mut Process) -> Value {

@@ -14,15 +14,15 @@ CODEX_HOME and GROK_HOME inside that prepared home. Prepare `runtime` as 0700.
 | Harness | Login destination inside prepared home | Flags to confirm before spending |
 | --- | --- | --- |
 | Claude Code | none: owner decision 2026-10-01, a long-lived `claude setup-token` token in a private 0600 file outside the home, passed via `HERDR_LIVE_TOKEN_FILE` + `HERDR_LIVE_TOKEN_ENV=CLAUDE_CODE_OAUTH_TOKEN` (the owner's OAuth credentials are never copied, so refresh-token rotation cannot sign them out) | TODO confirm noninteractive prompt, `--output-format json`, tools disabled and resume-last flags |
-| Grok | TODO steward confirm login filename under `.grok`; do not guess or enumerate owner data | TODO confirm headless prompt, usage summary output and resume-last flags |
-| Muse | TODO steward confirm login filenames under `.config/muse` | TODO confirm headless prompt, numeric usage JSON and whether resume exists |
+| Grok | none: owner decision 2026-10-01, an xAI API key in a private 0600 file via `HERDR_LIVE_TOKEN_FILE` + `HERDR_LIVE_TOKEN_ENV=XAI_API_KEY` (never copy `~/.grok/auth.json`: its OAuth refresh tokens rotate) | TODO confirm headless prompt, usage summary output and resume-last flags |
+| Muse | none: owner decision 2026-10-01, `HERDR_LIVE_ENV=XDG_CONFIG_HOME=<owner's ~/.config>` uses the login in place (no copy, so refreshes stay in one file; the release binary ignores the launcher's `MUSE_AUTH_PATH`), with sessions and data still in the throwaway home; run the installed release binary directly, not the self-updating launcher | TODO confirm headless prompt, numeric usage JSON and whether resume exists |
 | Codex | `.codex/auth.json` | TODO confirm `exec --json`, selected model, tool restrictions and `exec resume --last` for installed version |
 
 The steward must resolve TODOs using known deployment documentation before
 running. The fixed prompt includes `HERDR_LIVE_PRIVACY_LC0`; it requests one
 word and no tools. CLI flags, rather than the prompt, must enforce tool policy.
 
-Optional `HERDR_LIVE_TOKEN_FILE` (a private 0600 file) and `HERDR_LIVE_TOKEN_ENV` (the variable name) pass a login token to the harness process only; it is never logged or reported.
+Optional `HERDR_LIVE_ENV` passes non-secret `NAME=value` lines to the harness process. Optional `HERDR_LIVE_TOKEN_FILE` (a private 0600 file) and `HERDR_LIVE_TOKEN_ENV` (the variable name) pass a login token to the harness process only; it is never logged or reported.
 
 Set absolute `HERDR_LIVE_HOME`, `HERDR_LIVE_BIN`, and `HERDR_LIVE_OUT` (a new
 report filename outside the prepared home), plus `HERDR_LIVE=1`.
