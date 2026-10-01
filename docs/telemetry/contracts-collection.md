@@ -2703,7 +2703,8 @@ unbound, unknown is dropped. gRPC is not used by Devin.
 `api_request` is Devin's usage authority (DG4j `declare_usage` path), deduped
 by `request_id` (unique per API call; falling back to
 `(session.id, prompt.id, event.sequence)` only when absent) through a one-way
-digest, so a replay is one entry. `event.sequence` restarts at 0 in every Devin
+digest of the *raw* id (the stored attribute is excerpt-masked: UUID-like ids of 20+
+characters become `[redacted]` and would otherwise collapse every request into one), so a replay is one entry. `event.sequence` restarts at 0 in every Devin
 process, so a resumed session (`-c -p`) must not be keyed on it alone. Grok's key
 already includes `prompt.id` and `turn_number`, so its resume does not collide. Normalization is explicit
 `otlp-devin-exclusive-v1`: normalized input = `input_tokens` + `cache_read_tokens`

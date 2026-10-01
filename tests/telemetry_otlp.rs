@@ -728,6 +728,47 @@ fn devin_resumed_process_with_restarted_sequence_counts_each_request() {
 }
 
 #[test]
+fn devin_two_processes_with_same_session_and_sequence_count_both_requests_over_http() {
+    let f = Fixture::reserved();
+    let minted = otlp::mint_attempt_token(&f.project, &f.attempt, 60).unwrap();
+    let token = minted["token"].as_str().unwrap();
+    let (_server, address, _) = server(&f);
+    let logs: Value = serde_json::from_slice(&payload(&f, "devin-logs")).unwrap();
+    let metrics: Value = serde_json::from_slice(&payload(&f, "devin-metrics")).unwrap();
+    // Each process reports event.sequence 2 for the same session; its metrics batch
+    // precedes the logs batch, which arrives last at shutdown.
+    let turns = [("5b2f6d0e-7a41-4c1e-9f3a-0d8c2e1b7a90", "prompt-live-1", 2659u64, 9210u64, 28u64), ("c91a44f2-03de-4b7a-8e65-a2f7b9d01c33", "prompt-live-2", 3632, 8299, 27)];
+    for (request, prompt, input, read, output) in turns {
+        let mut l = logs.clone();
+        for record in l["resourceLogs"][0]["scopeLogs"].as_array_mut().unwrap().iter_mut().flat_map(|s| s["logRecords"].as_array_mut().unwrap()) {
+            for a in record["attributes"].as_array_mut().unwrap() {
+                let value = match a["key"].as_str().unwrap() {
+                    "request_id" => request.to_owned(),
+                    "prompt.id" => prompt.to_owned(),
+                    "input_tokens" => input.to_string(),
+                    "cache_read_tokens" => read.to_string(),
+                    "output_tokens" => output.to_string(),
+                    _ => continue,
+                };
+                a["value"] = json!({"stringValue": value});
+            }
+        }
+        for (path, root, is_metrics) in [("/v1/metrics", &metrics, true), ("/v1/logs", &l, false)] {
+            let body = pb_request(root, is_metrics);
+            assert_eq!(http(&address, Some(token), path, "application/x-protobuf", &body, body.len()), 200);
+        }
+        // The first process's ledger is synced before the second process exports.
+        f.cli_args(&["accounting", "sync"]);
+    }
+    f.cli_args(&["accounting", "sync"]);
+    let entries = f.cli_args(&["accounting", "entries"]).0;
+    let counted = support::telemetry::accepted_delta_entries(&entries);
+    assert_eq!(counted.len(), 2, "{entries}");
+    let sum = |key: &str| counted.iter().map(|e| e["normalized"][key].as_u64().unwrap()).sum::<u64>();
+    assert_eq!((sum("input_tokens"), sum("cache_read_tokens"), sum("output_tokens")), (2659 + 9210 + 3632 + 8299, 9210 + 8299, 55));
+}
+
+#[test]
 fn devin_protobuf_export_matches_json_rows() {
     let f = Fixture::reserved();
     for (fixture, metrics, expected) in [("devin-logs", false, 5), ("devin-metrics", true, 6)] {

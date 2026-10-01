@@ -519,7 +519,9 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                             } else if *native == "api_request" {
                                 let session = attrs.get("session.id").and_then(Value::as_str).filter(|s| !s.is_empty());
                                 let sequence = attrs.get("event.sequence").and_then(integer).filter(|n| *n >= 0);
-                                let request = payload["attributes"]["request_id"].as_str().map(str::to_owned);
+                                // Key on the raw id: the stored copy is excerpt-masked, so UUID-like ids all
+                                // collapse to `[redacted]`. Only its digest is kept.
+                                let request = attrs.get("request_id").and_then(Value::as_str).map(str::to_owned);
                                 let prompt = attrs.get("prompt.id").and_then(Value::as_str).filter(|s| !s.is_empty());
                                 // `event.sequence` restarts at 0 in every Devin process, so a resumed
                                 // session reuses it; `request_id` is the per-API-call identity.
