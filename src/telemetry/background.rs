@@ -33,3 +33,49 @@ pub fn idle_priority(log: impl FnOnce(&str)) {
     #[cfg(not(target_os = "linux"))]
     let _ = log;
 }
+
+/// One bounded worker for the slower derived lanes. Collection/accounting keep
+/// their own turn, so a long health or analytics evaluation cannot hold up the
+/// next project's ledger. At most 64 projects wait, with one queued turn per
+/// project; a full queue defers admission without blocking its caller.
+pub struct DeferredLanes {
+    sender: Option<std::sync::mpsc::SyncSender<std::path::PathBuf>>,
+    pending: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<std::path::PathBuf>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DeferredLanes {
+    pub fn new(run: impl Fn(&std::path::Path) + Send + 'static) -> std::io::Result<Self> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<std::path::PathBuf>(64);
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+        let queued = pending.clone();
+        let thread = std::thread::Builder::new().name("telemetry-derived".into()).spawn(move || {
+            while let Ok(project) = receiver.recv() {
+                if let Ok(mut pending) = queued.lock() { pending.remove(&project); }
+                run(&project);
+            }
+        })?;
+        Ok(Self { sender: Some(sender), pending, thread: Some(thread) })
+    }
+
+    pub fn submit(&self, project: &std::path::Path) -> bool {
+        let Some(sender) = &self.sender else { return false };
+        let Ok(mut pending) = self.pending.lock() else { return false };
+        if !pending.insert(project.to_owned()) { return true; }
+        if sender.try_send(project.to_owned()).is_err() {
+            pending.remove(project);
+            return false;
+        }
+        true
+    }
+
+    /// Finish accepted turns, then exit. This never waits for a running lane.
+    pub fn stop(&mut self) { self.sender.take(); }
+
+    pub fn is_finished(&self) -> bool { self.thread.as_ref().is_none_or(|thread| thread.is_finished()) }
+
+    /// Reap only a finished worker. The controller never joins unfinished work.
+    pub fn reap(&mut self) {
+        if self.is_finished() && let Some(thread) = self.thread.take() { let _ = thread.join(); }
+    }
+}

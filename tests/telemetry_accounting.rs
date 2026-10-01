@@ -2452,6 +2452,179 @@ fn coordinator_overhead_and_overlap_waste_from_accepted_reasons() {
     assert_eq!(rebuilt["metrics"]["M34"], original, "rebuild: the same M34");
 }
 
+/// A blocked derived turn must not prevent another project's public ingestion,
+/// and its deferred refresh must preserve current and pinned answers exactly.
+#[test]
+fn deferred_derived_lanes_leave_other_project_ingestion_available() {
+    use std::io::Write;
+    let hot = Fixture::new();
+    let light = Fixture::new();
+    let mut light_path = None;
+    for f in [&hot, &light] {
+        let path = f.rollout(&f.home, "deferred", &[RECORD], &f.worktree(), f.decided + 1000, "0.154.0");
+        f.cli("collect"); f.cli_args(&["accounting", "sync"]);
+        f.cli_args(&["query", "--metric", "M08", "--json"]);
+        f.cli_args(&["analytics", "refresh"]);
+        if f.project == light.project { light_path = Some(path); }
+    }
+    let revision = light.cli_args(&["analytics", "revisions", "--metric", "M08"]).0["revisions"][0]["revision"].as_i64().unwrap().to_string();
+    let pinned = light.cli_args(&["query", "--metric", "M08", "--as-of-seq", &revision, "--json"]).0["results"][0].clone();
+    let check_pinned = || {
+        let answer = light.cli_args(&["query", "--metric", "M08", "--as-of-seq", &revision, "--json"]).0["results"][0].clone();
+        for field in ["value", "detail", "coverage", "source_watermarks", "as_of", "definition", "observation_cutoff_unix_ms"] {
+            assert_eq!(answer[field], pinned[field], "{field}");
+        }
+        assert_eq!(answer["projection"]["content_digest"], pinned["projection"]["content_digest"]);
+    };
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let hot_project = hot.project.clone();
+    // Deterministic local service delay; the actual queued work is the public
+    // analytics store API over each real collected project, not a fake tally.
+    let mut worker = herdr_projects::telemetry::background::DeferredLanes::new(move |project| {
+        if project == hot_project {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+        }
+        let result = herdr_projects::telemetry::analytics::store::refresh(project, None).map_err(|e| format!("{e:#}"));
+        done_tx.send(result).unwrap();
+    }).unwrap();
+    assert!(worker.submit(&hot.project));
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(worker.submit(&light.project));
+    let path = light_path.unwrap();
+    let line = fs::read_to_string(&path).unwrap().lines().last().unwrap().replace("resp-1", "deferred-response");
+    writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(), "{line}").unwrap();
+    light.cli("collect"); light.cli_args(&["accounting", "sync"]);
+    assert_eq!(light.report()["metrics"]["M08"]["value"], 2000);
+    check_pinned();
+    release_tx.send(()).unwrap();
+    worker.stop();
+    for _ in 0..2 { done_rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap(); }
+    while !worker.is_finished() { std::thread::sleep(Duration::from_millis(10)); }
+    worker.reap();
+    assert_eq!(light.cli_args(&["query", "--metric", "M08", "--json"]).0["results"][0]["value"], 2000);
+    check_pinned();
+    let entries = light.cli_args(&["accounting", "entries"]).1;
+    light.sidecar().execute("DELETE FROM usage_ledger", []).unwrap();
+    light.cli_args(&["accounting", "sync"]);
+    assert_eq!(light.cli_args(&["accounting", "entries"]).1, entries);
+}
+
+/// Late new snapshots rewind only the affected window suffix, with exact replay.
+#[test]
+fn late_quota_snapshot_preserves_earlier_windows_and_matches_full_replay() {
+    use std::io::Write;
+    let f = Fixture::new();
+    let path = f.rollout(&f.home, "quota-suffix", &[RECORD], &f.worktree(), f.decided + 1000, "0.154.0");
+    let snapshot = |at: i64, reset: i64, used: i64| json!({"timestamp": jiff::Timestamp::from_millisecond(at).unwrap().to_string(),
+        "type": "event_msg", "payload": {"type": "token_count", "info": null, "rate_limits": {"limit_id": "codex",
+            "primary": {"used_percent": used, "window_minutes": 60, "resets_at": reset / 1000},
+            "secondary": {"used_percent": used, "window_minutes": 60, "resets_at": reset / 1000}, "plan_type": "pro"}}});
+    let mut out = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    for (at, reset, used) in [(1000, 3_600_000, 10), (4_000_000, 7_200_000, 20), (6_000_000, 7_200_000, 15), (8_001_000, 10_800_000, 30)] {
+        writeln!(out, "{}", snapshot(f.decided + at, f.decided + reset, used)).unwrap();
+    }
+    // A second limit's current window starts between the first limit's
+    // windows. The common replay floor must also rewind the older window's
+    // decrease flag, which does not advance its last trusted timestamp.
+    let mut staggered = snapshot(f.decided + 5_000_000, f.decided + 10_800_000, 10);
+    staggered["payload"]["rate_limits"]["limit_id"] = json!("other-limit");
+    writeln!(out, "{staggered}").unwrap();
+    drop(out);
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    let (before, before_bytes) = f.cli_args(&["accounting", "quota", "--json"]);
+    assert_eq!(before["windows"].as_array().unwrap().len(), 8);
+    f.sidecar().execute_batch(&format!("CREATE TRIGGER keep_old_quota BEFORE DELETE ON quota_window_observations
+        WHEN OLD.observed_unix_ms < {} BEGIN SELECT RAISE(ABORT,'unaffected quota history replayed'); END;", f.decided + 2_000_000)).unwrap();
+    // Native ordinal is new, while event time precedes the last synced row.
+    // Used=40 before the existing used=30 creates the same decrease flag as full replay.
+    writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(), "{}",
+        snapshot(f.decided + 8_000_500, f.decided + 10_800_000, 40)).unwrap();
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    let status = f.cli_args(&["accounting", "status"]).0;
+    assert_eq!(status["sync"]["mode"], "incremental");
+    assert_eq!(status["sync"]["rebuild_reason"], serde_json::Value::Null);
+    let incremental = f.cli_args(&["accounting", "quota", "--json"]).1;
+    assert_ne!(incremental, before_bytes);
+    f.sidecar().execute_batch("DROP TRIGGER keep_old_quota; DELETE FROM usage_ledger;").unwrap();
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "quota", "--json"]).1, incremental);
+}
+
+/// Ordered quota and usage appends keep unrelated sessions' persisted rows intact.
+#[test]
+fn incremental_usage_and_quota_append_touches_only_changed_session() {
+    use std::io::Write;
+    let f = Fixture::new();
+    let path = f.rollout(&f.home, "append-hot", &[RECORD], &f.worktree(), f.decided + 1000, "0.154.0");
+    let other = f.rollout(&f.home, "append-cold", &[RECORD], &f.worktree(), f.decided + 1000, "0.154.0");
+    let other_id = "00000000-0000-4000-8000-00000000c0df";
+    fs::write(&other, fs::read_to_string(&other).unwrap().replace(SID, other_id)).unwrap();
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    let line = fs::read_to_string(&path).unwrap().lines().last().unwrap().replace("resp-1", "append-response");
+    // Reject even a byte-identical rewrite of the unrelated ledger/graph/cache.
+    // These guards inspect actual persisted writes reached by the public CLI.
+    let db = f.sidecar();
+    for table in ["usage_entries", "session_graph_nodes", "accounting_usage_totals", "accounting_cache_totals", "accounting_tool_summary"] {
+        for event in ["DELETE", "UPDATE"] {
+            db.execute_batch(&format!("CREATE TRIGGER untouched_{table}_{event} BEFORE {event} ON {table}
+                WHEN OLD.session_id='{other_id}' BEGIN SELECT RAISE(ABORT,'unrelated session rewritten'); END;")).unwrap();
+        }
+    }
+    db.execute_batch("CREATE TRIGGER keep_dispatch BEFORE INSERT ON accounting_dispatch_headroom
+        WHEN EXISTS(SELECT 1 FROM accounting_dispatch_headroom WHERE attempt_id=NEW.attempt_id)
+        BEGIN SELECT RAISE(ABORT,'unchanged dispatch recomputed'); END;").unwrap();
+    drop(db);
+    // A real public-store reconciliation advances the canonical head/file
+    // identity without changing any dispatch input or blocked span.
+    let mut store = herdr_projects::store::SqliteStore::open(&f.project.join(".state/state.db")).unwrap();
+    let snapshot = store.read_snapshot(None).unwrap();
+    let binding = &snapshot.runtime_bindings[0];
+    store.record_observations(snapshot.head, &[herdr_projects::reconcile::RuntimeObservation {
+        binding: binding.id.clone(), binding_revision: binding.revision,
+        task_revision: Some(snapshot.tasks[0].revision), observed_unix_ms: unix_ms(),
+        collector: "herdr-git-v1".into(), config_digest: f.config.digest.clone(),
+        ..herdr_projects::reconcile::RuntimeObservation::default()
+    }]).unwrap();
+    drop(store);
+    let timestamp = jiff::Timestamp::from_millisecond(f.decided + 2000).unwrap().to_string();
+    let quota = json!({"timestamp": timestamp, "type": "event_msg", "payload": {"type": "token_count", "info": null,
+        "rate_limits": {"limit_id": "codex", "primary": {"used_percent": 20, "window_minutes": 300,
+            "resets_at": f.decided / 1000 + 3600}, "secondary": null, "plan_type": "pro"}}});
+    let mut out = fs::OpenOptions::new().append(true).open(&path).unwrap();
+    writeln!(out, "{line}\n{quota}").unwrap();
+    drop(out);
+    f.cli("collect");
+    let db = f.sidecar();
+    let dirty: Vec<String> = db.prepare("SELECT session_id FROM accounting_dirty_sessions ORDER BY session_id").unwrap()
+        .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+    assert_eq!(dirty, vec![SID.to_owned()]);
+    assert_eq!(db.query_row("SELECT quota_rebuild FROM accounting_stream", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    drop(db);
+    f.cli_args(&["accounting", "sync"]);
+    let status = f.cli_args(&["accounting", "status"]).0;
+    assert_eq!(status["sync"]["mode"], "incremental", "{status}");
+    assert_eq!(status["sync"]["rebuild_reason"], serde_json::Value::Null);
+    assert_eq!(f.report()["metrics"]["M08"]["value"], 3000);
+    let before = (f.cli_args(&["accounting", "entries"]).1, f.cli_args(&["accounting", "sessions"]).1,
+        f.cli_args(&["accounting", "quota", "--json"]).1);
+    let db = f.sidecar();
+    for table in ["usage_entries", "session_graph_nodes", "accounting_usage_totals", "accounting_cache_totals", "accounting_tool_summary"] {
+        for event in ["DELETE", "UPDATE"] { db.execute_batch(&format!("DROP TRIGGER untouched_{table}_{event}")).unwrap(); }
+    }
+    db.execute_batch("DROP TRIGGER keep_dispatch;").unwrap();
+    db.execute("DELETE FROM usage_ledger", []).unwrap();
+    drop(db);
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!((f.cli_args(&["accounting", "entries"]).1, f.cli_args(&["accounting", "sessions"]).1,
+        f.cli_args(&["accounting", "quota", "--json"]).1), before);
+}
+
 /// Collect in stages, including an older session and repeated responses, then
 /// compare the public projections with a forced rebuild of the same evidence.
 #[test]

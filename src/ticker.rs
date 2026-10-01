@@ -667,6 +667,8 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
 static TELEMETRY_START:std::sync::OnceLock<Instant>=std::sync::OnceLock::new();
 #[cfg(feature="state-store")]
 static TELEMETRY_RUNNING:std::sync::Mutex<Option<std::thread::JoinHandle<()>>>=std::sync::Mutex::new(None);
+#[cfg(feature="state-store")]
+static TELEMETRY_DERIVED:std::sync::Mutex<Option<herdr_projects::telemetry::background::DeferredLanes>>=std::sync::Mutex::new(None);
 // Graceful shutdown preserves a whole telemetry pass, but crash-safe work must
 // not keep the ticker alive indefinitely if a lane stalls.
 #[cfg(feature="state-store")]
@@ -675,10 +677,9 @@ const TELEMETRY_SHUTDOWN_WAIT:Duration=Duration::from_secs(60);
 #[cfg(feature="state-store")]
 fn drain_telemetry(log:&Log) {
     let Ok(mut running)=TELEMETRY_RUNNING.lock() else {return};
-    let Some(pass)=running.as_ref() else {return};
     let deadline=Instant::now()+TELEMETRY_SHUTDOWN_WAIT;
-    if !pass.is_finished() {log.line("waiting for telemetry pass");}
-    while !pass.is_finished() {
+    if running.as_ref().is_some_and(|pass|!pass.is_finished()) {log.line("waiting for telemetry pass");}
+    while running.as_ref().is_some_and(|pass|!pass.is_finished()) {
         let remaining=deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             log.line("telemetry pass still running at shutdown; exiting (the pass is crash-safe)");
@@ -687,6 +688,18 @@ fn drain_telemetry(log:&Log) {
         std::thread::sleep(Duration::from_millis(50).min(remaining));
     }
     if let Some(pass)=running.take() {let _=pass.join();}
+    if let Ok(mut derived)=TELEMETRY_DERIVED.lock() && let Some(worker)=derived.as_mut() {
+        worker.stop();
+        while !worker.is_finished() {
+            let remaining=deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                log.line("telemetry derived lanes still running at shutdown; exiting (the pass is crash-safe)");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50).min(remaining));
+        }
+        worker.reap();
+    }
 }
 
 #[cfg(feature="state-store")]
@@ -756,8 +769,21 @@ fn telemetry_pass(ctx:&Ctx,log:&Log,session:&str) {
         // Start its observed prefix now, without backfilling any earlier time.
         if !existing&&sidecar::path(&project).is_file()
             && let Err(error)=operating::observe_project(&project,&session,TICK.as_millis() as i64) {line.line(&format!("{slug}: operating observation: {error:#}"));}
-        for lane in &herdr_projects::telemetry::LANES {
-            if let Err(error)=(lane.tick)(&project,codex::Budget::TICK) {line.line(&format!("{slug}: telemetry {} tick: {error:#}",lane.stream));}
+        if let Err(error)=herdr_projects::telemetry::accounting::tick(&project,codex::Budget::TICK) {line.line(&format!("{slug}: telemetry accounting tick: {error:#}"));}
+        if let Ok(mut derived)=TELEMETRY_DERIVED.lock() {
+            if derived.is_none() {
+                let derived_log=line.clone();
+                match herdr_projects::telemetry::background::DeferredLanes::new(move |project| {
+                    herdr_projects::telemetry::background::idle_priority(|warning|derived_log.line(warning));
+                    for lane in herdr_projects::telemetry::LANES.iter().filter(|lane|lane.stream!="accounting") {
+                        if let Err(error)=(lane.tick)(project,codex::Budget::TICK) {derived_log.line(&format!("{}: telemetry {} tick: {error:#}",project.display(),lane.stream));}
+                    }
+                }) {
+                    Ok(worker)=>*derived=Some(worker),
+                    Err(error)=>line.line(&format!("telemetry derived worker: {error}")),
+                }
+            }
+            if let Some(worker)=derived.as_ref() && !worker.submit(&project) {line.line(&format!("{slug}: telemetry derived queue full; deferred"));}
         }
     });
     match pass {

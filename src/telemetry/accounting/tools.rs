@@ -613,9 +613,14 @@ fn summaries_current(project: &Path, db: &Connection) -> Result<bool> {
 /// as integers: aggregate nearest-rank distributions use the same sample set.
 pub(crate) fn store(project: &Path, db: &Connection, full: bool) -> Result<()> {
     let canonical = crate::telemetry::analytics::inputs::canonical(project)?;
-    let canonical_text = serde_json::to_string(&canonical)?;
+    let blocked = super::attention::blocked_spans(project, db)?;
+    // This is the tools evaluator's only canonical dependency. Keep its exact
+    // derived spans, rather than replaying every session after an unrelated
+    // reconciliation event or canonical-file timestamp change.
+    let canonical_text = serde_json::to_string(&json!({"canonical": canonical, "blocked": blocked}))?;
     let previous: Option<String> = db.query_row("SELECT canonical FROM accounting_tool_frontier WHERE singleton=1", [], |r| r.get(0)).optional()?;
-    let all = full || previous.as_deref() != Some(canonical_text.as_str());
+    let previous = previous.map(|v| serde_json::from_str::<Value>(&v)).transpose()?;
+    let all = full || previous.as_ref().map(|v| &v["blocked"]) != Some(&json!(blocked));
     if all {
         db.execute_batch("DELETE FROM accounting_tool_summary;
             INSERT OR IGNORE INTO accounting_selected SELECT session_id FROM rollout_sources;")?;
@@ -627,7 +632,6 @@ pub(crate) fn store(project: &Path, db: &Connection, full: bool) -> Result<()> {
     let selected: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM accounting_selected)", [], |r| r.get(0))?;
     if selected {
         db.execute_batch("DELETE FROM accounting_tool_summary WHERE session_id IN (SELECT session_id FROM accounting_selected);")?;
-        let blocked = super::attention::blocked_spans(project, db)?;
         let (list, _) = sessions(db, None, &blocked, true, false)?;
         let mut insert = db.prepare_cached("INSERT INTO accounting_tool_summary(session_id,tally) VALUES(?1,?2)")?;
         for s in &list {

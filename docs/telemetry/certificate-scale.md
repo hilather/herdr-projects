@@ -2329,6 +2329,201 @@ rebuilds, dirty-session fan-out) and fixes the cause, then makes the worker
 fair if it is still needed. Card P8 takes the `compare` regression and live
 `health`. L8 is proved only in the TM5.4 live ramp (owner gate).
 
+### 4.20 P7 / P7b: quota replay spikes and shared-worker fairness
+
+Branch `perf/1m-freshness`, base `628b59f`, 2026-10-01. **Pending the
+steward's serial 1M certification.** These are new P7b runs, not the interrupted
+worker's measurements. Registry, stream versions, capture triggers, existing
+metric expectations and the `scale_gates_hold_under_load` body are unchanged.
+
+**Measured cause.** Accounting diagnostics now record attention sampling,
+ledger preparation/validation and writes, graph storage, quota storage and its
+mode/row count, quota dispatch, cache totals, tools/fleet/cost, analytics input
+frontiers, termination summaries and final frontier/count/commit work. Each
+freshness results JSON retains every pass's `last_mode`, `last_reason`, dirty
+and selected session counts and `quota_rebuild`, beside these timers.
+All 15 baseline 1M passes were `incremental`, with null reasons and
+`quota_rebuild=false`; all selected 64 sessions. Six nevertheless replayed
+entire quota accounts because a new snapshot sorted before the globally last
+snapshot. Those replays read 99,064–106,211 native snapshots. The slowest
+accounting tick was 68,142.01 ms, including 60,585.25 ms in quota storage.
+Thus source-delete invalidation, cache-totals loss, secondary-window correction
+triggers and graph fan-out were not the measured spike mechanism. No capture
+trigger was weakened to remove it.
+
+The following breakdown compares each version's slowest measured 1M accounting
+pass (baseline steady, candidate drain), in milliseconds. Different ingress
+backlogs and host loads make this diagnostic evidence, not a matched latency
+microbenchmark:
+
+| Accounting sub-step | Before | After |
+| --- | ---: | ---: |
+| Attention sample | 15.57 | 13.64 |
+| Prepare and validate | 27.90 | 50.42 |
+| Ledger writes | 234.19 | 1,231.19 |
+| Graph store | 16.56 | 45.10 |
+| Quota store, including affected floor | 60,585.25 | 1,583.30 |
+| Quota dispatch | 181.82 | 63.22 |
+| Cache totals | 57.81 | 83.83 |
+| Tools | 1,408.84 | 81.91 |
+| Fleet | 277.86 | 6.08 |
+| Cost metrics | 1.07 | 0.03 |
+| Analytics input frontier | 246.66 | 6.06 |
+| Termination summary | 1,467.70 | 45.20 |
+| Frontier, public counts and commit | 3,129.82 | 181.02 |
+| Cost tick | 0.16 | 0.10 |
+
+**Fix and identical answers.** A late *new* quota snapshot rewinds affected
+accounts to complete window checkpoints and replays only their suffix in the
+original `(observed_ts, session_id, ordinal)` order. The common floor repeatedly
+rewinds windows crossing it, including decrease flags that do not advance the
+last trusted timestamp. This fixes a correctness defect in the interrupted
+worker's proposed suffix algorithm for staggered limits/windows. Native IDs are
+pinned before deleting projections; existing observation-order and native
+primary-key indexes select the suffix without replaying historical accounts.
+The persisted prefix is the exact original state-machine checkpoint, including
+start evidence, high-water values, trusted counts, flags and plan. The state
+machine and fixed-point arithmetic are unchanged. Corrections, account
+reassignments, source deletions, missing caches and inconsistent frontiers retain
+the original replay/rebuild paths. Ledger, graph, quota, caches, watermark and
+queue removal still commit together, with P1's source/generation validation.
+
+Tools compare their actual canonical dependency (derived blocked spans) and
+M40 dispatch storage compares the ordered decision/kind/home/time fingerprint,
+instead of replaying all sessions/decisions for unrelated reconciliation writes.
+Full canonical identities remain in read validation. The canonical stamp is
+captured before its dependent decision read, so a concurrent new decision makes
+the stamp stale and forces fallback. Legacy frontier bodies refresh safely on
+first sync. No evaluator, coverage rule, disposition, digest or as-of selection
+rule changes. After, all 119 measured 1M passes remain incremental with null
+reasons and `quota_rebuild=false`: 77 append and 42 suffix quota turns.
+The largest suffix replays 7,381 snapshots, not the entire 1M account history.
+Active-session history and affected whole-window suffixes still grow; this is
+not a constant-time guarantee for arbitrary late events or full rebuilds.
+
+**Paired reproduction.** Reused and restored the deterministic seed-5100
+prepared datasets, manifests/generator states, rollouts and SQLite stores at
+identical absolute paths before every run. Both scales have 10,000 bindings,
+64 active attempts and eight synthetic execution homes. The 1M seed starts with
+198,000 usage records; the 100k seed with 19,800. Fairness restores that same 1M
+hot seed plus the three original isolated 1k light projects. CLI collect/sync
+settles source/file identities outside timing. Preserved baseline binaries
+contain only diagnostics over `628b59f`; final binaries include these fixes.
+An incomplete baseline overlapping a duplicate build was stopped and excluded;
+all quoted completed runs were serial, without overlapping builds or tests.
+Every dataset, seed and fixture home stayed under `$PWD/bench-data/` on disk.
+
+Build each version with §1's exact release/no-run command (`--locked --offline
+-j 3 --features state-store --test telemetry_scale`). Use §1's environment,
+`SCALE_ACTIVE=64 SCALE_REPEATS=3 SCALE_CADENCE_MS=1000`, `SCALE_EVENTS=1000000`
+only for phases `scale_4_freshness_burst` and `scale_6_fairness`; use
+`SCALE_EVENTS=100000` for the freshness regression. Freshness retains 120 s
+steady / 60 s burst / 30 s drain. Fairness retains three 15 s rounds, the
+5 s reader cadence and the unchanged per-light-project 5 s criterion.
+`SCALE_TAG=p7b-before|p7b-after` names freshness JSONs. Fairness writes
+`results-fairness.json`; preserve it between variants. The optional
+`SCALE_FAIRNESS_DERIVED=0` measures final accounting with single-worker scheduling.
+No other 1M phase was run. Bounded workers: one collection/accounting worker and
+one derived worker; FIFO capacity 64, one queued turn per project, no per-project
+threads. With the controller, sleeping appender and surface reader, busy work
+stays within six threads. The fairness workers now use the ticker's idle
+CPU/I/O profile. Scheduling and enqueueing run off the controller; it never joins
+unfinished work; orderly shutdown retains its existing shared 60 s bound.
+
+| Freshness workload | Before p95 (s) | After p95 (s) | Passes before / after | Accounting p50 / max before → after (ms) |
+| --- | ---: | ---: | ---: | --- |
+| 1M/64 steady | 81.250 | 3.067 | 10 / 92 | 709.48 / 68,142.01 → 522.31 / 937.36 |
+| 1M/64 burst | 262.323 | 8.467 | 3 / 18 | 40,517.33 / 61,686.04 → 1,751.12 / 3,059.98 |
+| 1M/64 drain | 81.286 | 7.644 | 2 / 9 | 2,569.09 / 49,580.18 → 1,852.63 / 3,401.01 |
+| 100k/64 steady | 10.985 | 1.742 | 72 / 118 | 557.51 / 6,636.96 → 387.27 / 768.44 |
+| 100k/64 burst | 24.052 | 7.606 | 6 / 25 | 5,330.18 / 9,224.71 → 1,587.50 / 3,036.01 |
+| 100k/64 drain | 12.031 | 3.886 | 7 / 15 | 2,714.83 / 6,351.08 → 1,659.86 / 1,713.51 |
+
+All four freshness runs report zero violations and zero unseen usage after
+settle. One baseline 1M burst pass exhausted the unchanged 8 MiB cap; subsequent
+turns drained it. No after pass exhausted it or reported a pass error. The
+local steady target is met at both scales; 1M burst/drain and 100k burst remain
+above 5 s. Default ticker cadence remains 300 s. L2 is only partly addressed.
+
+**Why fairness also needs scheduling.** With corrected accounting but
+`SCALE_FAIRNESS_DERIVED=0`, round 1's hot pass takes 25,612.25 ms: accounting
+676.23 ms, analytics 6,506.98 ms and health 17,778.38 ms. Round 3's due analytics
+refresh takes 6,343.45 ms. Light turns themselves remain 0.18–0.20 s, yet the
+fixed criterion fails. The ticker now serves collection/accounting independently
+of one bounded FIFO worker for the other lanes, preserving their original lane
+order. The same production worker is exercised by the fairness harness. No
+parallel turns of the same derived worker or unbounded project threads appear.
+
+The split-worker run passes every round's fixed append-to-ledger criterion,
+even with a 27,980.94 ms hot derived turn (round 1) and 7,215.61 ms (round 3).
+`pass_ms` now explicitly measures the core turn; `derived_passes` separately
+records slower-lane durations/errors, so that work is not omitted or hidden.
+Slow lanes can still delay other derived refreshes; their recorded `as_of`
+remains explicit. This does not certify every derived surface within 5 s.
+
+| Light project | Before p95, rounds 1 / 2 / 3 (s) | Accounting-only p95 (s) | Split-worker after p95 (s) |
+| --- | --- | --- | --- |
+| 1 | 53.326 / 11.291 / 14.263 | 24.897 / 1.809 / 8.241 | 1.846 / 1.766 / 1.708 |
+| 2 | 53.537 / 11.519 / 14.501 | 25.080 / 1.987 / 8.338 | 1.830 / 1.810 / 1.849 |
+| 3 | 53.746 / 10.863 / 14.728 | 25.262 / 2.065 / 6.822 | 1.744 / 1.730 / 1.910 |
+
+Results-file load averages (1 / 5 / 15 minutes), start → phase ends → finish:
+
+| Run | Start | Steady / burst / drain ends, or fairness round ends | Finish |
+| --- | --- | --- | --- |
+| 1M freshness before | 10.45 / 11.94 / 10.56 | 10.38 / 10.35 / 10.13; 7.87 / 9.04 / 9.65; 6.40 / 8.41 / 9.38 | 6.40 / 8.41 / 9.38 |
+| 1M freshness after | 2.01 / 2.77 / 4.84 | 1.36 / 2.20 / 4.33; 1.64 / 2.12 / 4.15; 1.46 / 2.02 / 4.04 | 1.46 / 2.02 / 4.04 |
+| 100k freshness before | 5.87 / 5.97 / 7.97 | 7.57 / 6.39 / 7.84; 7.28 / 6.63 / 7.82; 6.67 / 6.55 / 7.74 | 6.67 / 6.55 / 7.74 |
+| 100k freshness after | 0.78 / 1.14 / 2.90 | 0.87 / 1.17 / 2.70; 1.53 / 1.31 / 2.64; 1.64 / 1.36 / 2.61 | 1.64 / 1.36 / 2.61 |
+| 1M fairness before | 4.05 / 6.59 / 8.59 | 4.46 / 6.36 / 8.37; 3.59 / 5.87 / 8.10; 3.35 / 5.59 / 7.93 | 3.35 / 5.59 / 7.93 |
+| 1M fairness accounting-only | 0.92 / 1.77 / 3.85 | 1.18 / 1.76 / 3.78; 1.87 / 1.90 / 3.78; 1.57 / 1.83 / 3.71 | 1.57 / 1.83 / 3.71 |
+| 1M fairness after | 0.50 / 1.19 / 3.18 | 1.20 / 1.30 / 3.15; 1.13 / 1.28 / 3.11; 1.32 / 1.31 / 3.08 | 1.32 / 1.31 / 3.08 |
+
+The after host is much quieter, especially for 1M freshness. Timing ratios are
+provisional, not an authoritative causal speedup certification. Replay counts,
+mode/reason diagnostics and the accounting-only fairness control establish the
+specific work removed and the remaining scheduling delay. L1/L3–L6/L8 and the
+unproduced signal/live-capacity limitations are not closed by this card.
+
+**Validation.** The unchanged final release load gate passes in 11.72 s
+(also 11.57 s before the conservative stamp-order correction). Accounting's
+release suite passes 30 tests, including P1's incremental/full proofs and P5c's
+capture schema guard; its only failure is the expected Unix bind denial.
+Three new CLI/public-store E2Es prove: an append of a quota snapshot plus usage
+only dirties/rewrites its changed session despite unrelated reconciliation;
+staggered-window/flagged late quota replay preserves the prefix and equals full
+replay byte for byte; a blocked hot derived refresh leaves another project's
+public ingestion available and preserves current/pinned answers and rebuilds.
+No unit/source-text tests, new crate or source process spawn was added.
+The final debug run uses `TMPDIR=$PWD/target/tmp RUST_TEST_THREADS=1`,
+`cargo test --locked --offline -j 3 --features state-store --no-fail-fast`,
+all fifteen requested targets and the five remaining telemetry targets.
+The requested targets pass **191 tests**, with **13 ignored** and only the
+following four sandbox-denied Unix-socket binds (`Operation not permitted`):
+
+- `telemetry::attempts_show_attention_summary`
+- `telemetry_accounting::attention_intervals_union_and_censor`
+- `telemetry_health::recommendations_and_notices_change_no_canonical_state_and_no_dispatch`
+- `telemetry_workspace::thread_start_records_the_dispatch_reason_and_the_sidebar_suffix`
+
+All twenty telemetry targets pass **220 tests**, with **13 ignored** and those
+four failures plus two TCP loopback bind denials in the extra OTLP target:
+`telemetry_otlp::http_auth_limits_malformed_and_replay` and
+`telemetry_otlp::http_request_rate_is_bounded`. No other failure, changed
+expectation or sandbox workaround. The unchanged debug gate and ticker
+kill/resume workflow pass; old pinned values, coverage, watermarks and digests
+remain reproducible, full ledger/analytics rebuilds match and canonical bytes
+remain untouched by telemetry. Clippy (`cargo clippy --locked --offline -j 3
+--features state-store --bin herdr-projects --test telemetry_accounting --test
+telemetry_scale --message-format=json`) completes with zero warning locations
+on changed lines, including secondary diagnostic spans. Existing unrelated
+warnings remain.
+
+Files: `src/telemetry/accounting/{ledger,mod,quota,tools}.rs`,
+`src/telemetry/background.rs`, `src/ticker.rs`,
+`tests/telemetry_accounting.rs`, `tests/telemetry_scale.rs`, this certificate.
+All `bench-data/` datasets and preserved binaries are removed before commit.
+
 ### 4.21 P8: maintained M02 comparison and live health (100k follow-up)
 
 Branch `perf/compare-1m`, base `628b59f`. **Pending the steward's serial
@@ -2587,7 +2782,14 @@ owner. None is hidden by loosening the target.
   7.302 s, drain 13.024 → 6.335 s); pending the steward's 1M certification**
   (§4.6). Sync now uses a durable collector-change frontier, affected-session
   replay and ordered quota-window extension. The default 300 s cadence and
-  other lanes' work remain. Owner: accounting lane.
+  other lanes' work remain. **P7/P7b: paired 1M steady/burst/drain p95
+  81.250/262.323/81.286 → 3.067/8.467/7.644 s; 100k regression
+  10.985/24.052/12.031 → 1.742/7.606/3.886 s (§4.20), pending the
+  steward's serial 1M certification.** Diagnostics identify whole-account
+  quota replay inside incremental ledger turns; complete-window suffix replay
+  removes it without weakening capture. The after host is quieter; burst/drain,
+  growing active-window suffixes and full rebuild costs remain limitations.
+  Owner: accounting lane.
 - **L3: lane and central metrics are not indexed aggregates.** Native cohort
   queries, as-of reads of stored revisions and paged exports meet 500 ms at
   1M. The lane metrics (M08/M09 derive the ledger again on every read, the
@@ -2728,7 +2930,13 @@ owner. None is hidden by loosening the target.
   Its same-dataset 100k report p95 was 253.48 → 241.54 ms and refresh p95
   907.39 → 807.19 ms; the results-file load averages are quoted there. These
   compatibility samples do not measure controller speedup. Its 1M
-  certification is pending.
+  certification is pending. **P7/P7b: 1M worst light-project p95 per round
+  53.746/11.519/14.728 → 1.846/1.810/1.910 s (§4.20), pending the
+  steward's serial 1M certification.** The fixed 5 s append-to-ledger criterion
+  passes every round with two bounded shared workers; accounting-only scheduling
+  still fails behind 6.5 s analytics / 17.8 s health work. Derived-lane refresh
+  delays and unproduced/live-signal gaps remain; no general freshness target is
+  relaxed or closed.
 - **L8: simulated capacity is not live capacity.** See the opening. Planted
   attempts and generated rollouts certify the telemetry path's behaviour at
   these volumes on this host, nothing about live workers or providers.

@@ -165,6 +165,12 @@ struct SyncPlan {
 /// together. Invalidated bases replay the complete history. Counts describe the
 /// whole projection, as before incremental sync.
 pub fn sync(db: &mut Connection) -> Result<Value> {
+    Ok(sync_observed(db)?.0)
+}
+
+pub(crate) fn sync_observed(db: &mut Connection) -> Result<(Value, Value)> {
+    let mut steps = serde_json::Map::new();
+    let mut timer = std::time::Instant::now();
     let project = db.path().map(std::path::Path::new).and_then(std::path::Path::parent)
         .and_then(std::path::Path::parent).filter(|project| project.join(".state/state.db").is_file()).map(std::path::Path::to_path_buf);
 
@@ -181,7 +187,13 @@ pub fn sync(db: &mut Connection) -> Result<Value> {
         }
         tx.rollback()?;
     };
+    steps.insert("prepare_and_validate_ms".into(), json!(timer.elapsed().as_secs_f64() * 1e3));
+    let dirty: i64 = tx.query_row("SELECT count(*) FROM accounting_dirty_sessions", [], |r| r.get(0))?;
+    let selected: i64 = tx.query_row("SELECT count(*) FROM accounting_selected", [], |r| r.get(0))?;
+    let quota_rebuild: bool = tx.query_row("SELECT quota_rebuild FROM accounting_stream", [], |r| r.get(0))?;
     let SyncPlan { entries, sequence, reason, full, .. } = plan;
+    let mode = if full { "full_rebuild" } else { "incremental" };
+    timer = std::time::Instant::now();
     if full { tx.execute_batch("DELETE FROM usage_dispositions; DELETE FROM usage_entries;")?; }
     else { tx.execute_batch("DELETE FROM usage_dispositions WHERE entry_id IN (SELECT entry_id FROM usage_entries WHERE session_id IN (SELECT session_id FROM accounting_selected));
         DELETE FROM usage_entries WHERE session_id IN (SELECT session_id FROM accounting_selected);")?; }
@@ -200,10 +212,16 @@ pub fn sync(db: &mut Connection) -> Result<Value> {
             *counts.entry(disposition).or_default() += 1;
         }
     }
+    steps.insert("ledger_write_ms".into(), json!(timer.elapsed().as_secs_f64() * 1e3));
+    timer = std::time::Instant::now();
     let (sessions, segments) = super::graph::store_scoped(&tx, &entries, full)?;
+    steps.insert("graph_ms".into(), json!(timer.elapsed().as_secs_f64() * 1e3));
+    timer = std::time::Instant::now();
     let quota_floor: Option<i64> = tx.query_row("SELECT min(observed_unix_ms) FROM quota_window_observations
         WHERE session_id IN (SELECT session_id FROM accounting_selected) OR (SELECT quota_rebuild FROM accounting_stream WHERE singleton=1)=1", [], |r| r.get(0))?;
-    let windows = super::quota::store_scoped(&tx, full)?;
+    let (windows, quota) = super::quota::store_scoped_observed(&tx, full)?;
+    steps.insert("quota_store_ms".into(), json!(timer.elapsed().as_secs_f64() * 1e3));
+    timer = std::time::Instant::now();
     let new_floor: Option<i64> = tx.query_row("SELECT min(observed_unix_ms) FROM quota_window_observations
         WHERE session_id IN (SELECT session_id FROM accounting_selected)", [], |r| r.get(0))?;
     let quota_floor = match (quota_floor, new_floor) { (Some(a), Some(b)) => Some(a.min(b)), (a, b) => a.or(b) };
@@ -238,14 +256,28 @@ pub fn sync(db: &mut Connection) -> Result<Value> {
         params![NORMALIZATION, jiff::Timestamp::now().as_millisecond()])?;
     tx.execute("UPDATE accounting_stream SET watermark=?1,invalidated=NULL,last_mode=?2,last_reason=?3 WHERE singleton=1",
         params![sequence, if full { "full_rebuild" } else { "incremental" }, reason])?;
+    steps.insert("cache_totals_ms".into(), json!(timer.elapsed().as_secs_f64() * 1e3));
+    timer = std::time::Instant::now();
     if let Some(project) = project.as_deref() {
         super::quota::store_dispatch(project, &tx, full, quota_floor)?;
+        steps.insert("quota_dispatch_ms".into(), json!(timer.elapsed().as_secs_f64() * 1e3));
+        timer = std::time::Instant::now();
         super::tools::store(project, &tx, full)?;
+        steps.insert("tools_ms".into(), json!(timer.elapsed().as_secs_f64() * 1e3));
+        timer = std::time::Instant::now();
         super::fleet::store(project, &tx)?;
+        steps.insert("fleet_ms".into(), json!(timer.elapsed().as_secs_f64() * 1e3));
+        timer = std::time::Instant::now();
         super::cost::store_metrics(&tx)?;
+        steps.insert("cost_ms".into(), json!(timer.elapsed().as_secs_f64() * 1e3));
+        timer = std::time::Instant::now();
         crate::telemetry::analytics::inputs::store_canonical(project, &tx)?;
+        steps.insert("analytics_input_frontier_ms".into(), json!(timer.elapsed().as_secs_f64() * 1e3));
+        timer = std::time::Instant::now();
         crate::telemetry::sidecar::store_termination_summary(project, &tx)?;
     }
+    steps.insert("termination_ms".into(), json!(timer.elapsed().as_secs_f64() * 1e3));
+    timer = std::time::Instant::now();
     tx.execute_batch("DELETE FROM accounting_dirty_sessions;")?;
     super::cache::store_frontier(&tx)?;
     // Preserve the public sync counts: they describe the entire stored projection.
@@ -257,7 +289,9 @@ pub fn sync(db: &mut Connection) -> Result<Value> {
         counts.insert(key, count);
     }
     tx.commit()?;
-    Ok(json!({"entries": entry_count, "dispositions": counts, "sessions": sessions, "model_segments": segments, "quota_windows": windows}))
+    steps.insert("frontier_counts_commit_ms".into(), json!(timer.elapsed().as_secs_f64() * 1e3));
+    Ok((json!({"entries": entry_count, "dispositions": counts, "sessions": sessions, "model_segments": segments, "quota_windows": windows}),
+        json!({"last_mode": mode, "last_reason": reason, "dirty_sessions": dirty, "selected_sessions": selected, "quota_rebuild": quota_rebuild, "quota": quota, "steps_ms": steps})))
 }
 
 fn synced(db: &Connection) -> Result<bool> {

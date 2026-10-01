@@ -415,11 +415,22 @@ fn usage_metrics_with(project: &Path, since: Option<i64>, aggregates: bool) -> R
 /// the ledger changed since the last reprice (§12), within the tick budget.
 /// Writes only the sidecar; never creates it.
 pub fn tick(project: &Path, budget: super::codex::Budget) -> Result<()> {
+    tick_observed(project, budget).map(|_| ())
+}
+
+/// The same atomic accounting tick, with diagnostic timings for scale measurements.
+pub fn tick_observed(project: &Path, budget: super::codex::Budget) -> Result<Value> {
     if let Some(mut db) = super::sidecar::open(project, false)? {
+        let t = std::time::Instant::now();
         let observed = attention::observe(project, &mut db, budget);
-        ledger::sync(&mut db)?;
+        let attention_ms = t.elapsed().as_secs_f64() * 1e3;
+        let (_, mut diagnostics) = ledger::sync_observed(&mut db)?;
+        let t = std::time::Instant::now();
         cost::tick(&mut db, budget)?;
+        diagnostics["attention_ms"] = json!(attention_ms);
+        diagnostics["cost_tick_ms"] = json!(t.elapsed().as_secs_f64() * 1e3);
         observed?;
+        return Ok(diagnostics);
     }
-    Ok(())
+    Ok(Value::Null)
 }

@@ -536,13 +536,29 @@ fn sidecar_bytes(d: &Dataset) -> Value {
 /// once-per-interval throttle: the Codex collect within the tick byte budget,
 /// then every lane's tick. Errors are logged and the pass continues, as there.
 fn telemetry_pass(project: &Path) -> (f64, Option<codex::Collected>, Vec<String>) {
-    let (ms, collected, errors, _) = telemetry_pass_steps(project);
+    let (ms, collected, errors, _, _) = telemetry_pass_steps(project);
     (ms, collected, errors)
 }
 
 /// As `telemetry_pass`, with each step's milliseconds (`collect`, then each lane's stream).
 /// A pass: its milliseconds, what the collect read, errors, and per-step milliseconds.
-type PassSteps = (f64, Option<codex::Collected>, Vec<String>, Vec<(&'static str, f64)>);
+type PassSteps = (f64, Option<codex::Collected>, Vec<String>, Vec<(&'static str, f64)>, Value);
+
+/// The shared worker's ledger turn; slower lanes run on DeferredLanes.
+fn telemetry_core_steps(project: &Path) -> PassSteps {
+    let started = Instant::now();
+    let mut errors = Vec::new();
+    let collected = match codex::collect(project, codex::Budget::TICK, false) {
+        Ok(c) => c, Err(e) => { errors.push(format!("collect: {e:#}")); None }
+    };
+    let mut steps = vec![("collect", started.elapsed().as_secs_f64() * 1e3)];
+    let t = Instant::now();
+    let accounting = match telemetry::accounting::tick_observed(project, codex::Budget::TICK) {
+        Ok(v) => v, Err(e) => { errors.push(format!("accounting: {e:#}")); Value::Null }
+    };
+    steps.push(("accounting", t.elapsed().as_secs_f64() * 1e3));
+    (started.elapsed().as_secs_f64() * 1e3, collected, errors, steps, accounting)
+}
 
 fn telemetry_pass_steps(project: &Path) -> PassSteps {
     let started = Instant::now();
@@ -550,12 +566,17 @@ fn telemetry_pass_steps(project: &Path) -> PassSteps {
     let mut steps = Vec::new();
     let collected = match codex::collect(project, codex::Budget::TICK, false) { Ok(c) => c, Err(e) => { errors.push(format!("collect: {e:#}")); None } };
     steps.push(("collect", started.elapsed().as_secs_f64() * 1e3));
+    let mut accounting = Value::Null;
     for lane in &telemetry::LANES {
         let t = Instant::now();
-        if let Err(e) = (lane.tick)(project, codex::Budget::TICK) { errors.push(format!("{} tick: {e:#}", lane.stream)); }
+        if lane.stream == "accounting" {
+            match telemetry::accounting::tick_observed(project, codex::Budget::TICK) {
+                Ok(v) => accounting = v, Err(e) => errors.push(format!("accounting tick: {e:#}")),
+            }
+        } else if let Err(e) = (lane.tick)(project, codex::Budget::TICK) { errors.push(format!("{} tick: {e:#}", lane.stream)); }
         steps.push((lane.stream, t.elapsed().as_secs_f64() * 1e3));
     }
-    (started.elapsed().as_secs_f64() * 1e3, collected, errors, steps)
+    (started.elapsed().as_secs_f64() * 1e3, collected, errors, steps, accounting)
 }
 
 // ---------------------------------------------------------------------------
@@ -1027,8 +1048,8 @@ fn scale_pass_child() {
     let d = Dataset::load(&data_dir());
     telemetry::background::idle_priority(|warning| eprintln!("{warning}"));
     rusqlite::Connection::open(d.sidecar()).unwrap().execute_batch("UPDATE analytics_cells SET checked_unix_ms=checked_unix_ms-120000").unwrap();
-    let (ms, collected, errors, steps) = telemetry_pass_steps(&d.project);
-    println!("pass: {}", json!({"ms": ms, "collected": collected, "errors": errors, "steps": steps.into_iter().map(|(k, v)| (k.to_owned(), json!(v))).collect::<serde_json::Map<_, _>>()}));
+    let (ms, collected, errors, steps, accounting) = telemetry_pass_steps(&d.project);
+    println!("pass: {}", json!({"ms": ms, "collected": collected, "errors": errors, "accounting": accounting, "steps": steps.into_iter().map(|(k, v)| (k.to_owned(), json!(v))).collect::<serde_json::Map<_, _>>()}));
 }
 
 /// The bounded read surfaces, each through the CLI (a fresh process per
@@ -1189,11 +1210,11 @@ fn pass_loop(project: PathBuf, cadence: Duration, stop: Arc<AtomicBool>, sids: V
         let cpu0 = thread_cpu_ms();
         while !stop.load(Ordering::Relaxed) {
             let started = Instant::now();
-            let (ms, collected, errors, steps) = telemetry_pass_steps(&project);
+            let (ms, collected, errors, steps, accounting) = telemetry_pass_steps(&project);
             let seen = delta_counts(&project, &sids);
             views.push((unix_ms(), seen));
             passes.push(json!({"ms": ms, "bytes": collected.as_ref().map(|c| c.bytes), "records": collected.as_ref().map(|c| c.records),
-                "budget_exhausted": collected.as_ref().map(|c| c.budget_exhausted), "errors": errors,
+                "budget_exhausted": collected.as_ref().map(|c| c.budget_exhausted), "errors": errors, "accounting": accounting,
                 "steps": steps.into_iter().map(|(k, v)| (k.to_owned(), json!(v))).collect::<serde_json::Map<_, _>>()}));
             std::thread::sleep(cadence.saturating_sub(started.elapsed()));
         }
@@ -1274,7 +1295,7 @@ fn scale_4_freshness_burst() {
         let steps: serde_json::Map<String, Value> = records.first().and_then(|p| p["steps"].as_object()).map(|first| first.keys().map(|k| (k.clone(),
             dist(&records.iter().filter_map(|p| p["steps"][k].as_f64()).collect::<Vec<_>>()))).collect()).unwrap_or_default();
         phases.insert(label.into(), json!({"rate_per_s": rate, "pass_steps_ms": steps, "seconds": length.as_secs(), "usage_records_appended": appended.len(), "passes": records.len(),
-            "pass_ms": dist(&ms), "pass_cpu_ms_total": cpu, "passes_budget_exhausted": exhausted, "pass_errors": errors.len(), "first_errors": errors.iter().take(3).collect::<Vec<_>>(),
+            "pass_ms": dist(&ms), "accounting_passes": records, "pass_cpu_ms_total": cpu, "passes_budget_exhausted": exhausted, "pass_errors": errors.len(), "first_errors": errors.iter().take(3).collect::<Vec<_>>(),
             "freshness_ms": dist(&fresh), "unseen_after_settle": unseen, "settle": {"passes": settle_passes, "ms": settle.elapsed().as_secs_f64() * 1e3},
             "sidecar_bytes": sidecar_bytes(&d), "loadavg": load_average()}));
     }
@@ -1600,9 +1621,10 @@ fn scale_7_late_slow() {
 }
 
 
-/// Four projects share one non-blocking controller loop, one sequential
-/// telemetry worker and one operator reader, like the ticker. No per-project
-/// telemetry threads: the hot project competes for the same worker as lights.
+/// Four projects share one non-blocking controller, one collection/accounting
+/// worker, one bounded derived-lane worker and one operator reader, like the
+/// ticker. No per-project threads. SCALE_FAIRNESS_DERIVED=0 measures the
+/// original single-worker scheduling with the same accounting implementation.
 #[test]
 #[ignore]
 fn scale_6_fairness() {
@@ -1656,19 +1678,35 @@ fn scale_6_fairness() {
         let worker = {
             let (projects, sids, stop) = (projects.clone(), sids.clone(), stop.clone());
             std::thread::spawn(move || {
+                telemetry::background::idle_priority(|warning| eprintln!("{warning}"));
+                let (derived_tx, derived_rx) = std::sync::mpsc::channel();
+                let split = std::env::var("SCALE_FAIRNESS_DERIVED").as_deref() != Ok("0");
+                let mut derived = split.then(|| telemetry::background::DeferredLanes::new(move |project| {
+                    telemetry::background::idle_priority(|warning| eprintln!("{warning}"));
+                    let started = Instant::now();
+                    let mut errors = Vec::new();
+                    for lane in telemetry::LANES.iter().filter(|lane| lane.stream != "accounting") {
+                        if let Err(e) = (lane.tick)(project, codex::Budget::TICK) { errors.push(format!("{}: {e:#}", lane.stream)); }
+                    }
+                    derived_tx.send(json!({"project": project, "ms": started.elapsed().as_secs_f64() * 1e3, "errors": errors})).unwrap();
+                }).unwrap());
                 let mut views = vec![Vec::new(); 4];
                 let mut passes = vec![Vec::new(); 4];
+                let mut diagnostics = vec![Vec::new(); 4];
                 while !stop.load(Ordering::Relaxed) {
                     let started = Instant::now();
                     for (i, project) in projects.iter().enumerate() {
-                        let (ms, _, errors) = telemetry_pass(project);
+                        let (ms, collected, errors, steps, accounting) = if split { telemetry_core_steps(project) } else { telemetry_pass_steps(project) };
+                        if let Some(derived) = &derived { assert!(derived.submit(project)); }
+                        diagnostics[i].push(json!({"ms": ms, "collected": collected, "accounting": accounting, "steps": steps.into_iter().map(|(k, v)| (k.to_owned(), json!(v))).collect::<serde_json::Map<_, _>>()}));
                         assert!(errors.is_empty(), "{errors:?}");
                         passes[i].push(ms);
                         views[i].push((unix_ms(), delta_counts(project, &sids[i])));
                     }
                     std::thread::sleep(cadence.saturating_sub(started.elapsed()));
                 }
-                (views, passes)
+                if let Some(derived) = &mut derived { derived.stop(); }
+                (views, passes, diagnostics, derived, derived_rx)
             })
         };
         let reader = {
@@ -1703,12 +1741,12 @@ fn scale_6_fairness() {
         }
         stop.store(true, Ordering::Relaxed);
         writer.join().unwrap();
-        let (mut views, passes) = worker.join().unwrap();
+        let (mut views, passes, diagnostics, mut derived, derived_rx) = worker.join().unwrap();
         let mut results = Vec::new();
         for i in 0..4 {
             // Drain, but retain the true append-to-first-visible duration.
             for _ in 0..200 {
-                let (_, c, errors) = telemetry_pass(&projects[i]);
+                let (_, c, errors, _, _) = if derived.is_some() { telemetry_core_steps(&projects[i]) } else { telemetry_pass_steps(&projects[i]) };
                 assert!(errors.is_empty(), "{errors:?}");
                 views[i].push((unix_ms(), delta_counts(&projects[i], &sids[i])));
                 if c.is_some_and(|c| !c.budget_exhausted) { break; }
@@ -1716,7 +1754,7 @@ fn scale_6_fairness() {
             let (fresh, unseen) = freshness(&log.lock().unwrap()[i], &base[i], &views[i]);
             assert_eq!(unseen, 0);
             results.push(json!({"project": i, "hot": i == 0, "admission_ms": dist(&admission[i]), "reconcile_ms": dist(&reconcile[i]),
-                "freshness_ms": dist(&fresh), "pass_ms": dist(&passes[i]),
+                "freshness_ms": dist(&fresh), "pass_ms": dist(&passes[i]), "accounting_passes": diagnostics[i],
                 "appended_usage": fresh.len(), "unseen": unseen}));
         }
         // Drain before joining a slow surface reader: its last query must not
@@ -1726,7 +1764,13 @@ fn scale_6_fairness() {
             results[i]["panel_ms"] = dist(&panel[i]);
             results[i]["digest_ms"] = dist(&digest[i]);
         }
-        rounds.push(json!({"round": round, "projects": results, "loadavg": load_average()}));
+        if let Some(derived) = &mut derived {
+            while !derived.is_finished() { std::thread::sleep(Duration::from_millis(20)); }
+            derived.reap();
+        }
+        let derived_passes: Vec<Value> = derived_rx.try_iter().collect();
+        assert!(derived_passes.iter().all(|pass| pass["errors"].as_array().unwrap().is_empty()), "{derived_passes:?}");
+        rounds.push(json!({"round": round, "projects": results, "derived_passes": derived_passes, "loadavg": load_average()}));
     }
     let state = Arc::try_unwrap(state).ok().unwrap().into_inner().unwrap();
     for (i, (d, (active, totals, mix))) in datasets.iter_mut().zip(state).enumerate() {
@@ -1739,7 +1783,7 @@ fn scale_6_fairness() {
     let fair = rounds.iter().all(|r| r["projects"].as_array().unwrap().iter().skip(1).all(|p|
         p["freshness_ms"]["n"].as_u64().unwrap() > 0 && p["freshness_ms"]["p95"].as_f64().unwrap() <= 5_000.0));
     write_results(&dir, "fairness", &json!({"hot_scale": datasets[0].scale, "light_events": 1_000, "projects": 4,
-        "cadence_ms": cadence.as_millis(), "reader_ms": reader_every.as_millis(), "round_seconds": length.as_secs(),
+        "cadence_ms": cadence.as_millis(), "reader_ms": reader_every.as_millis(), "round_seconds": length.as_secs(), "derived_worker": std::env::var("SCALE_FAIRNESS_DERIVED").as_deref() != Ok("0"),
         "criterion": "each light project has observed usage and p95 append-to-ledger freshness <= 5000 ms in every round", "fair": fair,
         "rounds": rounds, "loadavg_start": load, "loadavg_end": load_average()}));
     assert!(fair, "light-project freshness exceeds the fixed 5 s fairness criterion; see results-fairness.json");

@@ -116,6 +116,10 @@ pub fn store(tx: &Connection) -> Result<usize> {
 }
 
 pub(crate) fn store_scoped(tx: &Connection, full: bool) -> Result<usize> {
+    Ok(store_scoped_observed(tx, full)?.0)
+}
+
+pub(crate) fn store_scoped_observed(tx: &Connection, full: bool) -> Result<(usize, Value)> {
     tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS accounting_accounts(account TEXT PRIMARY KEY); DELETE FROM accounting_accounts;
         INSERT OR IGNORE INTO accounting_accounts SELECT home_digest FROM rollout_sources WHERE session_id IN (SELECT session_id FROM accounting_selected);
         INSERT OR IGNORE INTO accounting_accounts SELECT account FROM quota_window_observations WHERE session_id IN (SELECT session_id FROM accounting_selected) AND account IS NOT NULL;
@@ -132,12 +136,65 @@ pub(crate) fn store_scoped(tx: &Connection, full: bool) -> Result<usize> {
     // A late snapshot can change every later trust decision of its account.
     // Ordered new rows extend the exact saved state; all other changes replay.
     let append = !full && !correction && first_new.as_ref().is_none_or(|first| last.as_ref().is_none_or(|last| first > last));
+    // A late *new* snapshot only changes the suffix of its account's state
+    // machine. Rewind to the start of every window current at that time; the
+    // minimum is a conservative common boundary for all limits/window kinds.
+    // Earlier windows remain exact checkpoints (including flagged counts and
+    // start evidence). Corrections/reassignments still use the original replay.
+    let suffix = !full && !correction && !append;
+    tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS accounting_quota_floors(account TEXT PRIMARY KEY,observed INTEGER NOT NULL); DELETE FROM accounting_quota_floors;")?;
+    let cutoff = first_new.as_ref().map(|first| first.0);
+    if suffix {
+        tx.execute("INSERT INTO accounting_quota_floors
+            SELECT a.account,min(?1,coalesce(min(w.first_observed_unix_ms),?1)) FROM accounting_accounts a
+            LEFT JOIN quota_windows w ON w.account=a.account AND w.first_observed_unix_ms<=?1
+            AND NOT EXISTS(SELECT 1 FROM quota_windows later WHERE later.account=w.account AND later.limit_id=w.limit_id
+                AND later.window_kind=w.window_kind AND later.first_observed_unix_ms<=?1
+                AND later.first_observed_unix_ms>w.first_observed_unix_ms) GROUP BY a.account", [cutoff])?;
+        // Different limits/kinds can have staggered windows. A shared floor
+        // must not cut a retained window in half: its persisted counts/flags
+        // already include observations on both sides. Rewind every crossing
+        // window, including decrease flags that do not advance last_observed,
+        // until the retained prefix is a complete checkpoint for every key.
+        tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS accounting_quota_crossings(account TEXT PRIMARY KEY,observed INTEGER NOT NULL);")?;
+        loop {
+            tx.execute_batch("DELETE FROM accounting_quota_crossings;
+                INSERT INTO accounting_quota_crossings
+                SELECT o.account,min(w.first_observed_unix_ms) FROM quota_window_observations o
+                JOIN quota_windows w ON w.window_id=o.window_id JOIN accounting_quota_floors f ON f.account=o.account
+                WHERE o.observed_unix_ms >= (SELECT min(observed) FROM accounting_quota_floors)
+                AND o.observed_unix_ms>=f.observed AND w.first_observed_unix_ms<f.observed GROUP BY o.account;")?;
+            if tx.execute("UPDATE accounting_quota_floors SET observed=(SELECT observed FROM accounting_quota_crossings c
+                WHERE c.account=accounting_quota_floors.account) WHERE account IN (SELECT account FROM accounting_quota_crossings)", [])? == 0 { break; }
+        }
+    }
     if full { tx.execute_batch("DELETE FROM quota_window_observations; DELETE FROM quota_windows;")?; }
-    else if !append { tx.execute_batch("DELETE FROM quota_window_observations WHERE session_id IN (SELECT session_id FROM accounting_quota_sessions);
+    else if suffix {
+        tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS accounting_quota_replay(session_id TEXT,ordinal INTEGER,PRIMARY KEY(session_id,ordinal));
+            DELETE FROM accounting_quota_replay;")?;
+        // Pin only the suffix's native identities before removing projections.
+        // The observation-order index bounds this read to the affected suffix;
+        // native lookup then uses the existing (session_id,ordinal) primary key.
+        tx.execute("INSERT OR IGNORE INTO accounting_quota_replay
+            SELECT session_id,ordinal FROM quota_window_observations
+            WHERE observed_unix_ms >= (SELECT min(observed) FROM accounting_quota_floors)
+            AND account IN (SELECT account FROM accounting_quota_floors) AND observed_unix_ms >=
+                (SELECT observed FROM accounting_quota_floors f WHERE f.account=quota_window_observations.account)
+            UNION SELECT session_id,ordinal FROM quota_window_observations
+                WHERE account IS NULL AND session_id IN (SELECT session_id FROM accounting_selected) AND observed_unix_ms>=?1
+            UNION SELECT l.session_id,l.ordinal FROM codex_rate_limits l
+                WHERE l.session_id IN (SELECT session_id FROM accounting_selected)
+                AND NOT EXISTS(SELECT 1 FROM quota_window_observations o
+                    WHERE o.session_id=l.session_id AND o.ordinal=l.ordinal AND o.window_kind='primary')", [cutoff])?;
+        tx.execute_batch("DELETE FROM quota_window_observations WHERE (session_id,ordinal) IN (SELECT session_id,ordinal FROM accounting_quota_replay);
+            DELETE FROM quota_windows WHERE account IN (SELECT account FROM accounting_quota_floors)
+            AND first_observed_unix_ms >= (SELECT observed FROM accounting_quota_floors f WHERE f.account=quota_windows.account);")?;
+    } else if !append { tx.execute_batch("DELETE FROM quota_window_observations WHERE session_id IN (SELECT session_id FROM accounting_quota_sessions);
         DELETE FROM quota_windows WHERE account IN (SELECT account FROM accounting_accounts);")?; }
     let filter = if append { " WHERE l.session_id IN (SELECT session_id FROM accounting_selected) AND NOT EXISTS(SELECT 1 FROM quota_window_observations o
-        WHERE o.session_id=l.session_id AND o.ordinal=l.ordinal AND o.window_kind='primary')" }
-        else if full { "" } else { " WHERE l.session_id IN (SELECT session_id FROM accounting_quota_sessions)" };
+        WHERE o.session_id=l.session_id AND o.ordinal=l.ordinal AND o.window_kind='primary')".to_owned() }
+        else if suffix { " WHERE (l.session_id,l.ordinal) IN (SELECT session_id,ordinal FROM accounting_quota_replay)".to_owned() }
+        else if full { String::new() } else { " WHERE l.session_id IN (SELECT session_id FROM accounting_quota_sessions)".to_owned() };
     type Row = (String, i64, Option<String>, Fields, Option<String>, i64, Option<String>, i64, Option<Fields>, Option<String>);
     let rows: Vec<Row> = tx.prepare(&format!("SELECT l.session_id,l.ordinal,l.limit_id,l.used_percent,l.window_minutes,l.resets_at,l.plan_type,l.observed_ts,
         (SELECT min(s.home_digest) FROM rollout_sources s WHERE s.session_id=l.session_id),
@@ -148,6 +205,7 @@ pub(crate) fn store_scoped(tx: &Connection, full: bool) -> Result<usize> {
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, (r.get(3)?, r.get(4)?, r.get(5)?), r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?,
             r.get::<_, bool>(10)?.then(|| Ok::<_, rusqlite::Error>((r.get(11)?, r.get(12)?, r.get(13)?))).transpose()?, r.get(14)?)))?
         .collect::<rusqlite::Result<_>>()?;
+    let replayed = rows.len();
     let (mut current, mut done) = (BTreeMap::<(String, String, &str), Window>::new(), Vec::new());
     for (session, ordinal, limit, primary, plan, observed, account, homes, secondary, reached) in rows {
         for (kind, fields) in KINDS.into_iter().zip([Some(primary), secondary]) {
@@ -162,7 +220,7 @@ pub(crate) fn store_scoped(tx: &Connection, full: bool) -> Result<usize> {
                     Some(used) if minutes > 0 && minutes.checked_mul(60_000).is_some_and(|w| resets.checked_sub(w).is_some()) => {
                         let key = (account.clone(), limit.clone(), kind);
                         let snapshot = Snapshot { account, limit, kind, minutes, resets, observed, used, plan: &plan };
-                        if append && !current.contains_key(&key) && let Some(window) = current_window(tx, account, limit, kind)? {
+                        if (append || suffix) && !current.contains_key(&key) && let Some(window) = current_window(tx, account, limit, kind)? {
                             current.insert(key.clone(), window);
                         }
                         match current.get_mut(&key) {
@@ -218,7 +276,9 @@ pub(crate) fn store_scoped(tx: &Connection, full: bool) -> Result<usize> {
                 show(w.first_used), show(w.used), show(HUNDRED - w.used), show(w.used - w.first_used), w.plan, w.observations, w.flagged])?;
     }
     tx.execute("UPDATE accounting_stream SET quota_rebuild=0", [])?;
-    Ok(tx.query_row("SELECT count(*) FROM quota_windows", [], |r| r.get(0))?)
+    Ok((tx.query_row("SELECT count(*) FROM quota_windows", [], |r| r.get(0))?,
+        json!({"mode": if full { "full" } else if append { "append" } else if suffix { "suffix" } else { "account_replay" },
+            "snapshots_replayed": replayed, "first_new": first_new, "previous_last": last})))
 }
 
 pub(crate) fn synced(db: &Connection) -> Result<bool> {
@@ -315,14 +375,24 @@ pub(crate) fn headroom(db: &Connection, home: &str, decided: i64) -> Result<Valu
 /// also change shared-window candidates, so all homes at/after the earliest
 /// affected observation are reconsidered.
 pub(crate) fn store_dispatch(project: &Path, db: &Connection, full: bool, floor: Option<i64>) -> Result<()> {
-    let canonical = serde_json::to_string(&crate::telemetry::analytics::inputs::canonical(project)?)?;
+    // Capture the validation stamp before reading its dependent decisions.
+    // A concurrent canonical writer then makes this stamp stale, forcing the
+    // read fallback rather than certifying inputs from an older snapshot.
+    let canonical_inputs = crate::telemetry::analytics::inputs::canonical(project)?;
+    let decisions = decisions(project)?;
+    let decision_inputs = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(serde_json::to_vec(&decisions)?));
+    let canonical = serde_json::to_string(&json!({"canonical": canonical_inputs, "decisions": decision_inputs}))?;
     let previous: Option<String> = db.query_row("SELECT canonical FROM accounting_dispatch_frontier WHERE singleton=1", [], |r| r.get(0)).optional()?;
-    let all = full || previous.as_deref() != Some(canonical.as_str());
+    let previous = previous.map(|v| serde_json::from_str::<Value>(&v)).transpose()?;
+    // Reconciliation events do not change historical dispatch inputs. Retain
+    // the complete canonical identity for read validation, but replay only
+    // when the actual decision/home/time tuples changed.
+    let all = full || previous.as_ref().and_then(|v| v["decisions"].as_str()) != Some(decision_inputs.as_str());
     if all { db.execute_batch("DELETE FROM accounting_dispatch_headroom;")?; }
     if all || floor.is_some() {
         let mut insert = db.prepare_cached("INSERT INTO accounting_dispatch_headroom(attempt_id,home_digest,decided_unix_ms,body) VALUES(?1,?2,?3,?4)
             ON CONFLICT(attempt_id) DO UPDATE SET home_digest=excluded.home_digest,decided_unix_ms=excluded.decided_unix_ms,body=excluded.body")?;
-        for (attempt, kind, home, decided) in decisions(project)? {
+        for (attempt, kind, home, decided) in decisions {
             if kind.as_deref().is_some_and(|k| k != "codex") || !all && floor.is_some_and(|at| decided < at) { continue; }
             let Some(home) = home else { continue; };
             let body = headroom(db, &home, decided)?;
@@ -339,7 +409,7 @@ pub(crate) fn dispatch_current(project: &Path, db: &Connection) -> Result<bool> 
     // collect has pending rows. A maintenance invalidation requires fallback.
     if !db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='accounting_dispatch_frontier')", [], |r| r.get::<_, bool>(0))? { return Ok(false); }
     let canonical = serde_json::to_string(&crate::telemetry::analytics::inputs::canonical(project)?)?;
-    let valid: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM accounting_dispatch_frontier WHERE canonical=?1)
+    let valid: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM accounting_dispatch_frontier WHERE canonical=?1 OR json_extract(canonical,'$.canonical')=json(?1))
         AND EXISTS(SELECT 1 FROM accounting_stream WHERE invalidated IS NULL)", [&canonical], |r| r.get(0))?;
     Ok(valid)
 }
