@@ -471,3 +471,50 @@ fn contracts_with_a_repeated_dependency_another_object_format_or_revision_zero_a
         assert!(out.status.success(), "{format}: {}", String::from_utf8_lossy(&out.stderr));
     }
 }
+
+/// Signed historical policies keep their exact bytes; executable additions
+/// require version 2 at the same public contract installation boundary.
+#[test]
+fn signed_policy_compatibility_and_version_two_ingress() {
+    use sha2::{Digest, Sha256};
+    let f = Factory::new();
+    f.ok(&["task", "demo", "add", "compat", "--title", "compat", "--expected-head", &f.head().to_string()]);
+    let legacy = [
+        "cargo test",
+        r#"{"checks":["builds"]}"#,
+        r#"{"version":1,"checks":["relative-program"]}"#,
+        r#"{"version":99,"checks":null}"#,
+        r#"{"version":2,"checks":["/usr/bin/git","diff","--quiet"],"rerun_on_failure":0,"named_checks":{},"stress":null}"#,
+    ];
+    for (index, policy) in legacy.iter().enumerate() {
+        let mut body = f.contract_body("compat", index as u64 + 1, "compatibility", json!({"paths":[{"path":"src/","access":"write"}]}));
+        body["acceptance_policies"][0]["text"] = json!(policy);
+        let mut bytes = serde_json::to_vec_pretty(&body).unwrap();
+        bytes.push(b'\n');
+        let out = f.put(&format!("compat-{index}.json"), &bytes);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let receipt: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        assert_eq!(receipt["digest"], digest);
+        let stored: (Vec<u8>, String, String) = f.raw().query_row(
+            "SELECT c.raw_bytes,c.raw_digest,p.body FROM task_contracts c JOIN acceptance_policies p USING(task_id,contract_revision) WHERE c.task_id='compat' AND c.contract_revision=?1",
+            [index as u64 + 1], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+        ).unwrap();
+        assert_eq!(stored, (bytes, digest, (*policy).to_owned()));
+    }
+    for version in [None, Some(1), Some(3)] {
+        for field in ["rerun_on_failure", "named_checks", "stress"] {
+            let mut policy = json!({"checks":["/usr/bin/git","diff","--quiet"]});
+            if let Some(version) = version { policy["version"] = json!(version); }
+            policy[field] = match field { "rerun_on_failure" => json!(0), "named_checks" => json!({}), _ => Value::Null };
+            let mut body = f.contract_body("compat", legacy.len() as u64 + 1, "invalid additions", json!({"paths":[{"path":"src/","access":"write"}]}));
+            body["acceptance_policies"][0]["text"] = json!(policy.to_string());
+            let head = f.head();
+            let out = f.put("invalid-addition.json", &serde_json::to_vec(&body).unwrap());
+            assert!(!out.status.success(), "accepted {field} under {version:?}");
+            assert_eq!(f.head(), head);
+            let count: usize = f.raw().query_row("SELECT count(*) FROM task_contracts WHERE task_id='compat'", [], |r| r.get(0)).unwrap();
+            assert_eq!(count, legacy.len());
+        }
+    }
+}

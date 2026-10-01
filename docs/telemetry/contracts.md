@@ -41,6 +41,14 @@ needs a new reviewed revision, not a silent reinterpretation.
   inventory, restore reports; not a sidecar stream) and
   [operations-runbook.md](operations-runbook.md).
 
+Sidecar first-open concurrency: migrations acquire `BEGIN IMMEDIATE` before
+reading stream versions inside the write transaction. The standalone
+`journal_mode=WAL` pragma may return immediate `SQLITE_BUSY` while upgrading
+its internal read lock, bypassing SQLite's busy timeout. Open retries that
+pragma outside a transaction for up to five seconds, releasing the failed
+statement's lock between attempts; concurrent collectors then join the same
+migrated sidecar.
+
 ## 0. Common rules
 
 - **Authority.** Telemetry never grants launch, changes budgets, accepts

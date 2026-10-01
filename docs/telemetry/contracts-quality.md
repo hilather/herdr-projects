@@ -492,8 +492,12 @@ Executable policy version 2 accepts `rerun_on_failure` 0–2 (default 0),
 `named_checks`, and optional `stress` with named `checks`, `repetitions` 1–6,
 `concurrency` 1–5 background processes and optional `load` argv. Including the
 foreground execution, at most six check/load processes run concurrently.
-Invalid bounds, missing names and version-1 use of these additions fail signed
-contract put. There are no default stress steps or quarantine decisions.
+Invalid bounds, missing names and use of these additions without explicit
+version 2 fail signed contract put. Policies without these three additions
+retain historical ingress compatibility, including prose and unversioned JSON
+`checks`; their signed bytes and digests are preserved unchanged. Executable
+validation still applies when the verifier runs a policy. There are no default
+stress steps or quarantine decisions.
 All commands retain the original program allowlist, namespace, post-check tree
 proof and one shared timeout/cancellation budget.
 
