@@ -3,6 +3,8 @@ use super::*;
 use std::collections::BTreeMap;
 
 pub const FIXTURE_VERSIONS: &[&str] = &["1.4.0-R4161.1"];
+/// Versions with a recorded steward live reconciliation (owner-approved).
+pub const LIVE_VERSIONS: &[&str] = &["1.4.0-R4161.1"];
 
 pub(super) struct Source {
     session: String,
@@ -91,9 +93,11 @@ pub fn capabilities() -> Value {
     let fields = ["id", "recorded_at", "payload.record.workspace_root", "payload.event.model",
         "payload.event.usage.input_tokens", "payload.event.usage.output_tokens", "payload.event.usage.cache_read_tokens",
         "payload.event.usage.cache_write_tokens", "payload.event.usage.reasoning_tokens", "path.parent_session_id"]
-        .map(|field| json!({"kind":"model_completed", "field":field, "available":true, "basis":"reported", "certified":"fixture"}));
-    json!({"adapter":"muse", "interface":"session_jsonl", "certified_versions":[], "fixture_versions":FIXTURE_VERSIONS,
-        "accepted_versions":FIXTURE_VERSIONS, "certification":"fixture", "uncertified_version":"cli_version_uncertified",
+        // The 1.4.0-R4161.1 live run (docs/telemetry/muse-live-1.4.0.md) observed every
+        // field, including subagent sessions linked by path.
+        .map(|field| json!({"kind":"model_completed", "field":field, "available":true, "basis":"reported", "certified":"live", "live_versions":LIVE_VERSIONS}));
+    json!({"adapter":"muse", "interface":"session_jsonl", "certified_versions":LIVE_VERSIONS, "fixture_versions":FIXTURE_VERSIONS,
+        "accepted_versions":FIXTURE_VERSIONS, "certification":"live", "uncertified_version":"cli_version_uncertified",
         "fields":fields, "profiles":[], "live_certification":"separate_owner_gated_step"})
 }
 

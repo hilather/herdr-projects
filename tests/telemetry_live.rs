@@ -369,6 +369,11 @@ fn live(kind: &str) {
         "version",
     );
     let version = String::from_utf8(version_bytes).unwrap();
+    // Muse prints `Muse Code 1.4.0 (1.4.0-R4161.1)`: its certified identity is
+    // the parenthesized build id (as in `.muse-release-info.json`), not the semver.
+    let version = if kind == "muse" {
+        version.rsplit_once('(').and_then(|(_, b)| b.trim().strip_suffix(')')).unwrap_or(&version).to_owned()
+    } else { version };
     let version = version
         .split_whitespace()
         .map(|s| s.trim_start_matches('v'))

@@ -137,7 +137,9 @@ fn native_muse_exact_usage_children_privacy_replay_backup_retention() {
         .find(|a| a["adapter"] == "muse")
         .unwrap();
     assert_eq!(cap["fixture_versions"], json!(["1.4.0-R4161.1"]));
-    assert_eq!(cap["certified_versions"], json!([]));
+    // Steward's live reconciliation of 1.4.0-R4161.1 (docs/telemetry/muse-live-1.4.0.md).
+    assert_eq!(cap["certified_versions"], json!(["1.4.0-R4161.1"]));
+    assert!(cap["fields"].as_array().unwrap().iter().all(|f| f["certified"] == "live"));
     f.cli("collect");
     assert_eq!(f.cli_args(&["accounting", "entries"]).0, entries);
     for path in &paths {
