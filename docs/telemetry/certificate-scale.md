@@ -2863,6 +2863,27 @@ unit/source-text assertion or existing test expectation change. Benchmark
 stores, archives, temporary interposer and preserved binaries are removed
 before commit; verification logs remain under ignored `target/`.
 
+#### Steward 1M certification of P7c (2026-10-01, 16:31–16:43, serial, quiet host)
+
+Release build of `perf/1m-freshness` (P7b + P7c), `SCALE_EVENTS=1000000
+SCALE_ACTIVE=64`, seed 5100, `SCALE_CADENCE_MS=1000`; 1-minute load 1.66–2.39.
+The worker's provisional 14.8 s steady p95 was host noise; it was measured at much higher load.
+
+| 1M/64 freshness p95 | original | §4.22 main | **P7c** | target |
+| --- | --- | --- | --- | --- |
+| steady 100/s | 34.5 s | 40.3 s | **3.3 s** (p50 1.8 s; 84 passes, p95 1.79 s) | ≤ 5 s ✓ |
+| burst 1,000/s | 54.9 s | 121 s | **9.7 s** | — |
+| drain 100/s | 31.8 s | 26.4 s | **8.3 s** | — |
+
+Fairness (`scale_6_fairness`, three 15 s rounds): `fair: true`. Light-project p95
+3.7/3.8/3.8, 3.3/3.5/3.5 and 3.3/3.5/3.6 s; hot project 6.0–6.8 s. **L2 steady
+freshness and L7 fairness are met at 1M.** Every correctness gate held. Pass
+errors 0, budget exhaustion 0.
+
+Contention: the worker's loaded gate loop passed 10/10 (load 3.8–9.0). The
+steward's alternating loaded three-suite runs after rebase on main `155b280`:
+P7c 0/6, main 0/6 (load 3.2–3.8).
+
 ### 4.21 P8: maintained M02 comparison and live health (100k follow-up)
 
 Branch `perf/compare-1m`, base `628b59f`. **Pending the steward's serial
