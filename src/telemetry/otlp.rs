@@ -115,6 +115,8 @@ const MAPPINGS: &[(&str, &str, &str, &[&str])] = &[
     ("grok", "grok_code.error.count", "tool", &["error_category", "model"]),
 ];
 
+const GROK_LIVE_FIELDS: &[&str] = &["model", "input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens", "cache_creation_tokens"];
+
 pub fn capabilities() -> Vec<Value> {
     let mut out = Vec::new();
     for harness in ["claude-code", "gemini-cli", "grok", "muse", "codex"] {
@@ -131,7 +133,10 @@ pub fn capabilities() -> Vec<Value> {
             } else {
                 vec!["timeUnixNano"]
             }) {
-                fields.push(json!({"kind":name,"field":field,"available":true,"basis":if matches!(field,"model"|"tool_name"|"function_name"|"error_category"|"outcome"|"gen_ai.request.model"|"gen_ai.provider.name"|"token_type") {"reported_excerpt"} else {"reported"},"certified":"fixture","caveat":"native_scope_only_no_cross_surface_sum","reason":null}));
+                // Grok 1.0.46 live run (docs/telemetry/grok-live-1.0.46.md) observed the
+                // api_request usage counters and model; everything else stays fixture.
+                let live = harness == "grok" && *name == "grok_code.api_request" && GROK_LIVE_FIELDS.contains(&field);
+                fields.push(json!({"kind":name,"field":field,"available":true,"basis":if matches!(field,"model"|"tool_name"|"function_name"|"error_category"|"outcome"|"gen_ai.request.model"|"gen_ai.provider.name"|"token_type") {"reported_excerpt"} else {"reported"},"certified":if live {"live"} else {"fixture"},"live_versions":if live {json!(["1.0.46"])} else {json!([])},"caveat":"native_scope_only_no_cross_surface_sum","reason":null}));
             }
         }
         for field in [
@@ -161,6 +166,7 @@ pub fn capabilities() -> Vec<Value> {
         if harness == "grok" {
             let cap = out.last_mut().unwrap();
             cap["fixture_versions"] = json!(["1.0.46"]);
+            cap["certified_versions"] = json!(["1.0.46"]);
             cap["accepted_versions"] = json!(["1.0.46"]);
             cap["native_source"] = json!({"certified":"none", "reason":"local_usage_schema_not_established"});
         }

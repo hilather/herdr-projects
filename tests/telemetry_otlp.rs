@@ -585,9 +585,14 @@ fn grok_1046_metrics_are_versioned_bound_and_content_free() {
     let (cap, _) = f.cli_args(&["collectors", "capabilities", "--json"]);
     let grok = cap["adapters"].as_array().unwrap().iter().find(|a| a["adapter"] == "otlp:grok").unwrap();
     assert_eq!(grok["fixture_versions"], json!(["1.0.46"]));
-    assert_eq!(grok["certified_versions"], json!([]));
+    // Live only for the api_request usage counters and model the 1.0.46 live run observed.
+    assert_eq!(grok["certified_versions"], json!(["1.0.46"]));
     assert_eq!(grok["native_source"]["certified"], "none");
-    assert!(grok["fields"].as_array().unwrap().iter().filter(|f| f["available"] == true).all(|f| f["certified"] == "fixture"));
+    for f in grok["fields"].as_array().unwrap().iter().filter(|f| f["available"] == true) {
+        let live = f["kind"] == "grok_code.api_request" && ["model", "input_tokens", "output_tokens", "reasoning_tokens",
+            "cache_read_tokens", "cache_creation_tokens"].contains(&f["field"].as_str().unwrap());
+        assert_eq!(f["certified"], if live { "live" } else { "fixture" }, "{f}");
+    }
 }
 
 #[test]
@@ -1330,18 +1335,14 @@ fn http_protobuf_attempt_token_binding_auth_and_project_token_unchanged() {
         ),
         200
     );
-    // LC4 marks eight usage metrics as reconciliation-only; that reason
-    // does not change the project credential's resource-based binding.
-    assert_eq!(
-        otlp::records(&f.project)
-            .unwrap()
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|r| r["binding"] == "unknown_attempt" && r["attempt_id"].is_null())
-            .count(),
-        10
-    );
+    // The project credential binds solely from the resource attribute, which
+    // names no known attempt: exactly this request's 10 rows are added, all
+    // unbound. LC4's reconciliation-only reasons don't change binding.
+    let after = otlp::records(&f.project).unwrap();
+    let before = rows.as_array().unwrap();
+    let added: Vec<&Value> = after.as_array().unwrap().iter().filter(|r| !before.contains(r)).collect();
+    assert_eq!(added.len(), 10);
+    assert!(added.iter().all(|r| r["binding"] == "unknown_attempt" && r["attempt_id"].is_null()));
     privacy_scan(&f, &[attempt_token, "GROK_SECRET_CONTENT"]);
 }
 
