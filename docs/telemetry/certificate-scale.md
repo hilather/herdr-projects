@@ -3160,6 +3160,24 @@ Files: `src/telemetry/analytics/{inputs,lifecycle,query,store}.rs`,
 certificate. No new crate, source process spawn, schema, unit test or
 source-text assertion.
 
+**Steward 1M certification (2026-10-01, 19:23–19:31, serial, load 1.7–3.3).**
+Release build of this branch, `SCALE_EVENTS=1000000 SCALE_ACTIVE=64`, seed 5100,
+`SCALE_QUERY_SET=p9 SCALE_REPEATS=3 SCALE_PER_ROUND=1`; all gates held, with no
+violations and the canonical store unchanged.
+
+| 1M/64 p95 | §4.22 main | this branch | target |
+| --- | --- | --- | --- |
+| `health` (live states) | 14,029 ms (P8: 936) | **400 ms** | ≤ 500 ✓ |
+| `view health` | 566 ms | **258 ms** | ≤ 500 ✓ |
+| `view project` | 664 ms | **127 ms** | ≤ 500 ✓ |
+| `health evaluate` | 15,990 ms (P8: 968) | **361 ms** | ≤ 500 ✓ |
+| `query M02` / `M07` | 30 / 192 ms | 30 / 192 ms | ≤ 500 ✓ |
+| warm `analytics refresh` p50 / p95 | 905 / 2,085 ms | 980 / 1,126 ms, 77 MiB | no regression |
+
+L3 verdict: every measured dashboard surface meets 500 ms at 1M on a quiet host.
+The worker measured `health` p95 at 690 ms at load 8.6, so the margin shrinks
+under heavy contention.
+
 ## 5. Inefficiencies found and fixed
 
 The first measurement (same generator, same host) missed the query and
