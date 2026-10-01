@@ -102,7 +102,8 @@ pub(crate) fn clock(group: &str) -> bool { matches!(group, "attention" | "fleet"
 
 pub(crate) fn stamp(group: &str, canonical: &Value, generations: &BTreeMap<String, i64>) -> String {
     let relevant = |table: &str| table == "schema" || match group {
-        "native" => false,
+        // Native lifecycle rows and their maintained task body read only the canonical store.
+        "native" | "lifecycle" => false,
         "operating" => table.starts_with("operating_"),
         "central" | "comparison" => !table.starts_with("operating_"),
         "diagnostics" => matches!(table, "codex_usage" | "codex_usage_times" | "rollout_sources"),
@@ -123,6 +124,23 @@ pub(crate) fn cached(db: &Connection, group: &str, since: Option<i64>, stamp: &s
     let body: Option<String> = db.query_row("SELECT body FROM analytics_provider_aggregates WHERE provider=?1 AND window_key=?2 AND inputs=?3",
         rusqlite::params![group, window(since), stamp], |r| r.get(0)).optional()?;
     body.map(|b| serde_json::from_str(&b).map_err(Into::into)).transpose()
+}
+
+/// Whether a maintained body exists for exactly this stamp (no body is read).
+pub(crate) fn maintained(db: &Connection, group: &str, since: Option<i64>, stamp: &str) -> Result<bool> {
+    if generations(db)?.is_none() { return Ok(false); }
+    Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM analytics_provider_rows WHERE provider=?1 AND window_key=?2 AND inputs=?3)",
+        rusqlite::params![group, window(since), stamp], |r| r.get(0))?)
+}
+
+/// The latest recorded revision of a tracked cell when refresh certified it
+/// for exactly this stamp: `(revision, content digest, core body)`. The row
+/// pair is read in one statement, so a racing refresh cannot mix two states.
+pub(crate) fn certified_revision(db: &Connection, cell: &str, stamp: &str) -> Result<Option<(i64, String, String)>> {
+    if !db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='analytics_checked_inputs' AND type='table')", [], |r| r.get::<_, bool>(0))? { return Ok(None); }
+    Ok(db.query_row("SELECT r.revision,r.content_digest,r.body FROM analytics_checked_inputs c
+        JOIN analytics_revisions r ON r.revision=(SELECT max(revision) FROM analytics_revisions WHERE cell=c.cell)
+        WHERE c.cell=?1 AND c.inputs=?2", rusqlite::params![cell, stamp], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?)
 }
 
 /// Extract only the requested metric. A coverage read must not deserialize

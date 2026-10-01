@@ -126,6 +126,30 @@ pub fn load(project: &Path) -> Result<Vec<Task>> {
     }).collect())
 }
 
+/// The loaded tasks as one disposable maintained body (first-candidate
+/// verdicts are M30's own load and are not part of it). Lossless: `decode`
+/// returns tasks equal to `load`'s.
+pub(crate) fn encode(tasks: &[Task]) -> Value {
+    Value::Array(tasks.iter().map(|t| json!([t.id, t.state, t.accepted, t.accepted_at, t.route, t.class, t.replay,
+        t.attempts.iter().map(|a| json!([a.id, a.state, a.decided, a.reserved, a.ended, a.kind])).collect::<Vec<_>>()])).collect())
+}
+
+/// `None` when the body is not the shape `encode` writes.
+pub(crate) fn decode(body: &Value) -> Option<Vec<Task>> {
+    let text = |v: &Value| v.as_str().map(str::to_owned);
+    let maybe_text = |v: &Value| if v.is_null() { Some(None) } else { v.as_str().map(|s| Some(s.to_owned())) };
+    let maybe_int = |v: &Value| if v.is_null() { Some(None) } else { v.as_i64().map(Some) };
+    body.as_array()?.iter().map(|row| {
+        let row = row.as_array().filter(|r| r.len() == 8)?;
+        let attempts = row[7].as_array()?.iter().map(|a| {
+            let a = a.as_array().filter(|a| a.len() == 6)?;
+            Some(Attempt { id: text(&a[0])?, state: text(&a[1])?, decided: maybe_int(&a[2])?, reserved: maybe_int(&a[3])?, ended: maybe_int(&a[4])?, kind: maybe_text(&a[5])? })
+        }).collect::<Option<Vec<_>>>()?;
+        Some(Task { id: text(&row[0])?, state: text(&row[1])?, accepted: row[2].as_bool()?, accepted_at: maybe_int(&row[3])?, route: maybe_text(&row[4])?,
+            class: maybe_text(&row[5])?, replay: row[6].as_bool()?, attempts, first_candidate: None })
+    }).collect()
+}
+
 /// First submissions are ordered across all attempts and contract revisions.
 /// Walk attempts once and use the canonical attempt index for their submissions.
 const FIRST_SUBMISSIONS: &str = "SELECT a.task_id,s.submission_id,s.attempt_id,s.contract_revision,s.created_unix_ms
@@ -302,7 +326,10 @@ fn compute(metric: &str, members: &[&Member]) -> (Value, Value, Value, Option<&'
 }
 
 /// Evaluate one native metric: the body (without projection fields) and its drill-down lineage.
-pub fn evaluate(tasks: &[Task], r: &Request) -> (Value, Lineage) {
+pub fn evaluate(tasks: &[Task], r: &Request) -> (Value, Lineage) { evaluate_with(tasks, r, true) }
+
+/// As `evaluate`; without `lineage` the (empty) lineage is not built, for reads that never drill or digest.
+pub(crate) fn evaluate_with(tasks: &[Task], r: &Request, with_lineage: bool) -> (Value, Lineage) {
     let (members, excluded, cutoff) = cohort(tasks, r);
     let all: Vec<&Member> = members.iter().collect();
     let (numerator, denominator, value, reason, extra) = compute(r.metric, &all);
@@ -341,6 +368,7 @@ pub fn evaluate(tasks: &[Task], r: &Request) -> (Value, Lineage) {
         }).collect();
     }
     let mut lineage = Lineage::new();
+    if !with_lineage { return (body, lineage); }
     let task_row = |t: &Task| ("task", t.id.clone(), t.attrs());
     let numerator: Vec<Row> = match r.metric {
         "M07" => members.iter().flat_map(|m| m.task.attempts.iter().map(|a| ("attempt", a.id.clone(),

@@ -205,6 +205,8 @@ pub struct Sources<'a> {
     pub project: &'a Path,
     pub tasks: Vec<Task>,
     tasks_loaded: bool,
+    /// The tasks were read from the canonical store, not from the maintained body.
+    pub(crate) tasks_live: bool,
     first_candidates_loaded: bool,
     watermarks: Option<Value>,
     pub(crate) use_aggregates: bool,
@@ -219,12 +221,44 @@ impl<'a> Sources<'a> {
         let canonical_inputs = super::inputs::canonical(project)?;
         let input_generations = crate::telemetry::sidecar::read(project)?.as_deref()
             .map(super::inputs::generations).transpose()?.flatten().unwrap_or_default();
-        Ok(Sources { project, tasks: Vec::new(), tasks_loaded: false, first_candidates_loaded: false, watermarks: None, bodies: BTreeMap::new(), canonical_inputs, input_generations, use_aggregates: true, include_first_candidate_report: false })
+        Ok(Sources { project, tasks: Vec::new(), tasks_loaded: false, tasks_live: false, first_candidates_loaded: false, watermarks: None, bodies: BTreeMap::new(), canonical_inputs, input_generations, use_aggregates: true, include_first_candidate_report: false })
     }
 
     fn load_tasks(&mut self) -> Result<()> {
-        if !self.tasks_loaded { self.tasks = lifecycle::load(self.project)?; self.tasks_loaded = true; }
+        if self.tasks_loaded { return Ok(()); }
+        match self.maintained_tasks() {
+            Some(tasks) => self.tasks = tasks,
+            None => { self.tasks = lifecycle::load(self.project)?; self.tasks_live = true; }
+        }
+        self.tasks_loaded = true;
         Ok(())
+    }
+
+    /// The tasks refresh maintained for exactly these canonical inputs. Any
+    /// mismatch, absence or unreadable body falls back to the live load.
+    fn maintained_tasks(&self) -> Option<Vec<lifecycle::Task>> {
+        if !self.use_aggregates { return None; }
+        let db = crate::telemetry::sidecar::read(self.project).ok()??;
+        let stamp = super::inputs::stamp("lifecycle", &self.canonical_inputs, &self.input_generations);
+        super::inputs::cached(&db, "lifecycle", None, &stamp).ok()?.and_then(|body| lifecycle::decode(&body))
+    }
+
+    /// Load the tasks from the canonical store (refresh maintains them from this).
+    pub(crate) fn load_tasks_live(&mut self) -> Result<()> {
+        if !self.tasks_live { self.tasks = lifecycle::load(self.project)?; self.tasks_live = true; self.tasks_loaded = true; self.first_candidates_loaded = false; }
+        Ok(())
+    }
+
+    /// The cell's body, digest and revision when refresh certified its latest
+    /// revision for exactly the current inputs. Clock-dependent groups, the
+    /// operating-time metric and unsupported cells are never read this way.
+    fn certified(&self, cell: &Cell, db: &rusqlite::Connection) -> Result<Option<(Value, String, i64)>> {
+        if !self.use_aggregates || cell.metric.id == "M03" || cell.unsupported().is_some() { return Ok(None); }
+        let group = super::inputs::group(cell.version.provider, cell.metric.id);
+        if super::inputs::clock(group) { return Ok(None); }
+        let stamp = super::inputs::stamp(group, &self.canonical_inputs, &self.input_generations);
+        Ok(super::inputs::certified_revision(db, &cell.key(), &stamp)?
+            .and_then(|(revision, digest, body)| Some((serde_json::from_str(&body).ok()?, digest, revision))))
     }
 
     /// Where each source stood when read: canonical head and lifecycle input
@@ -314,7 +348,16 @@ fn lane_core(body: Value) -> Value {
 }
 
 /// Evaluate one cell live: `(core, lineage)`. Deterministic in the sources.
-pub fn evaluate(sources: &mut Sources, cell: &Cell) -> Result<(Value, Lineage)> {
+pub fn evaluate(sources: &mut Sources, cell: &Cell) -> Result<(Value, Lineage)> { evaluate_with(sources, cell, true) }
+
+/// The cell's core body only: certified recorded content when refresh vouches
+/// for the current inputs, else a live evaluation without lineage.
+pub(crate) fn evaluate_core(sources: &mut Sources, cell: &Cell) -> Result<Value> {
+    if let Some(db) = crate::telemetry::sidecar::read(sources.project)? && let Some((core, _, _)) = sources.certified(cell, &db)? { return Ok(core); }
+    Ok(evaluate_with(sources, cell, false)?.0)
+}
+
+fn evaluate_with(sources: &mut Sources, cell: &Cell, with_lineage: bool) -> Result<(Value, Lineage)> {
     if let Some((reason, diagnostic)) = cell.unsupported() { return Ok((unavailable_core(reason, diagnostic), Lineage::new())); }
     if cell.metric.id == "M03" {
         let mut core=crate::telemetry::operating::evaluate(sources.project,cell.from,cell.to)?;
@@ -329,7 +372,7 @@ pub fn evaluate(sources: &mut Sources, cell: &Cell) -> Result<(Value, Lineage)> 
                 sources.first_candidates_loaded = true;
             }
             let request = lifecycle::Request { metric: cell.metric.id, cohort: cell.cohort, from: cell.from, to: cell.to, horizon: cell.horizon, by: cell.by.as_deref() };
-            let (mut core, lineage) = lifecycle::evaluate(&sources.tasks, &request);
+            let (mut core, lineage) = lifecycle::evaluate_with(&sources.tasks, &request, with_lineage);
             if core["cells"].as_array().is_some_and(|cells| cells.len() > MAX_CELLS) {
                 return Ok((unavailable_core("too_many_cells", json!({"max": MAX_CELLS})), Lineage::new()));
             }
@@ -379,6 +422,13 @@ fn analytics_tables(db: &rusqlite::Connection) -> rusqlite::Result<bool> {
 pub fn latest(db: &rusqlite::Connection, key: &str) -> Result<Option<Stored>> {
     if !analytics_tables(db)? { return Ok(None); }
     Ok(db.query_row(LATEST, [key], stored_row).optional()?)
+}
+
+/// The latest revision of `key` when its content digest is `digest`; the body is not read.
+fn latest_revision(db: &rusqlite::Connection, key: &str, digest: &str) -> Result<Option<i64>> {
+    if !analytics_tables(db)? { return Ok(None); }
+    let latest: Option<(i64, String)> = db.query_row("SELECT revision,content_digest FROM analytics_revisions WHERE cell=?1 ORDER BY revision DESC LIMIT 1", [key], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+    Ok(latest.filter(|(_, stored)| stored == digest).map(|(revision, _)| revision))
 }
 
 fn as_of(db: &rusqlite::Connection, key: &str, at: Option<i64>, seq: Option<i64>) -> Result<Option<Stored>> {
@@ -487,6 +537,21 @@ const CURSOR_KIND: &str = "analytics-drill";
 /// the key under `$HOME/.config/herdr-projects` (`run_with` names it).
 pub fn run(project: &Path, request: &Request) -> Result<Value> { run_with(project, request, &Keyring::from_home()) }
 
+/// Live values for rules that read neither lineage nor recorded projections:
+/// the envelope of `run` with the projection's revision and digest left null.
+/// One `Sources` serves every request, so canonical rows load once.
+pub(crate) fn run_lean(sources: &mut Sources, request: &Request) -> Result<Value> {
+    let now = jiff::Timestamp::now().as_millisecond();
+    let watermarks = sources.watermarks()?;
+    let mut results = Vec::new();
+    for cell in &request.cells {
+        let core = evaluate_core(sources, cell)?;
+        let projection = json!({"mode": "live", "revision": null, "matches_revision": null, "content_digest": null});
+        results.push(envelope(cell, core, projection, &watermarks, now));
+    }
+    Ok(json!({"schema_version": SCHEMA_VERSION, "contract": CONTRACT, "request": request.normalized, "query_unix_ms": now, "results": results}))
+}
+
 /// As `run`, with drill-down cursors sealed and opened by `keys`.
 pub fn run_with(project: &Path, request: &Request, keys: &Keyring) -> Result<Value> {
     let now = jiff::Timestamp::now().as_millisecond();
@@ -517,9 +582,18 @@ pub fn run_with(project: &Path, request: &Request, keys: &Keyring) -> Result<Val
                 }
             }
         } else {
-            let (core, lineage) = evaluate(&mut sources, cell)?;
-            let digest = content_digest(&core, &lineage);
-            let matched = match sidecar.as_deref() { Some(db) => latest(db, &key)?.filter(|s| s.digest == digest).map(|s| s.revision), None => None };
+            // A drill-down needs the live lineage; every other read of a cell
+            // refresh certified for these inputs reuses its recorded body and digest.
+            let certified = match sidecar.as_deref() { Some(db) if request.drill.is_none() => sources.certified(cell, db)?, _ => None };
+            let (core, lineage, digest, matched) = match certified {
+                Some((core, digest, revision)) => (core, Lineage::new(), digest, Some(revision)),
+                None => {
+                    let (core, lineage) = evaluate(&mut sources, cell)?;
+                    let digest = content_digest(&core, &lineage);
+                    let matched = match sidecar.as_deref() { Some(db) => latest_revision(db, &key, &digest)?, None => None };
+                    (core, lineage, digest, matched)
+                }
+            };
             let projection = json!({"mode": "live", "revision": null, "matches_revision": matched, "content_digest": digest});
             (envelope(cell, core, projection, &watermarks, now), Some(Ok((lineage, digest, matched))))
         };

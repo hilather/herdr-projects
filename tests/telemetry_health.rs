@@ -437,6 +437,89 @@ fn attempt_cost_shift_and_latency_shift_compare_two_windows() {
     assert_eq!(latency["reasons"], json!([{"code": "no_shift", "ratio_to_prior": "100/100"}]));
 }
 
+// Maintained lifecycle rows and certified cells
+
+/// A copy without the fields that are a function of the clock, for comparing two reads.
+fn timeless(v: &Value) -> Value {
+    const CLOCK: [&str; 10] = ["query_unix_ms", "observation_cutoff_unix_ms", "lag_ms", "evaluated_unix_ms", "age_ms", "observed_unix_ms", "from_unix_ms", "to_unix_ms", "text", "lag_text"];
+    match v {
+        Value::Object(o) => Value::Object(o.iter().filter(|(k, _)| !CLOCK.contains(&k.as_str())).map(|(k, v)| (k.clone(), timeless(v))).collect()),
+        Value::Array(a) => Value::Array(a.iter().map(timeless).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Everything the operator surfaces answer from the native lifecycle and the central lane.
+fn surfaces(p: &Planted) -> Value {
+    json!({"query": timeless(&p.json(&["query", "--metric", "M01,M02,M06,M07,M13", "--json"])), "project": timeless(&p.json(&["view", "project", "--json"])),
+        "health_view": timeless(&p.json(&["view", "health", "--json"])), "health": timeless(&p.health()["states"])})
+}
+
+fn shift_samples(out: &Value) -> (Value, Value) {
+    let s = state(out, "latency_shift");
+    (s["evidence"]["current"]["samples"].clone(), s["evidence"]["prior"]["samples"].clone())
+}
+
+/// After `analytics refresh` the native cells, the canonical task rows and the
+/// central lane are served from maintained rows. Cold (maintained rows deleted)
+/// equals cached; a canonical or sidecar change is visible at once, with no
+/// refresh and whatever the maintained bodies hold; and a rule window slides
+/// with the clock while the maintained rows stay valid.
+#[test]
+fn maintained_reads_match_live_never_go_stale_and_windows_follow_the_clock() {
+    let p = Planted::new();
+    let config = configuration(&p.db(), "codex", "0.154.0");
+    let one = |state| Attempt { configuration: &config, state, profile: ("coder", "codex") };
+    let now = unix_ms();
+    for i in 0..6 { task(&p.db(), &format!("cur{i}"), "accepted", "code", &[one("completed")], now - 24 * HOUR + i * 1_000); }
+    for i in 0..5 { task(&p.db(), &format!("old{i}"), "accepted", "code", &[one("completed")], now - 8 * 24 * HOUR + i * 1_000); }
+    p.sidecar_created();
+    assert_eq!(shift_samples(&p.health()), (json!(6), json!(5)));
+
+    p.json(&["analytics", "refresh"]);
+    let rows = |sql: &str| p.sidecar().query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+    assert_eq!(rows("SELECT count(*) FROM analytics_provider_rows WHERE provider='lifecycle'"), 1);
+    assert!(rows("SELECT count(*) FROM analytics_checked_inputs") > 10);
+    let cached = surfaces(&p);
+    let recorded = p.json(&["query", "--metric", "M02", "--json"])["results"][0]["projection"]["matches_revision"].clone();
+    assert!(recorded.is_i64(), "a certified cell reports the revision it matches: {recorded}");
+    p.sidecar().execute_batch("DELETE FROM analytics_checked_inputs; DELETE FROM analytics_provider_rows;").unwrap();
+    assert_eq!(surfaces(&p), cached, "cold evaluation equals the maintained reads");
+    p.json(&["analytics", "refresh"]);
+    assert_eq!(rows("SELECT count(*) FROM analytics_provider_rows WHERE provider='lifecycle'"), 1);
+
+    // While the stamp is valid the maintained rows are what a window reads.
+    p.sidecar().execute("UPDATE analytics_provider_rows SET body='[]' WHERE provider='lifecycle'", []).unwrap();
+    assert_eq!(shift_samples(&p.health()), (json!(0), json!(0)));
+    // A canonical change invalidates them without a refresh.
+    task(&p.db(), "late", "accepted", "code", &[one("completed")], now - 2 * HOUR);
+    assert_eq!(shift_samples(&p.health()), (json!(7), json!(5)));
+    let m02 = p.json(&["query", "--metric", "M02", "--json"]);
+    assert_eq!((&m02["results"][0]["denominator"], &m02["results"][0]["projection"]["matches_revision"]), (&json!(12), &Value::Null), "{m02}");
+    // So does a sidecar change, for the central lane.
+    let m13 = |p: &Planted| { let r = p.json(&["query", "--metric", "M13", "--json"]); (r["results"][0]["numerator"].clone(), r["results"][0]["denominator"].clone()) };
+    p.json(&["analytics", "refresh"]);
+    assert_eq!(m13(&p), (json!(0), json!(12)));
+    usage(&p.sidecar(), "cur0-a0", "s1", 100);
+    assert_eq!(m13(&p), (json!(1), json!(12)));
+    p.json(&["analytics", "refresh"]);
+    let cached = surfaces(&p);
+    p.sidecar().execute_batch("DELETE FROM analytics_checked_inputs; DELETE FROM analytics_provider_rows;").unwrap();
+    assert_eq!(surfaces(&p), cached);
+
+    // Time alone moves the window and the collector age; nothing was refreshed or written.
+    // Terminal 8 s after the current 7-day window opens: it leaves the window as the clock advances.
+    task(&p.db(), "edge", "accepted", "code", &[one("completed")], unix_ms() - 7 * 24 * HOUR + 8_000 - 100);
+    let at = unix_ms() - 15 * MINUTE + 8_000;
+    p.sidecar().execute("INSERT INTO collect_offsets(path_digest,device,inode,byte_offset,records,rate_limits,model,effort,updated_unix_ms) VALUES('p',1,1,0,0,0,NULL,NULL,?1)", [at]).unwrap();
+    p.json(&["analytics", "refresh"]);
+    let before = p.health();
+    assert_eq!((&state(&before, "collector_stale")["state"], shift_samples(&before)), (&json!("ok"), (json!(8), json!(5))));
+    std::thread::sleep(std::time::Duration::from_secs(9));
+    let after = p.health();
+    assert_eq!((&state(&after, "collector_stale")["state"], shift_samples(&after)), (&json!("warn"), (json!(7), json!(6))));
+}
+
 // Cooldown, deduplication and inbox notices
 
 /// warn → one alert; the same condition again → the same alert

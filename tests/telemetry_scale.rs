@@ -1057,6 +1057,16 @@ fn scale_pass_child() {
 /// plus the fleet pane refresh and digest section as the long-running
 /// `watch` renders them (in process). `SCALE_REPEATS` rounds, the order
 /// rotated each round.
+/// A copy without the fields that are a function of the clock.
+fn timeless(v: &Value) -> Value {
+    const CLOCK: [&str; 10] = ["query_unix_ms", "observation_cutoff_unix_ms", "lag_ms", "evaluated_unix_ms", "age_ms", "observed_unix_ms", "from_unix_ms", "to_unix_ms", "text", "lag_text"];
+    match v {
+        Value::Object(o) => Value::Object(o.iter().filter(|(k, _)| !CLOCK.contains(&k.as_str())).map(|(k, v)| (k.clone(), timeless(v))).collect()),
+        Value::Array(a) => Value::Array(a.iter().map(timeless).collect()),
+        other => other.clone(),
+    }
+}
+
 #[test]
 #[ignore]
 fn scale_2_queries() {
@@ -1088,8 +1098,9 @@ fn scale_2_queries() {
     // minutes at a million events: heavy = the fleet surfaces, health, report, compare.
     let heavy = |name: &str| ["workspace", "health", "report", "compare"].iter().any(|h| name.starts_with(h));
     let set = std::env::var("SCALE_QUERY_SET").unwrap_or_else(|_| "all".into());
-    let queries: Vec<(&str, Vec<&str>)> = queries.into_iter().filter(|(name, _)| match set.as_str() { "light" => !heavy(name), "heavy" => heavy(name), "dg1" => *name == "report" || *name == "query M02 terminal_cohort", "p8" => *name == "compare M02" || *name == "health (live states)", _ => true }).collect();
-    let in_process = !matches!(set.as_str(), "light" | "dg1" | "p8");
+    let queries: Vec<(&str, Vec<&str>)> = queries.into_iter().filter(|(name, _)| match set.as_str() { "light" => !heavy(name), "heavy" => heavy(name), "dg1" => *name == "report" || *name == "query M02 terminal_cohort", "p8" => *name == "compare M02" || *name == "health (live states)",
+        "p9" => ["view project", "view health", "health (live states)", "query M02 terminal_cohort", "query M07 assignment_cohort"].contains(name), _ => true }).collect();
+    let in_process = !matches!(set.as_str(), "light" | "dg1" | "p8" | "p9");
     let query_bin = std::env::var_os("SCALE_QUERY_BIN");
     let comparison_bin = std::env::var_os("SCALE_COMPARE_BIN");
     let mut byte_comparisons = 0;
@@ -1112,11 +1123,17 @@ fn scale_2_queries() {
                         .args(["--root", d.root.to_str().unwrap(), "telemetry", "demo"]).args(args);
                     measure(c).ok()
                 } else { telemetry(&d, args).ok() };
-                if *name == "compare M02" && let Some(binary) = &comparison_bin {
+                if let Some(binary) = &comparison_bin && (*name == "compare M02" || set == "p9") {
                     let mut c = Command::new(binary);
                     c.env_clear().env("HOME", d.home()).env("PATH", "/usr/bin:/bin").env("HERDR_BIN_PATH", "/bin/false")
                         .args(["--root", d.root.to_str().unwrap(), "telemetry", "demo"]).args(args);
-                    assert_eq!(run.stdout, measure(c).ok().stdout, "compare bytes differ from baseline");
+                    let baseline = measure(c).ok().stdout;
+                    if *name == "compare M02" { assert_eq!(run.stdout, baseline, "compare bytes differ from baseline"); }
+                    else {
+                        // The dashboards print the clock (query time, lag, ages, rule windows): everything else is identical.
+                        let parse = |bytes: &[u8]| timeless(&serde_json::from_slice::<Value>(bytes).unwrap());
+                        assert_eq!(parse(&run.stdout), parse(&baseline), "{name} differs from baseline");
+                    }
                     byte_comparisons += 1;
                 }
                 round_samples.entry(name.to_string()).or_default().push(run.wall_ms);

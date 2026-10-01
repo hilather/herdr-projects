@@ -255,6 +255,16 @@ fn refresh_with_wait(project: &Path, extra: Option<Cell>, wait: &mut crate::tele
         .map(|((since, group), body)| Ok((group.clone(), super::inputs::window(*since),
             super::inputs::stamp(group, &sources.canonical_inputs, &sources.input_generations), serde_json::to_string(body)?)))
         .collect::<Result<Vec<_>>>()?;
+    // The canonical task rows every native lifecycle read starts from. Validity
+    // is a stamp lookup; a missing or stale body is rebuilt from this snapshot.
+    let lifecycle_stamp = super::inputs::stamp("lifecycle", &sources.canonical_inputs, &sources.input_generations);
+    if !sources.tasks_live
+        && !crate::telemetry::sidecar::read(project)?.is_some_and(|read| super::inputs::maintained(&read, "lifecycle", None, &lifecycle_stamp).unwrap_or(false)) {
+        sources.load_tasks_live()?;
+    }
+    if sources.tasks_live {
+        bodies.push(("lifecycle".to_owned(), super::inputs::window(None), lifecycle_stamp, serde_json::to_string(&super::lifecycle::encode(&sources.tasks))?));
+    }
     if let Some(body) = maintained_comparison {
         bodies.push(("comparison".to_owned(), super::inputs::window(None),
             super::inputs::stamp("comparison", &sources.canonical_inputs, &sources.input_generations), serde_json::to_string(&body)?));

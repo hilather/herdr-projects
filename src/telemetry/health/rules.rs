@@ -182,10 +182,12 @@ pub struct Ctx<'a> {
     pub project: &'a Path,
     pub now: i64,
     results: BTreeMap<(Option<i64>, Option<i64>), BTreeMap<String, Value>>,
+    /// One set of sources for every window of the pass: canonical rows load once.
+    sources: Option<query::Sources<'a>>,
 }
 
 impl<'a> Ctx<'a> {
-    pub fn new(project: &'a Path, now: i64) -> Self { Ctx { project, now, results: BTreeMap::new() } }
+    pub fn new(project: &'a Path, now: i64) -> Self { Ctx { project, now, results: BTreeMap::new(), sources: None } }
 
     /// One query-service result (`analytics-query.v1`) for `metric` over `[from, to)`,
     /// every metric of that window requested in one read.
@@ -199,7 +201,8 @@ impl<'a> Ctx<'a> {
             }).filter(|m| window_of(m, self.now).contains(&(from, to))).map(str::to_owned).collect();
             let args = query::Args { metrics, cohort: None, from, to, as_of: None, as_of_seq: None, by: None, horizon_ms: None, drill: None,
                 page_size: query::DEFAULT_PAGE, cursor: None, json: true };
-            let out = query::run(self.project, &query::request(&args)?)?;
+            if self.sources.is_none() { self.sources = Some(query::Sources::new(self.project)?); }
+            let out = query::run_lean(self.sources.as_mut().expect("sources"), &query::request(&args)?)?;
             let map = out["results"].as_array().into_iter().flatten().map(|r| (r["metric_id"].as_str().unwrap_or_default().to_owned(), r.clone())).collect();
             self.results.insert((from, to), map);
         }

@@ -3020,6 +3020,146 @@ every gate held, with no violations and the canonical store unchanged.
 L3 verdict: `compare` meets 500 ms. Live `health` and `health evaluate` are ~15×
 faster but still above 500 ms.
 
+### 4.23 P9: maintained lifecycle rows, certified cells and lean health (1M, pending the steward's certification)
+
+Branch `perf/views-health-500`, base `d19cd8e`. **Pending the steward's serial
+1M certification**: the numbers below are this worker's runs on the shared
+host (1-minute load 2.9–8.6, quoted per row), not authoritative. Dataset: one
+disk-backed seed-5100 fixture, `SCALE_EVENTS=1000000 SCALE_ACTIVE=64`
+(`scale_0_generate`, `scale_1_ingest` once; 10,000 attempts, so the
+canonical lifecycle is the same size as the 100k fixture's), then an explicit
+`analytics refresh`. Phase 2 with `SCALE_QUERY_SET=p9 SCALE_REPEATS=7
+SCALE_PER_ROUND=1`; `SCALE_QUERY_BIN` runs the preserved main CLI (`d19cd8e`) for
+before and `SCALE_COMPARE_BIN` runs it after each timed after-sample.
+
+**Where the time went (1M, main, loaded host, one process each).**
+
+| Surface | Phase | ms |
+| --- | --- | ---: |
+| `view project` (≈ 640) | native M01/M02/M06/M07: canonical task load (attempts, contracts, classes, acceptance times) + cohort + lineage rows + digest, ≈ 275–375 each; one load is shared by the four in the view | ≈ 500 |
+| | M36 (fleet, clock group, evaluated live) | ≈ 100 |
+| `view health` (≈ 600) | M40: a 19 MB body read from SQLite, parsed and cloned three times, hashed for the digest, and parsed *again* from the latest revision only to compare its digest | ≈ 450 |
+| | M13/M14/M15/M29/M38/M39/M49 (each ≈ 30 over the process) | ≈ 100 |
+| `health` (≈ 1,000–1,280) | `latency_shift`: two windows × a full canonical task load, lineage and digest | 480–508 |
+| | `fix_reopened` (review lane, 30-day window) | 94 |
+| | `budget_exposure` | 57 |
+| | `collector_stale` (query of M08/M13/M14/M38) | 61 |
+| | `recommendation_stale` (cached comparison + dispatch log) | 48 |
+| | `usage_after_termination`, `accounting_conflict`, `waiting_on_you`, `quota_headroom`, `verification_flaky` | 40 / 22 / 9 / 3 / 3 |
+
+Clock-independent (maintainable at refresh time): the canonical task rows
+every native cohort starts from, the recorded content and digest of every
+default non-clock cell, M40, the comparison, the dispatch log, ledger
+dispositions, the after-termination count and the shadow budget. Genuinely
+dependent on "now": collector age (`now − last collect`), the moving windows
+(M06/M07 current vs prior 7 days, M27/M48 30 days, flakes 30 days), quota
+expiry (`resets > now`), waits and every threshold comparison. The latter stay
+live on every read; they now sit on maintained inputs instead of history.
+
+**Design.**
+
+1. *Maintained lifecycle rows.* Refresh stores the loaded tasks (without M30's
+   first-candidate verdicts) as a provider body `lifecycle` in the existing
+   disposable `analytics_provider_rows`, stamped with the canonical
+   file/WAL identity, event head and registry version (the `native` stamp: no
+   sidecar table is an input). It is computed from the refresh's pinned
+   snapshot and published by the same short validated writer as the other
+   bodies (`inputs::stamp` is rechecked against the live generations and the
+   canonical identity under the writer; a changed input skips the publish).
+   `Sources::load_tasks` reads it when the stamp is current and otherwise
+   loads from the canonical store exactly as before. A missing body with a
+   current stamp (an older sidecar) is rebuilt by the next refresh. Every native
+   cell, window and dimension — including the rule windows of health — starts
+   from it.
+2. *Certified cells.* `analytics_checked_inputs` already records the stamp each
+   tracked cell was last evaluated for. A non-drill read of a default,
+   non-clock cell whose recorded stamp equals the current one reuses the latest
+   revision's body and content digest (one SQL statement) instead of
+   re-evaluating, building lineage and hashing the body; `matches_revision`
+   is that revision. Drill-downs, clock groups, M03, windows, `--by` cells and
+   any stamp mismatch use the live evaluator as before. The live path also no
+   longer decodes the latest revision's body just to compare its digest.
+3. *Lean health windows.* Health requests the values of its rules through one
+   shared `Sources` (`query::run_lean`): the canonical rows load once for all
+   four windows, no lineage is built and the digest is not computed (health
+   never reads the projection). The cohort filter runs over the maintained rows
+   with the current time, so a moving window needs no history scan.
+
+**Identical answers.** The maintained tasks decode to values equal to `load`'s
+(lossless integers, strings and options; M30 still loads its own first
+candidates); `evaluate_with(.., lineage=false)` runs the same cohort and metric
+code and only skips building the lineage; a certified cell is returned only
+when its recorded stamp equals the stamp recomputed from the current canonical
+identity and every relevant input generation, and the stored body and digest are
+by construction the evaluation of those inputs; `run_lean` differs from `run`
+only in the projection's revision and digest, which no rule reads. Rules
+version, notices, alerts and the no-canonical-write/no-dispatch properties are
+untouched. `SCALE_COMPARE_BIN` runs the main CLI after every timed sample and
+requires the same JSON apart from the clock fields (query/observation time,
+lag, ages, window bounds and rendered lag text): 35 comparisons across `view
+project`, `view health`, `health`, `query M02` and `query M07
+--cohort assignment_cohort`, all identical. A wider manual sweep (29 default
+metrics, `--by`, cohort and windowed queries, all five views, `health`,
+`compare`) was identical as well.
+
+| 1M/64, n=7, p50 / p95 ms | main `d19cd8e` | this branch |
+| --- | ---: | ---: |
+| `health` (live states) | 1,217.4 / 1,369.5 | **392.6 / 439.4** |
+| `view health` | 814.3 / 853.6 | **255.8 / 368.0** |
+| `view project` | 878.9 / 946.4 | **119.0 / 210.4** |
+| `query M02` (default cell) | 406.1 / 485.9 | 32.4 / 37.9 |
+| `query M07 --cohort assignment_cohort` (uncertified cell) | 395.1 / 521.7 | 240.4 / 434.8 |
+
+Load averages (1 / 5 / 15 min), start → end: before `4.15 / 5.46 / 5.64 →
+4.74 / 5.49 / 5.65`; after `2.94 / 5.43 / 5.64 → 4.15 / 5.46 / 5.64`. Earlier
+n=3 runs on the same fixture (loads 3.8–4.5): health 1,414.6 / 1,450.5 →
+383.5 / 498.8, `view health` 896.5 / 939.5 → 243.6 / 353.3, `view project`
+957.6 / 973.9 → 104.2 / 134.7. The host was roughly 1.3–1.5× slower than the
+steward's (main `health` 936 ms there), so the quiet-host expectation is below
+these values. A run during load 8.6 gave `health` p95 690 ms: **the 500 ms
+claim holds only on a quiet host and is for the steward to certify.**
+
+| 1M/64, 3 runs | main | this branch |
+| --- | ---: | ---: |
+| `health evaluate` p50 / p95 ms (load 3.3 → 3.2) | 960.9 / 1,008.4 | **417.1 / 423.1** |
+| `analytics refresh`, warm, three sets of 5, median ms | 920 / 877 / 886 | 1,165 / 927 / 893 |
+| `write_lock_ms` of a warm refresh (three samples) | 74–115 | 61–103 |
+
+Refresh keeps its cost to within noise (one set ran ~30 % slower, the other
+two within 2 %); its writer holds are unchanged because the new body is published by the
+same single short validated transaction. At 100k/64 (a regression check; the
+same 10,000 attempts; loads 2.4 → 2.2) `health` 844.5 / 859.8 → 302.9 / 312.5,
+`view health` 472.5 / 473.4 → 192.7 / 193.8, `view project` 652.8 / 672.7 →
+89.7 / 93.3, all 15 comparisons identical.
+
+Remaining `health` time (loaded host): review lane for the 30-day window
+(≈ 85–95 ms, the whole lane is evaluated for M27/M48), `budget_exposure`
+(≈ 70), `recommendation_stale` (≈ 56–65, mostly the canonical dispatch log),
+`usage_after_termination` (≈ 40–55), `collector_stale` (≈ 32) and
+`accounting_conflict` (≈ 25): further candidates for maintained bodies if the
+steward's figure is not enough.
+
+E2E (public CLI, `tests/telemetry_health.rs`): the maintained reads equal the
+live evaluator after deleting the maintained rows; a maintained body is what a
+window reads while its stamp is valid (a poisoned `lifecycle` row is observed);
+a canonical change and a sidecar change are each visible on the next read with
+no refresh, and the poisoned body is not served; a collector age and a rule
+window cross their boundaries as the clock advances (after a refresh and with
+no write). The full requested set ran: `telemetry`, `telemetry_accounting`,
+`telemetry_certification`, `telemetry_collect`, `telemetry_conformance`,
+`telemetry_health`, `telemetry_query`, `telemetry_views`, `telemetry_workspace`,
+`telemetry_quality`, `telemetry_review`, `telemetry_compare`, `telemetry_export`,
+`telemetry_scale` (the gate `scale_gates_hold_under_load` passes unchanged),
+`telemetry_operations`, `cli` and `canonical_worker`. Every failure is the
+sandbox: the 75 failing tests of this worker's run bind Unix sockets or create
+`/tmp/herdr-approval-*` (`Operation not permitted`, "cannot create private
+signature verification directory"), none touches the changed code.
+
+Files: `src/telemetry/analytics/{inputs,lifecycle,query,store}.rs`,
+`src/telemetry/health/rules.rs`, `tests/telemetry_{health,scale}.rs`, this
+certificate. No new crate, source process spawn, schema, unit test or
+source-text assertion.
+
 ## 5. Inefficiencies found and fixed
 
 The first measurement (same generator, same host) missed the query and
@@ -3199,6 +3339,14 @@ owner. None is hidden by loosening the target.
   at 1-minute loads 3.37 → 4.27 before / 3.35 → 3.14 after.
   Pending the steward's 1M certification; this worker's 1M fixture preparation
   remains pending clarification. Health still exceeds 500 ms; L3 stays open.**
+  **P9 (§4.23) maintains the canonical lifecycle rows, reuses certified cell
+  revisions and shares one set of sources across health's windows. At 1M/64
+  on the shared host (n=7, loads 2.9–4.7), `health` p50/p95 1,217/1,370 →
+  393/439 ms, `view health` 814/854 → 256/368 ms, `view project` 879/946 →
+  119/210 ms and `health evaluate` 961/1,008 → 417/423 ms; answers identical
+  apart from the clock fields. Pending the steward's 1M certification; the
+  500 ms target is met on this worker's runs and L3 closes only if the steward
+  confirms it.**
   Owners: accounting lane, analytics (TM4.1).
 - **L4: the ticker's telemetry pass exceeds the 256 MiB envelope at 10,000
   bindings.** The collector itself stays within it (58–115 MB) and its byte
