@@ -930,6 +930,7 @@ fn accounting_fields_match_the_adapter_certificate() {
         ("codex", "0.159.2", "docs/telemetry/codex-live-0.159.2.md"),
         ("claude-code", "2.1.286", "docs/telemetry/claude-live-2.1.286.md"),
         ("otlp:grok", "1.0.46", "docs/telemetry/grok-live-1.0.46.md"),
+        ("otlp:devin", "3000.11.3", "docs/telemetry/devin-live-3000.11.3.md"),
         ("muse", "1.4.0-R4161.1", "docs/telemetry/muse-live-1.4.0.md")];
     for adapter in adapters {
         let claims_live = adapter["fields"].as_array().into_iter().flatten().any(|f| f["certified"] == "live");

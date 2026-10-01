@@ -674,7 +674,8 @@ fn live(kind: &str) {
     if kind == "devin" {
         assert!(!records.is_empty(), "bound Devin usage must reach the ledger");
         assert!(!own.is_empty(), "Devin must report its own usage through the delta token metric");
-        assert!(differences.values().all(|v| v == &json!(0)), "Devin metric and ledger counters must all reconcile");
+        // Devin reports no reasoning breakdown: `not_reported` is honest, never zero-as-measured.
+        assert!(differences.values().all(|v| v == &json!(0) || v == &json!("not_reported")), "Devin metric and ledger counters must all reconcile");
     }
     if kind == "grok" {
         assert!(!records.is_empty(), "bound Grok usage must reach the ledger");

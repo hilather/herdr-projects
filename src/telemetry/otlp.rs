@@ -123,6 +123,8 @@ const DEVIN_SERVICE: &str = "devin-local";
 /// Devin `input_tokens` excludes cache reads and writes; the ledger stores their sum.
 const DEVIN_NORMALIZATION: &str = "otlp-devin-exclusive-v1";
 
+// Devin 3000.11.3 live run (docs/telemetry/devin-live-3000.11.3.md).
+const DEVIN_LIVE_FIELDS: &[&str] = &["model", "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens"];
 const GROK_LIVE_FIELDS: &[&str] = &["model", "input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens", "cache_creation_tokens"];
 
 pub fn capabilities() -> Vec<Value> {
@@ -143,8 +145,9 @@ pub fn capabilities() -> Vec<Value> {
             }) {
                 // Grok 1.0.46 live run (docs/telemetry/grok-live-1.0.46.md) observed the
                 // api_request usage counters and model; everything else stays fixture.
-                let live = harness == "grok" && *name == "grok_code.api_request" && GROK_LIVE_FIELDS.contains(&field);
-                fields.push(json!({"kind":name,"field":field,"available":true,"basis":if matches!(field,"model"|"tool_name"|"function_name"|"error_category"|"outcome"|"gen_ai.request.model"|"gen_ai.provider.name"|"token_type") {"reported_excerpt"} else {"reported"},"certified":if live {"live"} else {"fixture"},"live_versions":if live {json!(["1.0.46"])} else {json!([])},"caveat":"native_scope_only_no_cross_surface_sum","reason":null}));
+                let live = (harness == "grok" && *name == "grok_code.api_request" && GROK_LIVE_FIELDS.contains(&field))
+                    || (harness == "devin" && *name == "api_request" && DEVIN_LIVE_FIELDS.contains(&field));
+                fields.push(json!({"kind":name,"field":field,"available":true,"basis":if matches!(field,"model"|"tool_name"|"function_name"|"error_category"|"outcome"|"gen_ai.request.model"|"gen_ai.provider.name"|"token_type") {"reported_excerpt"} else {"reported"},"certified":if live {"live"} else {"fixture"},"live_versions":if live { if harness == "devin" { json!([DEVIN_VERSION]) } else { json!(["1.0.46"]) } } else {json!([])},"caveat":"native_scope_only_no_cross_surface_sum","reason":null}));
             }
         }
         for field in [
@@ -174,6 +177,7 @@ pub fn capabilities() -> Vec<Value> {
         if harness == "devin" {
             let cap = out.last_mut().unwrap();
             cap["fixture_versions"] = json!([DEVIN_VERSION]);
+            cap["certified_versions"] = json!([DEVIN_VERSION]);
             cap["accepted_versions"] = json!([DEVIN_VERSION]);
             cap["native_source"] = json!({"certified":"none", "reason":"local_usage_schema_not_established"});
         }

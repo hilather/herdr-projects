@@ -690,9 +690,15 @@ fn devin_3000_11_3_contract_is_version_gated_bound_and_content_free() {
     let (capabilities, _) = f.cli_args(&["collectors", "capabilities", "--json"]);
     let adapters = capabilities["adapters"].as_array().unwrap();
     let cap = adapters.iter().find(|a| a["adapter"] == "otlp:devin").unwrap();
-    assert_eq!((cap["fixture_versions"].clone(), cap["accepted_versions"].clone(), cap["certified_versions"].clone()), (json!(["3000.11.3"]), json!(["3000.11.3"]), json!([])));
+    // Steward's live reconciliation (docs/telemetry/devin-live-3000.11.3.md): live only for
+    // the api_request usage counters and model; everything else stays fixture.
+    assert_eq!((cap["fixture_versions"].clone(), cap["accepted_versions"].clone(), cap["certified_versions"].clone()), (json!(["3000.11.3"]), json!(["3000.11.3"]), json!(["3000.11.3"])));
     assert_eq!(cap["native_source"], json!({"certified":"none","reason":"local_usage_schema_not_established"}));
-    assert!(cap["fields"].as_array().unwrap().iter().filter(|f| f["available"] == true).all(|f| f["certified"] == "fixture"));
+    for f in cap["fields"].as_array().unwrap().iter().filter(|f| f["available"] == true) {
+        let live = f["kind"] == "api_request" && ["model", "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens"]
+            .contains(&f["field"].as_str().unwrap());
+        assert_eq!(f["certified"], if live { "live" } else { "fixture" }, "{f}");
+    }
 }
 
 #[test]
