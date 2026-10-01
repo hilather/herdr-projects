@@ -356,7 +356,7 @@ Cards (gaps that stop those questions being answered):
   `absent`). Produce it from the first submission's verification run per
   task: verified-accepted on the first candidate or not. It is the direct
   "clean on the first pass" measure.
-- **DG2 M10 cache-read share — done.** `M10.v1` (registry v3) reads
+- **DG2 M10 cache-read share — done.** `M10.v1` (registry v4) reads
   maintained accepted ledger totals: cache reads / compatible inclusive input,
   with cache writes separate and explicit excluded-session reasons. Codex,
   Claude and OpenCode native mappings count; Gemini message updates remain

@@ -10,6 +10,8 @@ nothing here writes `state.db`.
 
 ## 1. Metric registry (`analytics-registry.v4`)
 
+Version history: v1 TM4.1; v2 adds `verification_flip_rate` (DG6, #198); v3 adds M30 `M30.submission-v1` (DG1, #202); v4 adds M10 `M10.v1` (DG2).
+
 `telemetry <slug> metrics registry [--json]` prints one declared table
 (`registry.rs`) of every metric `telemetry report` or `query` can name:
 M01–M50 and lane C's `flaky_tests` and `verification_flip_rate`. A change is a new registry version, never
