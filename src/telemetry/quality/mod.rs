@@ -19,6 +19,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("../../../migrations/telemetry/quality/0001_proxy_signals.sql"),
     include_str!("../../../migrations/telemetry/quality/0002_integration_outcomes.sql"),
     include_str!("../../../migrations/telemetry/quality/0003_verification_flakes.sql"),
+    include_str!("../../../migrations/telemetry/quality/0004_verification_observations.sql"),
 ];
 
 /// `herdr-projects telemetry <slug> quality ...`

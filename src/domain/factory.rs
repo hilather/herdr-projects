@@ -489,6 +489,13 @@ impl UntrustedContractDocument {
             {
                 return Err("invalid acceptance policy".into());
             }
+            // Historical prose policies remain valid. Executable policy additions
+            // are validated at contract put, before signing or persistence.
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&policy.text)
+                && (value.get("checks").is_some() || ["rerun_on_failure", "stress", "named_checks"].iter().any(|key| value.get(key).is_some())) {
+                super::verification_policy::ExecutionPolicy::parse(policy.text.as_bytes())
+                    .map_err(|error| error.to_string())?;
+            }
             acceptance_policies.push(AcceptancePolicy {
                 id: policy.id,
                 text: policy.text,

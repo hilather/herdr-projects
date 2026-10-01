@@ -14,8 +14,9 @@ needs a new reviewed revision, not a silent reinterpretation.
   in `telemetry_streams(stream, version)`: `codex` (§5, migrations under
   `migrations/telemetry/`, also `user_version`; 3 adds TM5.1's read indexes,
   certificate-scale.md §5), and one stream per lane under
-  `migrations/telemetry/<stream>/`: `ingest`, `accounting`, `quality`,
-  `review`, `analytics` (TM4.1 aggregate revisions), `health` (TM4.5 alert
+  `migrations/telemetry/<stream>/`: `ingest`, `accounting`, `quality` (0004 adds DG6d/e rerun observations; contracts-quality.md §6),
+  `review`,
+  `analytics` (TM4.1 aggregate revisions), `health` (TM4.5 alert
   state), `otlp` (DG4a sanitized native records, migration 0001;
   DG4c Gemini SDK file cursors, migration 0002;
   contracts-collection.md DG4a/DG4c). A reader refuses only a

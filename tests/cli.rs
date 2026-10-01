@@ -3735,6 +3735,25 @@ fn task_contract_put_and_result_submit_keep_worker_bytes_untrusted() {
         assert_eq!(runtime::snapshot(&project).unwrap().head, before.head);
         assert_eq!(rusqlite::Connection::open(&db_path).unwrap().query_row("SELECT count(*) FROM task_contracts", [], |row| row.get::<_,u64>(0)).unwrap(), 0);
     }
+    for (index, policy) in [
+        serde_json::json!({"version":2,"checks":["/usr/bin/git","diff","--quiet"],"rerun_on_failure":3}),
+        serde_json::json!({"version":2,"checks":["/usr/bin/git","diff","--quiet"],"rerun_on_failure":-1}),
+        serde_json::json!({"version":1,"checks":["/usr/bin/git","diff","--quiet"],"rerun_on_failure":1}),
+        serde_json::json!({"version":2,"checks":["/usr/bin/git","diff","--quiet"],"named_checks":{"ci":["/usr/bin/git","diff","--quiet"]},"stress":{"checks":["ci"],"repetitions":0,"concurrency":1}}),
+        serde_json::json!({"version":2,"checks":["/usr/bin/git","diff","--quiet"],"named_checks":{"ci":["/usr/bin/git","diff","--quiet"]},"stress":{"checks":["ci"],"repetitions":7,"concurrency":1}}),
+        serde_json::json!({"version":2,"checks":["/usr/bin/git","diff","--quiet"],"named_checks":{"ci":["/usr/bin/git","diff","--quiet"]},"stress":{"checks":["ci"],"repetitions":1,"concurrency":6}}),
+    ].into_iter().enumerate() {
+        let mut invalid = original.clone();
+        invalid["acceptance_policies"][0]["text"] = policy.to_string().into();
+        let path = home.path().join(format!("invalid-verification-policy-{index}.json"));
+        std::fs::write(&path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y", "sign", "-f"]).arg(&key).args(["-n", CONTRACT_SIGNATURE_NAMESPACE]).arg(&path).status().unwrap().success());
+        let signature = path.with_extension("json.sig");
+        let rejected = hp(home.path(), &["--root", root_arg, "task", "demo", "contract", "put", "--input-file", path.to_str().unwrap(), "--signature", signature.to_str().unwrap()]);
+        assert!(!rejected.status.success(), "accepted invalid verification policy {index}");
+        assert_eq!(runtime::snapshot(&project).unwrap().head, before.head);
+        assert_eq!(rusqlite::Connection::open(&db_path).unwrap().query_row("SELECT count(*) FROM task_contracts", [], |row| row.get::<_,u64>(0)).unwrap(), 0);
+    }
     let installed = hp(home.path(), &["--root", root_arg, "task", "demo", "contract", "put", "--input-file", doc_path.to_str().unwrap(), "--signature", sig_path.to_str().unwrap()]);
     assert!(installed.status.success(), "{}", String::from_utf8_lossy(&installed.stderr));
     let installed: serde_json::Value = serde_json::from_slice(&installed.stdout).unwrap();

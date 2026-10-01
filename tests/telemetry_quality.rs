@@ -97,7 +97,7 @@ fn first_candidate_ci_proxy_and_test_weakening_flag() {
     let (collected, _) = f.cli_args(&["quality", "collect"]);
     assert_eq!(collected["proxy_signals"], json!({"observed": 3, "flagged": 1, "weakening_unavailable": 0, "deferred": 0}));
     assert_eq!(f.cli_args(&["quality", "collect"]).0["proxy_signals"], json!({"observed": 0, "flagged": 0, "weakening_unavailable": 0, "deferred": 0}), "settled signals are not re-observed");
-    assert_eq!(f.cli_args(&["quality", "status"]).0, json!({"stream": "quality", "version": 3}));
+    assert_eq!(f.cli_args(&["quality", "status"]).0, json!({"stream": "quality", "version": 4}));
 
     let after = f.report();
     let m45 = &f.cli_args(&["quality", "report"]).0["metrics"]["M45"];

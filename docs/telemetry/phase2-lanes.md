@@ -425,12 +425,12 @@ Cards (gaps that stop those questions being answered):
     test outcomes (test names and pass/fail: metadata, within the privacy
     default) so a flake is attributed to a specific test, not a whole
     verdict.
-  - **DG6d stress verification (policy, opt-in).** A verification step that
+  - **Done (DG6d, policy v2 / metadata v2) stress verification (policy, opt-in).** A verification step that
     runs the declared suites under controlled concurrent load: the steward's
     six-run concurrent-load loop as a product feature. It applies to change
     classes that touch write paths, transactions, locks, migrations or the
     ticker. It caught P3's lock regression before merge.
-  - **DG6e honest re-run on failure (policy).** A failed check may be re-run.
+  - **Done (DG6e, quality 0004) honest re-run on failure (policy).** A failed check may be re-run.
     A re-run that passes is recorded as a flake with its evidence and raises
     the flip metric. It is never recorded as a clean pass.
   - **Not planned:** a known-flaky quarantine that stops tests blocking. It

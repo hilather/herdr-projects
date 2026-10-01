@@ -148,3 +148,63 @@ retain the check's actual numeric exit status when available; it is separate
 from the supervisor's failure classification. Historical receipts without a
 version-2 check record cannot authorize downstream reuse; fresh verification
 with a new idempotency key is required. Migration and replay never upgrade them.
+
+## Evidence reruns and stress (DG6d/e)
+
+Executable acceptance policy version 1 retains its single `checks` argv.
+Version 2 adds `rerun_on_failure` (integer 0–2, default 0) and optional named
+stress checks. These declarations are validated at signed contract put, and the
+operator policy must still match the signed bytes exactly. Example:
+
+```json
+{
+  "version": 2,
+  "checks": ["/usr/bin/git", "diff", "--quiet"],
+  "rerun_on_failure": 1,
+  "named_checks": {
+    "locks": ["/absolute/new-verification-scratch/checkout/check", "locks"]
+  },
+  "stress": {
+    "checks": ["locks"],
+    "repetitions": 6,
+    "concurrency": 2
+  }
+}
+```
+
+`stress.checks` lists 1–6 distinct names from `named_checks` (at most six
+names, each 1–64 ASCII alphanumeric, underscore or hyphen characters).
+`repetitions` is 1–6. `concurrency` is 1–5 background processes, so together
+with the foreground check there are at most six check/load processes. For each
+named check and repetition, background copies start alongside the foreground
+check. An optional `stress.load` argv replaces those background copies with a
+declared command. Each batch finishes before the next starts. Programs retain
+the verifier's allowlist: `/usr/bin/git` or an executable in the copied checkout.
+Stress is opt-in, intended for write paths, transactions, locks, migrations and
+ticker changes; it is never enabled by default. Any foreground or load failure
+fails verification. A load command should remain active long enough to overlap
+the check; the verifier does not infer sustained pressure from process start.
+
+A failed primary, named foreground check or load copy gets up to `rerun_on_failure`
+additional executions, stopping at the first passing rerun. Reruns exist to
+produce evidence, not to pass work: the original failure remains
+`checks_failed`, with no acceptance receipt. Background load failures also fail
+verification. All executions use the same private checkout;
+ignored fixture/build state can persist between repetitions. Tree identity is
+rechecked after all children finish, just as for version 1.
+
+One original check timeout budget covers the primary check, reruns, stress and
+load cleanup. It is never reset per repetition. Deadline exhaustion kills the
+namespace's children, rejects with `timeout`, and records started but unfinished
+observations as `cancelled`. Explicit caller cancellation retains the existing
+no-verdict rule. Replay never executes repetitions again.
+
+Version-2 run metadata records sequence, kind (`check`, `stress`, `load`,
+`flake`), check name, repetition, outcome, numeric exit status when available,
+load context and bounded per-test results. Each command streams stdout to the
+existing bounded supervisor; repetition test parsing retains at most 8 KiB,
+with at most 1 KiB of serialized test evidence per observation. Larger suites
+are explicitly unavailable, never partial passing suites. Check stderr is
+drained without forwarding supervisor protocol lines. Quality collection
+projects completed flake observations, and a failure followed by a passing
+rerun counts as a flip on the same tree and policy without accepting work.

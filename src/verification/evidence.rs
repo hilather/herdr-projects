@@ -132,7 +132,7 @@ fn insert(
     }
     Ok(())
 }
-fn test_results(output: &str) -> Value {
+pub(super) fn test_results(output: &str) -> Value {
     let parsed = if output.len() > OUTPUT_BYTES {
         Err("output_limit")
     } else if output.trim_start().starts_with('<') {
@@ -372,4 +372,32 @@ fn entities(mut text: &str) -> Result<String, &'static str> {
     }
     out.push_str(text);
     Ok(out)
+}
+
+/// Samples inside the existing verifier namespace; project slots are held by
+/// the parent and unavailable in the private root.
+pub(super) fn repetition_load() -> Value {
+    let average = read_small(Path::new("/proc/loadavg"))
+        .and_then(|s| s.split_whitespace().next().and_then(number));
+    json!({"sampled_unix_ms": jiff::Timestamp::now().as_millisecond(),
+        "host_load_1m": average, "host_load_reason": average.is_none().then_some("unreadable_or_invalid"),
+        "project_concurrent_runs": null, "concurrency_reason": "execution_slots_unavailable",
+        "cpu": pressure("cpu"), "io": pressure("io")})
+}
+
+pub(super) fn repetitions(stderr: &str, interrupted: bool) -> Vec<Value> {
+    let mut rows = BTreeMap::new();
+    for line in stderr.lines() {
+        if let Some(raw) = line.strip_prefix("hp-verify observation=")
+            && let Ok(value) = serde_json::from_str::<Value>(raw)
+            && let Some(index) = value["sequence"].as_u64().filter(|n| *n < 700) {
+            rows.insert(index, value);
+        }
+    }
+    rows.into_values().map(|mut row| {
+        if row["outcome"] == "running" || (interrupted && row["outcome"] == "fail" && row["exit_status"].is_null()) {
+            row["outcome"] = json!(if interrupted { "cancelled" } else { "unavailable" });
+        }
+        row
+    }).collect()
 }

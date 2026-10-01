@@ -4239,3 +4239,122 @@ fn verification_receipts_capture_load_and_bounded_test_metadata() {
         assert_eq!(serde_json::from_str::<serde_json::Value>(&rerun_metadata).unwrap()["load"]["project_concurrent_runs"],1);
     }
 }
+
+/// Public submission/verifier/quality workflow, with a retained static fixture
+/// executable. Counter and rendezvous files live only in the disposable checkout.
+#[cfg(target_os = "linux")]
+#[test]
+fn verification_policy_reruns_are_evidence_and_stress_failures_block_acceptance() {
+    let fixtures = tempfile::tempdir().unwrap();
+    let source = fixtures.path().join("check.rs");
+    fs::write(&source, r#"
+use std::{fs, time::{Duration, Instant}};
+fn main() {
+    let mode = std::env::args().nth(1).unwrap();
+    if mode == "flake" || mode == "signal" {
+        let first = fs::OpenOptions::new().write(true).create_new(true).open(".fixture-counter").is_ok();
+        println!("test racy ... {}", if first { "FAILED" } else { "ok" });
+        if first && mode == "signal" {
+            unsafe extern "C" { fn kill(pid: i32, signal: i32) -> i32; }
+            unsafe { kill(std::process::id() as i32, 9); }
+        }
+        std::process::exit(i32::from(first));
+    }
+    if mode == "hang" { loop { std::thread::sleep(Duration::from_millis(10)); } }
+    let first = fs::OpenOptions::new().write(true).create_new(true).open(".fixture-lock").is_ok();
+    if !first {
+        fs::write(".fixture-collision", b"collision").unwrap();
+        println!("test lock ... FAILED");
+        std::process::exit(1);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !std::path::Path::new(".fixture-collision").exists() {
+        assert!(Instant::now() < deadline, "concurrent copy did not arrive");
+        std::thread::yield_now();
+    }
+    println!("test lock ... ok");
+}
+"#).unwrap();
+    let executable = fixtures.path().join("check");
+    let compiled = Command::new("rustc").args(["--edition=2024", "-C", "target-feature=+crt-static", "-o"])
+        .arg(&executable).arg(&source).output().unwrap();
+    assert!(compiled.status.success(), "{}", String::from_utf8_lossy(&compiled.stderr));
+    for case in ["rerun", "signal", "legacy", "stress", "stress-rerun", "budget"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = classification_project(tmp.path(), "tests", None);
+        let path = project.join(".state/state.db");
+        let repo = tmp.path().join("repo");
+        fs::copy(&executable, repo.join("check")).unwrap();
+        fs::write(repo.join(".gitignore"), ".fixture-*\n").unwrap();
+        git(&repo, &["add", "check", ".gitignore"]);
+        git(&repo, &["commit", "-qm", "retained policy fixture"]);
+        let oid = git(&repo, &["rev-parse", "HEAD"]).trim().to_owned();
+        let work = tmp.path().join("scratch");
+        let command = work.join("checkout/check").display().to_string();
+        let policy = if case == "legacy" {
+            serde_json::json!({"version":1,"checks":[command,"flake"]})
+        } else if case == "rerun" || case == "signal" {
+            serde_json::json!({"version":2,"checks":[command,if case == "signal" {"signal"} else {"flake"}],"rerun_on_failure":1})
+        } else {
+            serde_json::json!({"version":2,"checks":["/usr/bin/git","diff","--quiet"],
+                "rerun_on_failure":if case == "stress-rerun" {2} else {0},
+                "named_checks":{"lock":[command,if case == "budget" {"hang"} else {"lock"}]},
+                "stress":{"checks":["lock"],"repetitions":if case == "stress" {2} else {1},"concurrency":1}})
+        }.to_string();
+        let digest = install_fixture_verification_contract(&path,"tests",repo.to_str().unwrap(),&oid,"sha1","check",&[],&policy);
+        admit_ready(&project);
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        let attempt:String = raw.query_row("SELECT id FROM attempts",[],|r|r.get(0)).unwrap();
+        let object_list = git(&repo,&["rev-list","--objects","--no-object-names","HEAD"]);
+        let objects:Vec<_> = object_list.lines().map(|oid|serde_json::json!({"oid":oid,"relative_path":format!("{}/{}",&oid[..2],&oid[2..])})).collect();
+        let mut store = SqliteStore::open(&path).unwrap();
+        let submission = store.submit_result(&serde_json::to_vec(&serde_json::json!({"idempotency_key":"submit","task_id":"tests","contract_revision":1,"contract_digest":digest,
+            "attempt_id":attempt,"repository":repo,"base_oid":oid,"candidate_oid":oid,"object_format":"sha1","artifact_manifest":[],"claimed_checks":[],"objects":objects})).unwrap()).unwrap();
+        let policy_path = tmp.path().join("policy.json"); fs::write(&policy_path,&policy).unwrap();
+        fs::create_dir(&work).unwrap();
+        let request = herdr_projects::verification::VerifyRequest::new(submission.submission_id,"builds",&policy_path,"verify",
+            Duration::from_secs(if case == "budget" { 1 } else { 30 }),&work);
+        let outcome = herdr_projects::verification::verify(&mut store,&request).unwrap();
+        assert_eq!(outcome.state,"rejected", "{case}: {:?}",outcome.reason);
+        assert!(outcome.receipt.is_none());
+        assert_eq!(outcome.reason.as_deref(),Some(if case == "budget" {"timeout"} else {"checks_failed"}),"{case}");
+        let metadata:String = raw.query_row("SELECT metadata FROM verification_runs WHERE run_id=?1",[&outcome.run_id],|r|r.get(0)).unwrap();
+        let metadata:serde_json::Value = serde_json::from_str(&metadata).unwrap();
+        if case == "legacy" {
+            assert_eq!(metadata["version"],"verification-metadata.v1");
+            assert!(metadata.get("observations").is_none());
+        } else {
+            let observations = metadata["observations"].as_array().unwrap();
+            assert_eq!(observations.len(),if case == "rerun" || case == "signal" {2} else if case == "stress" || case == "stress-rerun" {5} else {3});
+            assert!(observations.iter().all(|row|row.get("load").is_some() && row.get("tests").is_some()));
+            if case == "rerun" || case == "signal" {
+                assert_eq!(observations[0]["outcome"],"fail");
+                if case == "signal" {
+                    assert!(observations[0]["exit_status"].is_null());
+                    assert!(raw.query_row("SELECT exit_status FROM verification_runs WHERE run_id=?1",[&outcome.run_id],|r|r.get::<_,Option<i32>>(0)).unwrap().is_none());
+                }
+                assert_eq!(observations[1]["kind"],"flake");
+                assert_eq!(observations[1]["outcome"],"pass");
+                assert_eq!(observations[1]["tests"]["results"],serde_json::json!([{"name":"racy","outcome":"pass"}]));
+                for _ in 0..2 {
+                    let collect = Command::new(env!("CARGO_BIN_EXE_herdr-projects")).env_clear().env("HOME",tmp.path())
+                        .args(["--root",tmp.path().to_str().unwrap(),"telemetry","project","quality","collect"]).output().unwrap();
+                    assert!(collect.status.success(),"{}",String::from_utf8_lossy(&collect.stderr));
+                }
+                let report = Command::new(env!("CARGO_BIN_EXE_herdr-projects")).env_clear().env("HOME",tmp.path())
+                    .args(["--root",tmp.path().to_str().unwrap(),"telemetry","project","quality","flaky"]).output().unwrap();
+                assert!(report.status.success(),"{}",String::from_utf8_lossy(&report.stderr));
+                let report:serde_json::Value=serde_json::from_slice(&report.stdout).unwrap();
+                assert_eq!(report["value"],"1/1");
+                assert_eq!(report["flips"][0]["completed_runs"],2);
+                assert_eq!(report["tests"][0]["name"],"racy");
+            } else if case == "budget" {
+                assert_eq!(observations.iter().filter(|row|row["outcome"]=="cancelled").count(),2,"{metadata}");
+            } else {
+                assert!(observations.iter().any(|row|row["outcome"]=="fail"));
+            }
+        }
+        assert!(herdr_projects::verification::verify(&mut store,&request).unwrap().replayed);
+        assert!(!work.join("checkout/.fixture-counter").exists(),"private copy escaped namespace");
+    }
+}

@@ -396,11 +396,17 @@ M42 estimator: `percentile_bootstrap.v1`, `B = 1000`, seed
 `0x4d34325f626f6f74`, level 0.95 (§4). The other lane C metrics (M45–M48)
 declare no minimum.
 
-## 6. DG6 passive verification flakes
+## 6. DG6 verification flakes and opt-in policy evidence
 
-DG6a–c are telemetry only. DG6d/e (stress or rerun policy) remain unbuilt.
+DG6a–c are passive telemetry. DG6d/e add opt-in executable policy version 2,
+with honest evidence reruns and bounded concurrent stress; see
+[verified-results.md](../factory/verified-results.md#evidence-reruns-and-stress-dg6de).
+A first failure always blocks acceptance even if an evidence rerun passes.
+Stress targets write paths, transactions, locks, migrations and ticker changes;
+it is never inferred or enabled by telemetry.
 `quality collect` scans at most 10,000 new canonical runs per call into
-quality stream version 3, migration `0003_verification_flakes.sql`; the
+quality stream version 4 (base migration `0003_verification_flakes.sql`,
+observations migration `0004_verification_observations.sql`); the
 existing quality lane tick scans at most 256. These are the only paths that
 derive flake rows: migrations create empty tables and unrelated commands
 never backfill them. A sidecar rebuild must replay the same quality collection
@@ -479,3 +485,47 @@ key; ignored and absent tests do not count as flips. This attributes a
 verdict signal; it does not establish the underlying race or cause. The
 existing `flaky_tests.proxy-v1` newly-flaky-test metric stays unavailable:
 DG6 has no temporal baseline proving a test is *newly* flaky.
+
+### DG6d/e repetition record and projection
+
+Executable policy version 2 accepts `rerun_on_failure` 0–2 (default 0),
+`named_checks`, and optional `stress` with named `checks`, `repetitions` 1–6,
+`concurrency` 1–5 background processes and optional `load` argv. Including the
+foreground execution, at most six check/load processes run concurrently.
+Invalid bounds, missing names and version-1 use of these additions fail signed
+contract put. There are no default stress steps or quarantine decisions.
+All commands retain the original program allowlist, namespace, post-check tree
+proof and one shared timeout/cancellation budget.
+
+`verification-metadata.v2` preserves the top-level load sample and primary tests,
+and adds `observations` in execution-start sequence order. Each entry carries
+`sequence`, `kind`, `check`, `repetition`, `source_sequence`, `outcome` (pass/fail/cancelled or
+unavailable), `exit_status`, `load` and `tests`. Flake repetition numbers count
+additional attempts; `source_sequence` links them to their first failure
+(and is null for other entries). Stress/load repetition numbers count batches. Load context
+is sampled before each spawn in the same namespace. The parent's slot remains
+held for the whole run; child samples cannot read the project slot lock and
+report project concurrency unavailable. The per-observation stdout/parser caps
+are 8 KiB / 1 KiB serialized tests, with explicit unavailable reasons. Output
+bodies and check stderr never enter metadata. A cancelled caller still records
+no verdict; deadline exhaustion retains a timeout rejection and completed or
+cancelled observations, excluded from flip statistics.
+
+Quality migration 0004 creates `quality_verification_observations` and
+`quality_observation_tests`, plus union views for reports. Both tables belong to
+`sidecar.derived_projections`: no independent TTL, rebuildable from canonical
+metadata and included in ordinary sidecar backup/restore. Migration resets only
+the derived cursor, so explicit collection replays immutable metadata; unique
+parent/sequence identities make repeated collection idempotent. It neither
+creates observations nor changes canonical verdicts.
+
+Only completed `flake` entries from otherwise eligible runs enter these
+projections. Their report identity is `PARENT_RUN_ID:flake:SEQUENCE`; the parent
+is a canonical run and the suffix is an observation, never a receipt. Grouping
+and time window use the parent's exact tree, object format, policy id/digest and
+completion time. The original failure and a passing observation therefore
+supply a rejected/accepted evidence pair to the existing flip ratio and test
+attribution. Here `accepted` is the derived passing-observation value, not a
+canonical acceptance. Primary/stress/load entries do not add duplicate run
+exposure to the metric. Readers of older sidecars preserve their existing
+reports until explicit collection upgrades the stream.

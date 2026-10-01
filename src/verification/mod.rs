@@ -7,6 +7,7 @@ mod checkout;
 mod evidence;
 mod manifest;
 mod setup;
+mod repetitions;
 pub(crate) mod supervise;
 
 #[cfg(test)] use crate::execution_guard::GatedSpawn;
@@ -181,8 +182,6 @@ pub struct VerifyOutcome {
 
 #[derive(serde::Deserialize)]
 struct PolicyDocument {
-    version: u32,
-    checks: Vec<String>,
     /// Hidden check inputs (replay suite, TM4.6): owner-held files the
     /// candidate never sees, bound read-only into the isolated root at the
     /// same path and pinned by digest. Absent in ordinary policies.
@@ -244,25 +243,7 @@ fn hidden_inputs_ok(project_store: &Path, hidden: &[HiddenInput]) -> bool {
 }
 
 pub(crate) fn parse_checks(bytes: &[u8]) -> Result<Vec<String>> {
-    if bytes.is_empty() || bytes.len() > 4_000 {
-        bail!("policy document exceeds bounds");
-    }
-    let document: PolicyDocument =
-        serde_json::from_slice(bytes).context("policy document is invalid")?;
-    if document.version != 1 || document.checks.is_empty() || document.checks.len() > 32 {
-        bail!("policy checks exceed bounds");
-    }
-    if document
-        .checks
-        .iter()
-        .any(|arg| arg.is_empty() || arg.len() > 4_096 || arg.contains('\0'))
-    {
-        bail!("policy check argument is invalid");
-    }
-    if !Path::new(&document.checks[0]).is_absolute() {
-        bail!("policy check program is not absolute");
-    }
-    Ok(document.checks)
+    Ok(crate::domain::verification_policy::ExecutionPolicy::parse(bytes)?.checks)
 }
 
 pub(crate) fn program_allowed(program: &str, checkout: &Path) -> bool {
@@ -537,7 +518,8 @@ fn verify_owned(store: &mut SqliteStore, request: &VerifyRequest, ownership: Opt
         return persist(store, &target, request, payload_digest, Vec::new(), Vec::new(),
             Some(checkout.tree), Some("required_output_missing"), None, String::new(), None, None);
     }
-    if !program_allowed(&checks[0], &checkout.path) {
+    if !crate::domain::verification_policy::ExecutionPolicy::parse(&policy_bytes)?
+        .commands().all(|args| program_allowed(&args[0], &checkout.path)) {
         return persist(
             store,
             &target,
@@ -636,6 +618,8 @@ fn verify_owned(store: &mut SqliteStore, request: &VerifyRequest, ownership: Opt
     launch.cmd.capture_limit = 2 * 1024 * 1024 + 1;
     launch.cmd.cancellation = request.cancellation.clone();
     let mut execution = evidence::Execution::start(Path::new(&target.project_store));
+    launch.cmd.env.push(("HP_VERIFY_DEADLINE_MONOTONIC_MS".into(),
+        (repetitions::monotonic_ms().saturating_add(request.timeout.as_millis() as u64)).to_string()));
     // The check touches only its own scratch; record only if the inputs still hold.
     let (ran, target) = match ownership {
         Some(ownership) => {
@@ -697,7 +681,14 @@ fn verify_owned(store: &mut SqliteStore, request: &VerifyRequest, ownership: Opt
     } else {
         None
     };
-    let metadata = execution.metadata(&report.stdout, output.stdout_truncated);
+    let mut metadata = execution.metadata(&report.stdout, output.stdout_truncated);
+    if crate::domain::verification_policy::ExecutionPolicy::parse(&policy_bytes)?.version == 2 {
+        metadata["version"] = serde_json::json!("verification-metadata.v2");
+        let observations = evidence::repetitions(&output.stderr, output.timed_out || output.code == Some(78));
+        // The primary command's tests remain distinct from repetition output.
+        if let Some(first) = observations.first() { metadata["tests"] = first["tests"].clone(); }
+        metadata["observations"] = serde_json::json!(observations);
+    }
     persist(
         store,
         &target,
@@ -813,7 +804,7 @@ struct ChildReport {
 
 fn classify(output: &Output, commit: &str, tree: &str) -> ChildReport {
     let stdout = output.stdout.clone();
-    if output.timed_out {
+    if output.timed_out || output.code == Some(78) {
         return ChildReport {
             success: false,
             reason: Some("timeout"),

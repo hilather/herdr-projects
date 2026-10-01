@@ -22,6 +22,7 @@ mod launch;
 pub use launch::*;
 mod worktrees;
 pub use worktrees::*;
+pub(crate) mod verification_policy;
 mod factory;
 pub use factory::*;
 mod delegated_reservation;
