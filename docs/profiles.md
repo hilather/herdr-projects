@@ -173,17 +173,105 @@ are copied into frozen inputs, prompts or the ledger.
 
 The supported gate executes the agent through `env -i` with only HOME, a fixed
 `/usr/bin:/bin` PATH, C.UTF-8 locale and xterm-256color TERM. Arbitrary inherited
-variables do not reach the agent. Custom environment/model/effort mappings still
-require their own verified preparation support. Old profiles lacking an explicit
+variables do not reach the agent. Custom environment mappings still require their
+own verified preparation support; model and effort are mapped for Codex and Claude
+Code (see [Model and effort pinning](#model-and-effort-pinning)). Old profiles lacking an explicit
 home remain readable for recovery but are refused by the native gate sender.
 The trusted CLI producer of this frozen environment remains part of dispatch
 preparation work; `profile resolve` does not grant it.
+
+## Model and effort pinning
+
+A profile pins its model and reasoning effort with the validated fields `model`
+and `reasoning_effort` (lowercase names: letters, digits, `._:-`, at most 64
+characters). Profiles still carry no passthrough arguments (`extra_args` empty,
+no `environment`): the pins reach the agent only through its own configuration
+inside the isolated execution home, written by the product and read back:
+
+```toml
+[profiles.codex-sol]
+kind = "codex"
+permission_policy = "interactive"
+model = "gpt-6.1-sol"
+reasoning_effort = "low"
+[profiles.codex-sol.budget]
+max_wall_seconds = 3600
+unknown_usage = "allow_with_warning"
+
+[profiles.claude-sonnet]
+kind = "claude"
+permission_policy = "interactive"
+model = "claude-sonnet-5-5"
+reasoning_effort = "low"
+[profiles.claude-sonnet.budget]
+max_wall_seconds = 3600
+unknown_usage = "allow_with_warning"
+```
+
+| Kind | File in the execution home | What is written |
+| --- | --- | --- |
+| `codex` | `.codex/config.toml` | `model`, `model_reasoning_effort`, `approval_policy = "never"`, `sandbox_mode = "workspace-write"`, `sandbox_workspace_write.network_access = false`, `check_for_update_on_startup = false` (the last four only when absent), and `[projects."<dir>"] trust_level = "trusted"` |
+| `claude` | `.claude/settings.json` | `model`, `effortLevel`, `permissions.defaultMode = "acceptEdits"` (when absent), `permissions.allow` of `Bash`, `Read`, `Edit`, `Write`, `Glob`, `Grep`, `permissions.additionalDirectories` (the attempt's spool, output and Git directories), `env.DISABLE_AUTOUPDATER = "1"` |
+| `claude` | `.claude.json` | `hasCompletedOnboarding`, `theme` (when absent) and `projects."<dir>".hasTrustDialogAccepted` |
+
+Existing settings in those files are preserved; the pins are always overwritten
+from the profile. The OS sandbox, not the agent's own prompts, is the boundary
+for a worker, which is why the worker permission defaults are non-interactive.
+
+* **`profile verify-interaction`** prepares the home, runs the agent in the fixed
+  empty directory `<execution-home>/.hp-verify-work` and trusts exactly that
+  directory in the home's configuration, so no hand-edited trust entry is needed
+  and the home must be a dedicated directory. After the agent is ready it reads
+  the pins back from the agent's configuration and requires the ready screen to
+  show the pinned model (its id, or for Claude Code its display name such as
+  `Sonnet 5.5`). The retained evidence records the pins (`interaction.pinned`);
+  retention and revalidation refuse a profile whose pins evidence does not
+  match its definition. The reasoning effort is verified from the configuration
+  only: neither agent is required to print it.
+* **Every launch** rewrites the pins and trusts the attempt's own worktree in the
+  home before the gate is released, so a drifted configuration is corrected, not
+  launched with.
+* **`profile inspect`** shows `pinned_model` and `pinned_reasoning_effort` for a
+  supported kind and valid names; any other model or effort request stays a
+  blocker.
+
+The `effortLevel` key is Claude Code's own setting; if a Claude Code version
+ignores it the readiness check still binds the model, and `profile inspect` only
+reports what will be written.
+
+## Shared login
+
+A worker authenticates as the owner's already-logged-in CLI: the sandbox binds the
+owner's single login file (`~/.codex/auth.json` for Codex,
+`~/.claude/.credentials.json` for Claude Code) read-write onto the same place in
+the isolated execution home before the owner's agent directory is hidden. It is
+the same file, never a copy, so a token refresh by the worker or the owner's own
+session is seen by both (the file is replaced in place; an agent that renames a new
+file over its login gets `EBUSY` on the mount point). Everything else in the owner's
+agent directories (`~/.codex`, `~/.claude`, `~/.claude.json`, `~/.gemini`,
+`~/.grok`, `~/.cursor`, `~/.copilot`, OpenCode and Muse data) stays hidden. If the
+login file does not exist the worker starts without one (its readiness check then
+fails visibly). The execution home keeps only an empty mount point.
+
+Overrides are part of the pinned owner configuration, so they are covered by its
+digest:
+
+```toml
+[worker_isolation]
+share_login = true                       # default; false disables sharing
+[worker_isolation.login]
+codex = "/home/me/tokens/codex-auth.json"   # bind this file instead of ~/.codex/auth.json
+```
+
+A copy placed in the execution home by hand still works with `share_login = false`.
+An override path must not lie under `/tmp`, `/var/tmp` or `/dev/shm` (private in the
+sandbox). Other launch kinds get the same treatment as they become launchable.
 
 ### Filesystem isolation
 
 On Linux the gate also isolates the worker's filesystem view before the agent
 starts: the projects root is covered except the worker's own project, the
-owner's key and credential directories (`~/.ssh`, `~/.gnupg`, `~/.codex`,
+owner's key and credential directories (`~/.ssh`, `~/.gnupg`, `~/.codex`, `~/.claude`,
 `~/.config/herdr-projects` including `review-signer/`, Herdr's sockets,
 `/run/user/UID` and others) are replaced by empty read-only mounts, and the
 agent runs in a nested user namespace that cannot unmount them. The execution
@@ -248,8 +336,9 @@ the result. It neither reserves work nor changes project state.
 The current preparation mapping requires Herdr 0.9.1, a recognized Claude or Codex
 version format, `permission_policy = "interactive"`, and a bounded wall-time
 budget. The interactive policy selects the project's owner-approval authority;
-it does not certify vendor permission flags. Unverified model, effort, environment
-and usage-blocking mappings refuse preparation. Arguments remain bound by digest
+it does not certify vendor permission flags. Unverified environment and
+usage-blocking mappings, and a model or effort for a kind other than Codex or
+Claude Code, refuse preparation. Arguments remain bound by digest
 and are not passed to the version probe.
 
 The returned frozen profile has **Unknown** transport capabilities and reports

@@ -55,6 +55,7 @@ pub mod prompt_claim;
 pub mod launch_claim;
 pub mod coordinator_prime;
 pub mod notification_claim;
+pub mod agent_home;
 pub mod worker_supervision;
 #[cfg(all(feature="state-store",target_os="linux"))]
 pub mod source_tree;

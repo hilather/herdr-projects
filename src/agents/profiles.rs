@@ -36,6 +36,12 @@ pub struct Inspection {
     environment_reference_count: usize,
     model_requested: bool,
     reasoning_effort_requested: bool,
+    /// The model and effort the execution-home preparation will pin in the
+    /// agent's own configuration (only for supported kinds and valid names).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pinned_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pinned_reasoning_effort: Option<String>,
     budget_requested: bool,
     capabilities: Capabilities,
     pub(super) agent_version: Option<String>,
@@ -104,8 +110,10 @@ fn load_text(text: &str, name: &str) -> Result<(Inspection, Option<Budget>)> {
         .map_err(|_| anyhow::anyhow!("invalid profile fields (source redacted); check the documented schema"))?;
     validate(&profile)?;
     let mut blockers = vec!["installed-version compatibility has not been verified", "no verified launch adapter evidence", "permission policy has not been resolved", "profile is not bound to an immutable attempt"];
-    if profile.model.is_some() { blockers.push("model request requires a verified adapter mapping"); }
-    if profile.reasoning_effort.is_some() { blockers.push("reasoning effort requires a verified adapter mapping"); }
+    let mapped = |value: &Option<String>| value.as_deref().filter(|v| herdr_projects::agent_home::supported(&profile.kind) && herdr_projects::agent_home::valid_pin(v)).map(str::to_owned);
+    let (pinned_model, pinned_reasoning_effort) = (mapped(&profile.model), mapped(&profile.reasoning_effort));
+    if profile.model.is_some() && pinned_model.is_none() { blockers.push("model request requires a verified adapter mapping"); }
+    if profile.reasoning_effort.is_some() && pinned_reasoning_effort.is_none() { blockers.push("reasoning effort requires a verified adapter mapping"); }
     if !profile.environment.is_empty() { blockers.push("environment references require an approved execution environment"); }
     if profile.budget.is_some() { blockers.push("budget request requires admission and usage policy resolution"); }
     let inspection = Inspection {
@@ -117,6 +125,8 @@ fn load_text(text: &str, name: &str) -> Result<(Inspection, Option<Budget>)> {
         extra_argument_count: profile.extra_args.len(),
         environment_reference_count: profile.environment.len(),
         model_requested: profile.model.is_some(),
+        pinned_model,
+        pinned_reasoning_effort,
         reasoning_effort_requested: profile.reasoning_effort.is_some(),
         budget_requested: profile.budget.is_some(),
         capabilities: Capabilities {

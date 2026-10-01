@@ -41,6 +41,7 @@ pub(super) fn command(
             launch_hides,
         )?
         .with_submission_spool(attempt.as_str())?;
+        let isolation = crate::profile_config::share_login(isolation, profile, Path::new(home))?;
         return crate::worker_supervision::isolated_gated_command(
             Path::new(&profile.agent.path),
             &agent_arguments(profile, &definition, project, attempt, events, operation)?,
@@ -1150,6 +1151,7 @@ pub fn release_gate(
     // The sandbox binds the attempt's spool and output directory writable
     // only when they exist, so they are created (owner-only) before release.
     crate::submission_spool::prepare(&project, &record.attempt)?;
+    prepare_agent_home(profile, &project, &record.attempt, &state.events, operation, &target.route)?;
     executable(&profile.agent, deadline, &cancellation)?;
     let supervisor = crate::worker_supervision::SupervisorObservation::reconnect(
         target
@@ -1197,6 +1199,28 @@ pub fn release_gate(
         "uncertain gate input acknowledgment; observe without replay"
     );
     Ok(())
+}
+
+/// Write the agent's own configuration in the execution home before its gate
+/// is released: the profile's model and effort pins, the worker permission
+/// defaults, and trust for exactly this attempt's working directories. The
+/// pins come from the digest-pinned profile, so a drifted home configuration
+/// is corrected, never launched with.
+fn prepare_agent_home(profile: &FrozenProfile, project: &Path, attempt: &AttemptId, events: &[Event], operation: &OperationId, route: &RuntimeRoute) -> Result<()> {
+    let Some(home) = profile.execution_home.as_deref().map(Path::new) else { return Ok(()) };
+    if !crate::agent_home::supported(&profile.kind) {
+        return Ok(());
+    }
+    let definition = crate::profile_config::frozen_definition(profile)?;
+    let git = crate::worktree_preparation::retained_git_directories(events, operation)?;
+    let mut trusted: Vec<std::path::PathBuf> = git.iter().map(|(w, _, _)| std::path::PathBuf::from(w.as_str())).collect();
+    trusted.push(std::path::PathBuf::from(&route.cwd));
+    trusted.sort();
+    trusted.dedup();
+    let trusted: Vec<&Path> = trusted.iter().map(std::path::PathBuf::as_path).collect();
+    let worktrees = git.iter().map(|(w, d, c)| (Path::new(w.as_str()), Path::new(d.as_str()), Path::new(c.as_str()))).collect::<Vec<_>>();
+    let writable = crate::worker_supervision::agent_writable_roots(project, &worktrees, attempt.as_str())?;
+    crate::agent_home::prepare(&profile.kind, home, &crate::agent_home::Pins { model: definition.model.clone(), reasoning_effort: definition.reasoning_effort.clone() }, &trusted, &writable)
 }
 
 #[cfg(target_os = "linux")]

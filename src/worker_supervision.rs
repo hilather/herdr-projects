@@ -196,6 +196,9 @@ pub struct Isolation {
     /// first: each later entry is mounted on top of the earlier ones.
     plan: Vec<(String, bool)>,
     hide: Vec<String>,
+    /// (owner login file, its place in the execution home): bound read-write
+    /// before the owner's agent directory is hidden.
+    login: Vec<(String, String)>,
     /// The worker's own project directory (canonical).
     project: String,
     /// The attempt's submission spool, when the agent is a canonical attempt
@@ -281,14 +284,23 @@ pub fn agent_writable_roots(project: &Path, worktrees: &[(&Path, &Path, &Path)],
 }
 
 /// Owner-home entries hidden from every isolated agent: signing and SSH keys,
-/// the owner's own agent credentials, the product configuration (owner policy
+/// the owner's own agent data directories (their single login file is shared
+/// into the worker's home by [`Isolation::with_shared_login`], never copied), the product configuration (owner policy
 /// and the reviewer-signer directory under it), Herdr's control sockets and
 /// common credential stores. A missing entry is skipped at setup time.
 const OWNER_SECRETS: &[&str] = &[
     ".ssh",
     ".gnupg",
     ".codex",
-    ".claude/.credentials.json",
+    ".claude",
+    ".claude.json",
+    ".gemini",
+    ".grok",
+    ".cursor",
+    ".copilot",
+    ".local/share/opencode",
+    ".config/muse",
+    ".local/share/muse",
     ".config/herdr-projects",
     ".config/herdr",
     ".config/gh",
@@ -331,7 +343,10 @@ const OWNER_SECRETS: &[&str] = &[
 ///    and output directory under the otherwise read-only project `.state`) is
 ///    bound onto itself on top, writable; every executable the worker runs
 ///    from outside a read-only anchor is bound read-only onto itself;
-/// 5. mounts an empty read-only tmpfs over every hidden directory and
+/// 5. binds the owner's single login file (`loginsrc:`/`logindst:`), when it
+///    exists, read-write onto its place in the execution home, before the
+///    owner's agent directory is hidden: the same inode, never a copy;
+/// 6. mounts an empty read-only tmpfs over every hidden directory and
 ///    `/dev/null` over every hidden file, then over the owner's SSH agent and
 ///    tmux socket directories in `/tmp` (enumerated at setup, so the argv
 ///    stays fixed; a directory the owner does not own is left alone).
@@ -372,6 +387,9 @@ const SANDBOX: &str = concat!(
     r#"ro:*) p=${a#ro:}; if [ -e "$p" ]; then /usr/bin/mount --rbind -o ro=recursive "$p" "$p" || fail "$p"; fi;; "#,
     r#"rw:*) p=${a#rw:}; if [ -e "$p" ]; then /usr/bin/mount --rbind -o rw "$p" "$p" || fail "$p"; fi;; "#,
     r#"esac; done; "#,
+    r#"for a in "$@"; do case $a in --) break;; loginsrc:*) s=${a#loginsrc:};; logindst:*) d=${a#logindst:}; "#,
+    r#"if [ -f "$s" ]; then { [ ! -L "$d" ] && [ ! -L "${d%/*}" ] && /usr/bin/mkdir -p -- "${d%/*}" && { [ -e "$d" ] || : > "$d"; } && "#,
+    r#"/usr/bin/mount --bind "$s" "$d" && /usr/bin/mount -o remount,bind,rw,nosuid,nodev,noexec "$d"; } || fail "$d"; fi;; esac; done; "#,
     r#"for a in "$@"; do case $a in --) break;; hide:*) p=${a#hide:}; "#,
     r#"if [ -d "$p" ]; then /usr/bin/mount -t tmpfs -o ro,nosuid,nodev,noexec,size=4k,mode=0555 herdr-projects-hidden "$p" || fail "$p"; "#,
     r#"elif [ -e "$p" ]; then { /usr/bin/mount --bind /dev/null "$p" && /usr/bin/mount -o remount,bind,ro "$p"; } || fail "$p"; fi;; esac; done; "#,
@@ -738,7 +756,7 @@ impl Isolation {
             ensure!(keep.len() <= 7, "too many agent paths directly under {dir}");
             private.push(((*dir).to_owned(), keep));
         }
-        let mut isolation = Self { root, expose, private, git: quarantines, plan, hide, project, spool: None, product: None };
+        let mut isolation = Self { root, expose, private, git: quarantines, plan, hide, login: Vec::new(), project, spool: None, product: None };
         // Every executable the worker runs: the agent, and the product binary
         // it invokes for `result submit` and the review worker channel (the
         // controller deriving this sandbox is that binary).
@@ -749,6 +767,26 @@ impl Isolation {
                 .filter(|dir| !dir.contains(':') && dir != "/usr/bin" && dir != "/bin");
         }
         Ok(isolation)
+    }
+
+    /// Authenticate the worker as the owner's already-logged-in CLI: bind the
+    /// single login file of `kind` (`~/.codex/auth.json`,
+    /// `~/.claude/.credentials.json`, or `source_override`, an absolute path
+    /// from the pinned owner configuration) read-write onto its place in the
+    /// execution `home`. It is the same file, never a copy, so token refreshes
+    /// stay consistent with the owner's own sessions; the rest of the owner's
+    /// agent directory stays hidden. A kind without a login file, or a source
+    /// that does not exist at launch, adds nothing (the agent then reports
+    /// that it is not logged in). The file is replaced in place only: an agent
+    /// that renames a new file over it gets `EBUSY` on the mount point.
+    pub fn with_shared_login(mut self, kind: &str, home: &Path, source_override: Option<&Path>) -> Result<Self> {
+        let Some(relative) = crate::agent_home::login_file(kind) else { return Ok(self) };
+        let Some(source) = crate::agent_home::login_source(kind, &owner_homes()?, source_override) else { return Ok(self) };
+        self.login.push((normal(&source)?, normal(&home.join(relative))?));
+        self.login.sort();
+        self.login.dedup();
+        ensure!(self.login.len() <= 1, "one login file is shared per worker");
+        Ok(self)
     }
 
     /// Also expose `executable` to the agent, read-only: for a caller whose
@@ -871,6 +909,9 @@ impl Isolation {
             args.extend([format!("quarantine:{quarantine}"), format!("overlay:{common}")]);
         }
         args.extend(self.plan.iter().map(|(p, writable)| format!("{}:{p}", if *writable { "rw" } else { "ro" })));
+        for (source, dest) in &self.login {
+            args.extend([format!("loginsrc:{source}"), format!("logindst:{dest}")]);
+        }
         args.extend(self.hide.iter().map(|p| format!("hide:{p}")));
         args
     }

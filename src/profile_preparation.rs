@@ -12,7 +12,7 @@ pub use revalidation::{RevalidatedProfile, revalidate};
 pub const BUDGET: Duration = Duration::from_secs(60);
 #[cfg(target_os = "linux")]
 pub use native::{
-    InteractionEvidence, NativeEvidence, NativePreparation, verify_interaction, verify_native,
+    InteractionEvidence, NativeEvidence, NativePreparation, PinEvidence, verify_interaction, verify_native,
 };
 
 use crate::{
@@ -606,7 +606,7 @@ else:
             verified.evidence.interaction = Some(InteractionEvidence {
                 session: ResourceIdentity { device: 1, inode: 2, born_secs: 1, born_nanos: 0 },
                 terminal: "fixture-terminal".into(), readiness_manifest: "fixture-manifest".into(),
-                prompt_digest: "a".repeat(64), acknowledged_unix_ms: 999,
+                prompt_digest: "a".repeat(64), acknowledged_unix_ms: 999, pinned: None,
             });
             verified.preparation = f.prepare().unwrap();
             super::native::apply_evidence(&mut verified.preparation, &verified.evidence).unwrap();

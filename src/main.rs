@@ -46,6 +46,8 @@ mod local_reports;
 mod local_observations;
 mod adopt;
 mod cli;
+#[cfg(all(feature="state-store",target_os="linux"))]
+mod launch_run;
 mod cleanup;
 mod coordinator;
 mod coordinator_jobs;

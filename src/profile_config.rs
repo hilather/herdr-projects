@@ -111,9 +111,14 @@ impl ProfileDefinition {
     pub fn validate_gated_preparation(&self, prompt_chars: u64) -> anyhow::Result<u64> {
         use anyhow::{Context, ensure};
         self.validate()?;
+        ensure!(self.environment.is_empty(), "worker profile needs an unsupported environment mapping");
+        // Model and effort are mapped only for kinds whose own configuration
+        // the execution-home preparation writes and verification reads back.
         ensure!(
-            self.model.is_none() && self.reasoning_effort.is_none() && self.environment.is_empty(),
-            "worker profile needs an unsupported model or environment mapping"
+            (self.model.is_none() && self.reasoning_effort.is_none())
+                || (crate::agent_home::supported(&self.kind)
+                    && [&self.model, &self.reasoning_effort].into_iter().flatten().all(|v| crate::agent_home::valid_pin(v))),
+            "worker profile needs an unsupported model or effort mapping"
         );
         let budget = self
             .budget
@@ -247,6 +252,34 @@ pub(crate) fn frozen_definition(profile: &crate::domain::FrozenProfile) -> anyho
 /// for an owner signing key or other secret outside the fixed hidden set.
 #[cfg(feature = "state-store")]
 pub(crate) fn frozen_isolation_hides(profile: &crate::domain::FrozenProfile) -> anyhow::Result<Vec<String>> {
+    Ok(frozen_isolation(profile)?.hide)
+}
+
+/// The `[worker_isolation]` table of the digest-pinned owner configuration.
+/// `login` shares the owner's login file with the worker (default on); an
+/// explicit per-kind path under `[worker_isolation.login]` names another token
+/// file to bind instead of the owner's default one.
+#[cfg(feature = "state-store")]
+#[derive(Default)]
+pub(crate) struct IsolationConfig {
+    pub hide: Vec<String>,
+    pub share_login: Option<bool>,
+    pub login: std::collections::BTreeMap<String, std::path::PathBuf>,
+}
+
+#[cfg(feature = "state-store")]
+impl IsolationConfig {
+    /// The login file override for `kind`, or `None` for the owner's default.
+    pub fn login_override(&self, kind: &str) -> Option<std::path::PathBuf> {
+        self.login.get(kind).cloned()
+    }
+    pub fn shares_login(&self) -> bool {
+        self.share_login.unwrap_or(true)
+    }
+}
+
+#[cfg(feature = "state-store")]
+pub(crate) fn frozen_isolation(profile: &crate::domain::FrozenProfile) -> anyhow::Result<IsolationConfig> {
     use anyhow::{Context, ensure};
     use sha2::{Digest, Sha256};
     use std::path::Path;
@@ -261,9 +294,19 @@ pub(crate) fn frozen_isolation_hides(profile: &crate::domain::FrozenProfile) -> 
         std::str::from_utf8(&bytes).map_err(|_| anyhow::anyhow!("invalid worker configuration"))?,
     )
     .map_err(|_| anyhow::anyhow!("invalid worker configuration (contents withheld)"))?;
-    let Some(table) = config.get("worker_isolation") else { return Ok(vec![]) };
+    let Some(table) = config.get("worker_isolation") else { return Ok(IsolationConfig::default()) };
     let table = table.as_table().context("invalid worker_isolation table")?;
-    ensure!(table.keys().all(|k| k == "hide"), "unknown worker_isolation setting");
+    ensure!(table.keys().all(|k| matches!(k.as_str(), "hide" | "share_login" | "login")), "unknown worker_isolation setting");
+    let share_login = table.get("share_login").map(|v| v.as_bool().context("worker_isolation.share_login must be a boolean")).transpose()?;
+    let mut login = std::collections::BTreeMap::new();
+    if let Some(entries) = table.get("login") {
+        for (kind, path) in entries.as_table().context("worker_isolation.login must be a table of kind = path")? {
+            let path = path.as_str().context("worker_isolation.login paths must be strings")?;
+            ensure!(crate::agent_home::login_file(kind).is_some() && path.starts_with('/') && path.len() <= 1024 && !path.contains('\0'),
+                "worker_isolation.login takes an absolute path for codex or claude");
+            login.insert(kind.clone(), std::path::PathBuf::from(path));
+        }
+    }
     let hide = table
         .get("hide")
         .map(|v| v.as_array().context("worker_isolation.hide must be a list of paths"))
@@ -275,5 +318,21 @@ pub(crate) fn frozen_isolation_hides(profile: &crate::domain::FrozenProfile) -> 
         hide.len() <= 16 && hide.iter().all(|p| p.starts_with('/') || p.starts_with("~/")),
         "worker_isolation.hide takes at most 16 absolute or ~/ paths"
     );
-    Ok(hide)
+    Ok(IsolationConfig { hide, share_login, login })
+}
+
+/// Share the owner's login with the worker the profile launches, unless the
+/// pinned owner configuration turns sharing off (`share_login = false`, for an
+/// owner who copies a token into the execution home themselves).
+#[cfg(feature = "state-store")]
+pub(crate) fn share_login(
+    isolation: crate::worker_supervision::Isolation,
+    profile: &crate::domain::FrozenProfile,
+    home: &std::path::Path,
+) -> anyhow::Result<crate::worker_supervision::Isolation> {
+    let config = frozen_isolation(profile)?;
+    if !config.shares_login() {
+        return Ok(isolation);
+    }
+    isolation.with_shared_login(&profile.kind, home, config.login_override(&profile.kind).as_deref())
 }

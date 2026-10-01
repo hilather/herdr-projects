@@ -145,6 +145,36 @@ enum LaunchCommand {
         #[arg(long)] approval_digest: String,
         #[arg(long)] expected_head: u64,
     },
+    /// One operator command for a migrated project: capacity, Herdr server and
+    /// binding, reconcile and activation, signed contract, knowledge snapshot,
+    /// draft, signed approval, import and reservation. Idempotent; stops at the
+    /// first failing step. Signs only through `ssh-keygen -Y sign` with the key
+    /// path given to --sign-with.
+    Run {
+        #[arg(long)] task: String,
+        /// Profile whose launchable evidence was retained by `profile verify-interaction --retain`
+        #[arg(long)] profile: String,
+        /// The task's repository (its worktrees branch from --base here)
+        #[arg(long)] repository: PathBuf,
+        /// Owner key (or public key with an agent) for `ssh-keygen -Y sign`
+        #[arg(long)] sign_with: Option<PathBuf>,
+        #[arg(long, default_value_t=900)] validity_seconds: u64,
+        #[arg(long)] title: Option<String>,
+        /// Planning task: the one deliverable, a Markdown file under docs/
+        #[arg(long, conflicts_with="contract_file")] plan_output: Option<String>,
+        /// Task instructions, appended to PROJECT.md in the retained brief
+        #[arg(long)] prompt_file: Option<PathBuf>,
+        /// Your own complete unsigned contract document
+        #[arg(long)] contract_file: Option<PathBuf>,
+        /// Existing, not-checked-out branch (e.g. refs/heads/integration); turns verify+integrate automation on
+        #[arg(long)] integration_ref: Option<String>,
+        #[arg(long, default_value="HEAD")] base: String,
+        #[arg(long, default_value_t=1)] max_active_workers: u32,
+        /// Use a Herdr server you already run for this task (its control socket) instead of starting one
+        #[arg(long)] herdr_socket: Option<PathBuf>,
+        /// Stop before reserving. A new binding pauses the project until no attempt is unfinished, so prepare every task first, then run each again to reserve
+        #[arg(long)] prepare_only: bool,
+    },
 }
 
 #[cfg(feature="state-store")]
@@ -1225,7 +1255,7 @@ pub fn run() -> Result<()> {
         #[cfg(all(feature="state-store", target_os="linux"))]
         Command::Launch { slug, command } => {
             project::validate_slug(&slug)?;
-            let project=ctx.root.join(slug);
+            let project=ctx.root.join(&slug);
             let load=|path:&std::path::Path|->Result<herdr_projects::launch_preparation::LaunchSelection> {
                 let bytes=herdr_projects::migration::read_plan_file(path)?;
                 anyhow::ensure!(bytes.len()<=1024*1024,"launch selection exceeds bounds");
@@ -1235,6 +1265,8 @@ pub fn run() -> Result<()> {
             let value=match command {
                 LaunchCommand::Draft { selection, expected_head, validity_seconds } =>
                     serde_json::to_value(herdr_projects::launch_preparation::draft(&project,&load(&selection)?,expected_head,std::time::Duration::from_secs(validity_seconds),deadline,Default::default())?)?,
+                LaunchCommand::Run { task, profile, repository, sign_with, validity_seconds, title, plan_output, prompt_file, contract_file, integration_ref, base, max_active_workers, herdr_socket, prepare_only } =>
+                    crate::launch_run::run(&ctx, &slug, crate::launch_run::Args { task, profile, repository, sign_with, validity_seconds, title, plan_output, prompt_file, contract_file, integration_ref, base, max_active_workers, herdr_socket, prepare_only })?,
                 LaunchCommand::Reserve { selection, approval_digest, expected_head } => {
                     let approval=herdr_projects::domain::VersionedReference{id:format!("approval-{approval_digest}"),revision:1,digest:approval_digest};
                     serde_json::to_value(herdr_projects::launch_preparation::reserve(&project,&load(&selection)?,&approval,expected_head,deadline,Default::default())?)?

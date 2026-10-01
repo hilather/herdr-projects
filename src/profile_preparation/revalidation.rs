@@ -112,6 +112,10 @@ fn evidence_shape(report: &Report, now: i64) -> Result<()> {
             && i.prompt_digest.len() == 64
             && i.prompt_digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
             "invalid retained interaction evidence");
+        if let Some(pin) = &i.pinned {
+            ensure!([&pin.model, &pin.reasoning_effort].into_iter().flatten().all(|v| crate::agent_home::valid_pin(v))
+                && (pin.model.is_none() || pin.model_on_screen), "invalid retained model pin evidence");
+        }
     }
     Ok(())
 }
@@ -168,6 +172,14 @@ pub fn revalidate(
     ensure!(retained.reference == *reference, "retained profile reference mismatch");
     evidence_shape(&report, crate::canonical_worker::now())?;
     derivation(&report)?;
+    // A profile that pins a model or effort is launchable only on evidence
+    // that the agent's configuration carried exactly that pin.
+    let definition = crate::profile_config::frozen_definition(&retained.profile)?;
+    if definition.model.is_some() || definition.reasoning_effort.is_some() {
+        let pin = report.evidence.interaction.as_ref().and_then(|i| i.pinned.as_ref());
+        ensure!(pin.is_some_and(|p| p.model == definition.model && p.reasoning_effort == definition.reasoning_effort),
+            "retained profile evidence does not cover the profile's model and effort pin");
+    }
     ensure!(crate::authority::routine_policy(&project)?
         == (retained.profile.permission_policy.clone(), retained.profile.config.clone()),
         "retained profile policy or configuration changed");

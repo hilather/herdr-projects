@@ -10,6 +10,10 @@ pub fn snapshot(project:&Path)->Result<Snapshot> { migration::open_active(projec
 pub fn snapshot_controlled(project:&Path,control:&crate::store::controlled::ReadControl)->Result<Snapshot> {
     migration::open_active_controlled(project,control.clone())?.read_snapshot(None).map_err(Into::into)
 }
+/// The installed signed contract of `task`, if any (read-only).
+pub fn task_contract(project:&Path,task:&TaskId)->Result<Option<crate::domain::VersionedReference>> {
+    Ok(migration::open_active(project)?.task_contract_reference(task.as_str())?)
+}
 pub fn add_task(project:&Path,id:TaskId,title:String,expected_head:u64)->Result<u64> {
     ensure!(!title.trim().is_empty() && title.len()<=16_000,"title must contain 1–16000 bytes");
     let _maintenance=migration::runtime_mutation(project)?;

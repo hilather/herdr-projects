@@ -800,8 +800,48 @@ wait for a token reply and does not establish task or memory protocol behavior.
 Initial attempts failed before prompt submission: extra temporary-path nesting
 caused workspace creation failure; the original shorter layout worked, but the
 broad `/tmp` trust entry did not establish trust for the specific working directory.
-The fixture now provisions that exact path before calling the shared verifier.
-Production verification does not change the user's trust configuration. API errors
+The fixture then provisioned that exact path before calling the shared verifier.
+
+That workaround is gone (W-COORD-1): `profile verify-interaction` now runs the
+agent in a fixed empty directory under the execution home
+(`<home>/.hp-verify-work`) and trusts exactly that directory in the home's own
+agent configuration (`.codex/config.toml` for Codex; `.claude.json` and
+`.claude/settings.json` for Claude Code). Verification still never touches the
+owner's real `~/.codex` or `~/.claude`; it writes only inside the dedicated
+execution home. The same preparation pins the profile's model and reasoning
+effort and the verifier reads them back after readiness (see
+[profiles.md](profiles.md#model-and-effort-pinning)); the evidence's
+`interaction.pinned` records them. Launch, readiness, prompt and stop semantics,
+and the version and digest binding of the evidence, are unchanged. API errors
 now identify the failed method without exposing output; readiness timeouts retain
 the last validation error. Test-only screen diagnostics emit fixed categories,
 not terminal contents or credentials.
+
+### Claude Code as a canonical worker kind and the shared login (W-COORD-1)
+
+`claude` is launchable beside `codex`. Before the gate is released the controller
+prepares the execution home for the kind (pins, worker permission defaults, trust
+for the attempt's worktree; `permissions.additionalDirectories` carries the
+attempt's spool, output and Git directories, the Claude analogue of the
+`writable_roots` argument Codex receives). Launch, readiness, prompt, stop and
+result submission (`result submit` through the attempt's submission spool, then
+`result capture`) are the agent-agnostic native paths; only the kind string,
+version format (`2.1.0 (Claude Code)`) and the home configuration differ.
+
+The worker authenticates through the owner's single login file, bound
+read-write into the isolated home (`~/.codex/auth.json`,
+`~/.claude/.credentials.json`; see [profiles.md](profiles.md#shared-login)). No
+credential is copied and the rest of the owner's agent directories stays hidden;
+`tests/worker_login_share.rs` proves both through the real sandbox.
+
+### One operator command
+
+`herdr-projects launch PROJECT run --task ID --profile NAME --repository REPO
+--plan-output docs/FILE.md --prompt-file FILE [--sign-with KEY]` performs the whole
+operator sequence on a migrated project and stops at the first failing step; a
+rerun skips finished steps and never reserves a second attempt. `--prepare-only`
+stops before the reservation: a new runtime binding pauses the project until no
+attempt is unfinished, so with several workers every task is prepared before any is
+reserved (a binding that would pause a project under a live worker is refused first).
+See
+[operator-runbook.md](operator-runbook.md).

@@ -81,6 +81,9 @@ pub struct NativeEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<String>,
 }
+/// The empty directory under the execution home in which the diagnostic agent
+/// runs; trusted by the home's own agent configuration.
+const LAB_WORK: &str = ".hp-verify-work";
 pub(crate) const COMMAND_TRANSPORT: &str = "workspace.create_command-v1";
 pub(crate) const STOCK_TRANSPORT: &str = "workspace.create+exec-launch-v1";
 
@@ -92,6 +95,19 @@ pub struct InteractionEvidence {
     pub readiness_manifest: String,
     pub prompt_digest: String,
     pub acknowledged_unix_ms: i64,
+    /// The model and effort the profile pins, as the agent's own configuration
+    /// read back after readiness, and whether the ready screen showed the
+    /// model. Absent when the profile pins nothing (and in older evidence).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<PinEvidence>,
+}
+
+#[derive(Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PinEvidence {
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub model_on_screen: bool,
 }
 
 pub(super) struct Lab {
@@ -388,7 +404,21 @@ pub(super) fn verify(
         locks: guard.inherit()?,
     };
     let token = format!("probe-{}", digest(lab.root.as_os_str().as_encoded_bytes()));
-    let cwd = lab.root.join("work");
+    // The agent must trust its working directory, and its trust lives in the
+    // execution home's own configuration: run in a fixed, empty directory there
+    // and trust exactly it, so verification needs no hand-edited trust entry.
+    let cwd = execution_home.join(LAB_WORK);
+    match fs::symlink_metadata(&cwd) {
+        Ok(m) => {
+            ensure!(m.is_dir() && m.uid() == unsafe { libc::geteuid() }, "native probe directory in the execution home is not an owner directory");
+            fs::remove_dir_all(&cwd)?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    fs::DirBuilder::new().mode(0o700).create(&cwd)?;
+    let expected_pins = crate::agent_home::Pins { model: definition.model.clone(), reasoning_effort: definition.reasoning_effort.clone() };
+    crate::agent_home::prepare(&profile.kind, execution_home, &expected_pins, &[&cwd], &[])?;
     let isolation = crate::worker_supervision::Isolation::for_agent(
         &project,
         execution_home,
@@ -400,6 +430,7 @@ pub(super) fn verify(
         Some(&socket),
         &crate::profile_config::frozen_isolation_hides(profile)?,
     )?;
+    let isolation = crate::profile_config::share_login(isolation, profile, execution_home)?;
     let argv = crate::worker_supervision::isolated_gated_command(
         Path::new(&profile.agent.path),
         &definition.extra_args,
@@ -548,6 +579,7 @@ pub(super) fn verify(
             terminal,
             &project,
             &token,
+            (&expected_pins, execution_home),
         )?)
     } else {
         None
@@ -680,6 +712,7 @@ fn verify_prompt(
     terminal: &str,
     project: &Path,
     token: &str,
+    (expected_pins, execution_home): (&crate::agent_home::Pins, &Path),
 ) -> Result<InteractionEvidence> {
     let wait_until = api.deadline.min(Instant::now() + Duration::from_secs(30));
     let mut readiness_failure = None;
@@ -708,6 +741,7 @@ fn verify_prompt(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    let pinned = pin_evidence(api, route, expected_pins, execution_home)?;
     let prompt = format!(
         "Transport verification only. Do not use tools, inspect files, or change anything. Reply with exactly: {token}"
     );
@@ -755,7 +789,35 @@ fn verify_prompt(
         readiness_manifest: manifest.context("readiness observation missing")?,
         prompt_digest: digest(prompt.as_bytes()),
         acknowledged_unix_ms: crate::canonical_worker::now(),
+        pinned,
     })
+}
+
+/// A profile that pins a model or effort is launchable only if the agent's own
+/// configuration still says so after the agent became ready, and the ready
+/// screen shows the pinned model. Nothing is read when the profile pins nothing.
+fn pin_evidence(
+    api: &Api<'_>,
+    route: &RuntimeRoute,
+    expected: &crate::agent_home::Pins,
+    execution_home: &Path,
+) -> Result<Option<PinEvidence>> {
+    if expected.model.is_none() && expected.reasoning_effort.is_none() {
+        return Ok(None);
+    }
+    let actual = crate::agent_home::read_pins(&api.profile.kind, execution_home)?;
+    ensure!(
+        expected.model.as_ref().is_none_or(|m| actual.model.as_ref() == Some(m))
+            && expected.reasoning_effort.as_ref().is_none_or(|e| actual.reasoning_effort.as_ref() == Some(e)),
+        "the agent configuration does not pin the profile's model and effort"
+    );
+    let mut model_on_screen = false;
+    if let Some(model) = &expected.model {
+        let screen = api.call("pane.read", json!({"pane_id":route.pane_id,"source":"visible"}))?;
+        model_on_screen = crate::agent_home::screen_shows_model(&api.profile.kind, model, &screen.to_string());
+        ensure!(model_on_screen, "the ready agent screen does not show the profile's pinned model");
+    }
+    Ok(Some(PinEvidence { model: actual.model, reasoning_effort: actual.reasoning_effort, model_on_screen }))
 }
 
 pub(super) fn validate_prompt_response(

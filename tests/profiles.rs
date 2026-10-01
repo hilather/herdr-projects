@@ -149,3 +149,68 @@ fn prepare_refuses_worker_budgets_outside_the_supported_bounds() {
     let out = lab.profile("prepare", &[]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 }
+
+impl Lab {
+    /// A migrated project whose `worker` profile has `kind` and `fields` (extra TOML
+    /// lines such as pins) and whose agent fixture answers `version` (Codex is
+    /// probed with an execution-home `HOME`, Claude without one).
+    fn pinned(kind: &str, fields: &str, version: &str) -> Self {
+        let lab = Lab::with_budget("[]", &format!("{fields}\n[profiles.worker.budget]\nmax_wall_seconds=60\nunknown_usage='allow_with_warning'\n"));
+        let config = fs::read_to_string(&lab.config).unwrap();
+        // The kind is part of the pinned configuration: rebuild the project over it.
+        drop(lab);
+        let home = tempfile::tempdir().unwrap();
+        let config_path = home.path().join(".config/herdr-projects/config.toml");
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(&config_path, config.replace("kind='claude'", &format!("kind='{kind}'"))).unwrap();
+        let lab = Lab { project: home.path().join("root/demo"), config: config_path, home };
+        for command in ["new", "pause"] { lab.ok(&[command, "demo"]); }
+        migration::apply(&lab.project, &migration::inspect_with_config(&lab.project, &lab.config).unwrap(), true).unwrap();
+        fs::create_dir(lab.path("agent-home")).unwrap();
+        fs::write(lab.path("herdr"), "#!/bin/sh\n[ \"$1\" = --version ] && echo 'herdr 0.9.1' && exit 0\nexit 3\n").unwrap();
+        fs::write(lab.path("claude"), format!("#!/bin/sh\n[ \"$1\" = --version ] && echo '{version}' && exit 0\nexit 3\n")).unwrap();
+        for name in ["herdr", "claude"] { fs::set_permissions(lab.path(name), fs::Permissions::from_mode(0o700)).unwrap(); }
+        lab
+    }
+}
+
+/// Model and reasoning effort are validated profile fields for Codex and Claude
+/// (no passthrough arguments): preparation freezes them into the profile
+/// identity and `profile inspect` shows what will be pinned.
+#[test]
+fn model_and_effort_pins_are_profile_fields_that_inspect_shows_and_identity_binds() {
+    for (kind, model, version) in [("codex", "gpt-6.1-sol", "codex-cli 0.154.0"), ("claude", "claude-sonnet-5-5", "2.1.0 (Claude Code)")] {
+        let pinned = Lab::pinned(kind, &format!("model='{model}'\nreasoning_effort='low'"), version);
+        let inspected = pinned.ok(&["profile", "inspect", "worker"]);
+        assert_eq!((inspected["kind"].as_str(), inspected["pinned_model"].as_str(), inspected["pinned_reasoning_effort"].as_str()), (Some(kind), Some(model), Some("low")), "{inspected}");
+        assert_eq!(inspected["extra_argument_count"], 0);
+        assert!(!inspected["blockers"].to_string().contains("model request") && !inspected["blockers"].to_string().contains("reasoning effort"), "{inspected}");
+        let prepared = pinned.profile("prepare", &[]);
+        assert!(prepared.status.success(), "{kind}: {}", String::from_utf8_lossy(&prepared.stderr));
+        let prepared: Value = serde_json::from_slice(&prepared.stdout).unwrap();
+        let profile: FrozenProfile = serde_json::from_value(prepared["profile"].clone()).unwrap();
+        assert_eq!(profile.kind, kind);
+        // No passthrough argument carries the pin; the definition identity does.
+        assert_eq!(profile.arguments_digest, "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945", "empty extra_args");
+        let plain = Lab::pinned(kind, "", version);
+        let other: Value = serde_json::from_slice(&plain.profile("prepare", &[]).stdout).unwrap();
+        assert_ne!(other["profile"]["definition_digest"], prepared["profile"]["definition_digest"], "the pins are part of the profile identity");
+        // Pins write nothing by themselves: the home is prepared by verification and launch.
+        assert!(fs::read_dir(pinned.path("agent-home")).unwrap().next().is_none());
+    }
+}
+
+/// Anything that is not a plain lowercase model or effort name is refused
+/// before any work, without echoing the value.
+#[test]
+fn invalid_pins_are_refused_without_echoing_them() {
+    for fields in ["model='Private Model!'", "reasoning_effort='PRIVATE'", "model='gpt-6.1-sol'\nreasoning_effort=''"] {
+        let lab = Lab::pinned("codex", fields, "codex-cli 0.154.0");
+        let before = runtime::snapshot(&lab.project).unwrap();
+        let refused = lab.profile("prepare", &[]);
+        assert!(!refused.status.success(), "{fields}");
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(!stderr.contains("Private") && !stderr.contains("PRIVATE"), "{stderr}");
+        assert_eq!(runtime::snapshot(&lab.project).unwrap(), before);
+    }
+}

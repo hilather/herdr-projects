@@ -18,7 +18,7 @@ pub(crate) fn retain(project: &Path, herdr: &Path, agent: &Path, home: &Path) ->
         interaction:Some(InteractionEvidence {
             session:ResourceIdentity{device:1,inode:2,born_secs:1,born_nanos:0},
             terminal:"fixture-terminal".into(),readiness_manifest:"fixture-manifest".into(),
-            prompt_digest:"a".repeat(64),acknowledged_unix_ms:999,
+            prompt_digest:"a".repeat(64),acknowledged_unix_ms:999,pinned:None,
         }),
         transport:None,
     };
