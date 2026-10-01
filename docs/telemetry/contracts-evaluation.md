@@ -9,7 +9,7 @@ opened strictly read-only), writes no sidecar stream and is **never read by
 dispatch or admission**: a measured association never becomes a routing
 decision or a causal claim.
 
-## 1. `telemetry <slug> compare` (`analytics-comparison.v1`)
+## 1. `telemetry <slug> compare` (`analytics-comparison.v2`)
 
 ```
 telemetry <slug> compare --metric M02[,M07] [--by configuration]
@@ -338,3 +338,10 @@ disagreements, abstentions, `disagreement_rate` `"d/n"` over non-abstained
 decisions, per class; canonical decisions by chooser as `shadowed`,
 `single_profile_chooser` (operator/delegated), `policy_assigned` or
 `policies_off`).
+
+DG1 extends comparison v2 with M30 (`M30.submission-v1`), evaluated separately
+using the first-submission cohort (`activity_window`) and first-submission
+attempt configuration. Pending candidates remain explicit exclusions. The
+20-task minimum applies to adjudicated first candidates; policy-body digest
+mixes are reported and mismatches block rankings. See
+[contracts-analytics.md](contracts-analytics.md#dg1-first-candidate-independent-verification-m30).

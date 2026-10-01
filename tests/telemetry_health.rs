@@ -679,7 +679,7 @@ fn recommendation_carries_evidence_and_goes_stale_after_a_configuration_change()
     assert_eq!(rec["advisory"], json!({"advisory": true, "authority": "none", "writes": "none",
         "routing": "advisory only: a person decides; nothing here is read by dispatch or admission, and it changes no authority, profile, model access, spending limit or acceptance check"}));
     assert_eq!(rec["metric"], json!({"metric_id": "M02", "definition": "M02.cohort-v1", "higher_is_better": true, "registry": "analytics-registry.v2",
-        "comparison": "analytics-comparison.v1", "freshness": "M50.recommendation-v1"}));
+        "comparison": "analytics-comparison.v2", "freshness": "M50.recommendation-v1"}));
     assert_eq!(rec["evidence_window"], json!({"cohort": "terminal_cohort", "from_unix_ms": null, "to_unix_ms": null, "semantics": "half_open", "time_basis": "task_terminal_time"}));
     assert_eq!(rec["recommendation"]["configuration_id"], json!(codex));
     assert_eq!((&rec["recommendation"]["label"], &rec["recommendation"]["value"], &rec["recommendation"]["tasks"]), (&json!("codex 0.154.0"), &json!("20/20"), &json!(20)));

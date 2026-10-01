@@ -151,7 +151,7 @@ fn registry_declares_every_metric_and_gates_families() {
         let m = get(id);
         assert_eq!((&m["active"], &m["family"], &m["proxy"], &m["certification"]["status"]), (&json!(true), &json!("proxy"), &json!(true), &json!(status)), "{id}");
     }
-    assert_eq!((&get("M30")["certification"]["status"], &get("M30")["versions"][0]["provider"]["reason"]), (&json!("absent"), &json!("no_producer")));
+    assert_eq!((&get("M30")["certification"]["status"], &get("M30")["versions"][0]["provider"]["reason"]), (&json!("fixture"), &Value::Null));
     assert_eq!((&get("M49")["active"], &get("M49")["activation"]["card"]), (&json!(true), &json!("TM4.6")));
     // Text form: one line per metric.
     let text = String::from_utf8(p.raw(&["metrics", "registry"])).unwrap();
@@ -585,4 +585,113 @@ fn refresh_tracks_tables_created_after_input_installation() {
     assert!(resumed["deferred"].as_array().unwrap().is_empty(), "{resumed}");
     assert!(resumed["evaluated"].as_array().unwrap().iter().any(|c| c["metric"] == "M16"), "{resumed}");
     assert_eq!(db.query_row("SELECT count(*) FROM analytics_cells WHERE metric='M16' AND window_from_unix_ms=0 AND checked_unix_ms IS NOT NULL", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+}
+
+/// DG1: first submission is frozen across retries; only adjudicated first
+/// candidates divide the rate. All reads exercise the public CLI.
+#[test]
+fn first_candidate_verification_submission_cohort() {
+    let p = Planted::new();
+    let db = p.db();
+    let a = format!("sha256:{}", hex("arm-a"));
+    let b = format!("sha256:{}", hex("arm-b"));
+    for arm in [&a, &b] {
+        db.execute("INSERT INTO agent_configurations VALUES(?1,'{}',1)", [arm]).unwrap();
+    }
+    for (task, arm) in [("clean", &a), ("retry", &b), ("pending", &a), ("partial", &a)] {
+        let attempt = format!("{task}-a1");
+        plant(&db, task, "running", Some("verify_only"), &[(&attempt, "completed", &[("reserved", 900)])], None, None);
+        for policy in ["ci", "review"] {
+            db.execute("INSERT INTO acceptance_policies VALUES(?1,1,?2,?2)", [task, policy]).unwrap();
+        }
+        db.execute("INSERT INTO dispatch_decisions(attempt_id,task_id,task_revision,contract_revision,chosen_configuration_id,eligible,chooser_kind,chooser_principal,reason_codes,decided_unix_ms)
+            VALUES(?1,?2,1,1,?3,?4,'operator','fixture','[\"unspecified\"]',900)",
+            rusqlite::params![attempt, task, arm, json!([{"configuration_id":arm,"probability_ppm":1000000}]).to_string()]).unwrap();
+        db.execute("INSERT INTO task_classifications(classification_id,task_id,contract_revision,taxonomy,class,band,features,classifier,revision,reason,created_unix_ms)
+            VALUES(?1,?2,1,'taxonomy.v1',?3,'small','{}','rule:fixture',1,NULL,800)",
+            rusqlite::params![format!("sha256:{}", hex(task)), task, if task == "retry" { "docs" } else { "code" }]).unwrap();
+        first_candidate_submission(&db, task, &attempt, "first", 1000);
+    }
+    candidate_verdict(&db, "clean", "first", "ci", true, 3000);
+    candidate_verdict(&db, "clean", "first", "review", true, 3001);
+    candidate_verdict(&db, "retry", "first", "ci", false, 1500);
+    // One accepted required policy is still pending, never a success.
+    candidate_verdict(&db, "partial", "first", "ci", true, 1600);
+    // A later candidate cannot erase acceptance of the original first one.
+    first_candidate_submission(&db, "clean", "clean-a1", "second", 1800);
+    // A later successful candidate on a different configuration cannot replace
+    // the first rejection or transfer that task's comparison arm.
+    db.execute("INSERT INTO attempts(id,task_id,revision,state,reservation,termination_observed) VALUES('retry-a2','retry',2,'completed','retry-a2',1)", []).unwrap();
+    db.execute("INSERT INTO dispatch_decisions(attempt_id,task_id,task_revision,contract_revision,chosen_configuration_id,eligible,chooser_kind,chooser_principal,reason_codes,decided_unix_ms)
+        VALUES('retry-a2','retry',1,1,?1,?2,'operator','fixture','[\"unspecified\"]',1700)",
+        rusqlite::params![a, json!([{"configuration_id":a,"probability_ppm":1000000}]).to_string()]).unwrap();
+    first_candidate_submission(&db, "retry", "retry-a2", "second", 1800);
+    candidate_verdict(&db, "retry", "second", "ci", true, 1900);
+    candidate_verdict(&db, "retry", "second", "review", true, 1901);
+    drop(db);
+    let m = p.query(&["--metric", "M30", "--from", "1000", "--to", "1001"]);
+    assert_eq!(nd(&m), (json!(1), json!(2), json!("1/2")));
+    assert_eq!(m["pending"], 2);
+    assert_eq!(m["coverage"], json!({"state":"partial","known":2,"expected":4,"missing":2,"reasons":{"pending":2,"policy_unknown":0}}));
+    assert_eq!(m["time_basis"], "first_submission_time");
+    let policy = p.query(&["--metric", "M30", "--by", "policy"]);
+    assert_eq!(nd(&policy["cells"][0]), (json!(1), json!(2), json!("1/2")));
+    assert!(policy["cells"][0]["dimension"]["policy"].as_str().unwrap().starts_with("ci,review@sha256:"));
+    let class = p.query(&["--metric", "M30", "--by", "task_class"]);
+    assert_eq!(class["cells"], json!([
+        {"dimension":{"task_class":"code"},"numerator":1,"denominator":1,"value":"1/1","reason":null},
+        {"dimension":{"task_class":"docs"},"numerator":0,"denominator":1,"value":"0/1","reason":null}
+    ]));
+    let compare = p.json(&["compare", "--json", "--metric", "M30", "--by", "configuration", "--from", "1000", "--to", "1001"]);
+    let arms = compare["results"][0]["all_classes"]["arms"].as_array().unwrap();
+    let arm = |id: &str| arms.iter().find(|v| v["configuration_id"] == id).unwrap();
+    assert_eq!((&arm(&a)["numerator"], &arm(&a)["denominator"]), (&json!(1), &json!(1)));
+    assert_eq!((&arm(&b)["numerator"], &arm(&b)["denominator"]), (&json!(0), &json!(1)));
+    assert_eq!(arm(&a)["value"]["reason"], "insufficient_data");
+    assert_eq!(compare["population"]["exclusions"]["pending"], 2);
+    let empty = p.query(&["--metric", "M30", "--from", "1001", "--to", "1801"]);
+    assert_eq!(nd(&empty), (json!(0), json!(0), Value::Null));
+    assert_eq!(empty["reason"], "empty_denominator");
+    assert_eq!(p.query(&["--metric", "M30.v1"])["reason"], "no_producer", "old absent definition stays servable");
+    let report = p.json(&["report", "--json"]);
+    assert_eq!(report["metrics"]["M30"]["value"], "1/2");
+    assert_eq!(p.query(&["--metric", "M30"])["detail"], report["metrics"]["M30"]);
+    let exported = p.json(&["export", "--metric", "M30"]);
+    assert_eq!(exported["metrics"][0]["value"], "1/2", "{exported}");
+    p.raw(&["collect"]);
+    let refreshed = p.json(&["analytics", "refresh", "--metric", "M30"]);
+    let revision = refreshed["appended"].as_array().unwrap().iter().find(|v| v["cell"]["metric"] == "M30").unwrap()["revision"].as_i64().unwrap();
+    assert_eq!(nd(&p.query(&["--metric", "M30", "--as-of-seq", &revision.to_string()])), (json!(1), json!(2), json!("1/2")));
+    assert!(p.json(&["analytics", "rebuild", "--verify"])["identical"].as_bool().unwrap());
+    let db = p.db();
+    candidate_verdict(&db, "pending", "first", "ci", true, 4000);
+    candidate_verdict(&db, "pending", "first", "review", true, 4001);
+    drop(db);
+    assert_eq!(nd(&p.query(&["--metric", "M30"])), (json!(2), json!(3), json!("2/3")));
+    let restated = p.json(&["analytics", "refresh", "--metric", "M30"]);
+    let cell = restated["appended"].as_array().unwrap().iter().find(|v| v["cell"]["metric"] == "M30").unwrap();
+    assert_eq!(cell["kind"], "restatement");
+    assert_eq!(cell["supersedes"], revision);
+    assert_eq!(nd(&p.query(&["--metric", "M30", "--as-of-seq", &revision.to_string()])), (json!(1), json!(2), json!("1/2")));
+    assert!(p.json(&["analytics", "rebuild", "--verify"])["identical"].as_bool().unwrap());
+}
+
+fn first_candidate_submission(db: &rusqlite::Connection, task: &str, attempt: &str, candidate: &str, at: i64) {
+    let submission = hex(&format!("{task}-{candidate}"));
+    db.execute("INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,artifact_manifest,claimed_checks,created_unix_ms)
+        VALUES(?1,'store',?1,?2,'{}',?3,1,?2,?4,'/repo',?5,?5,'sha1','[]','[]',?6)", rusqlite::params![submission, hex("d"), task, attempt, OID, at]).unwrap();
+}
+
+fn candidate_verdict(db: &rusqlite::Connection, task: &str, candidate: &str, policy: &str, accepted: bool, at: i64) {
+    let submission = hex(&format!("{task}-{candidate}"));
+    let run = hex(&format!("{task}-{candidate}-{policy}"));
+    let digest = hex(policy);
+    db.execute("INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms)
+        VALUES(?1,'store',?1,?2,?3,?4,1,?2,?5,?6,?7,?8,?8,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]',?9,?10,?11,?12,1,1,?13)",
+        rusqlite::params![run, hex("d"), submission, task, if candidate == "first" { format!("{task}-a1") } else { format!("{task}-a2") }, policy, digest, OID,
+            if accepted { "accepted" } else { "rejected" }, if accepted { None } else { Some("check_failed") }, if accepted { 0 } else { 1 }, accepted.then_some(&digest), at]).unwrap();
+    if accepted {
+        db.execute("INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms)
+            VALUES(?1,?1,?2,?3,?3,'sha1',?4,?4,'linux-unshare-user-pid-mount-v1',0,?5)", rusqlite::params![run, submission, OID, digest, at]).unwrap();
+    }
 }

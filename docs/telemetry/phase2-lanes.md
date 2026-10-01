@@ -340,10 +340,14 @@ it is done. Most of the log already maps to registry metrics:
 | Worker A vs worker B | `compare --by configuration`; head to head via M41/M42 candidate groups |
 
 Cards (gaps that stop those questions being answered):
-- **DG1 M30 first-candidate verification rate** has no producer (registry:
-  `absent`). Produce it from the first submission's verification run per
-  task: verified-accepted on the first candidate or not. It is the direct
-  "clean on the first pass" measure.
+- **DG1 M30 first-candidate verification rate — done.** Native
+  `M30.submission-v1` in analytics registry v2 measures accepted first
+  candidates / adjudicated first candidates (dictionary doc 07), with pending
+  cases shown separately. First submission time fixes the window; all required
+  policies need independent verified receipts. Query, report, export, revisions
+  and configuration comparison share the producer; CLI fixtures cover retries,
+  partial verification, configuration splits and empty windows. See
+  [contracts-analytics.md](contracts-analytics.md#dg1-first-candidate-independent-verification-m30).
 - **DG2 M10 cache-read share** has no producer. Codex rollouts already report
   `cached_input_tokens` (collected in `codex_usage`), so this is a
   lane-accounting metric definition over existing data. The steward computed

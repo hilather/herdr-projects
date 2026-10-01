@@ -185,7 +185,7 @@ pub const METRICS: &[Metric] = &[
     m!("M27", "reopen_rate", ReviewQuality, "ratio", [lane("review", "M27.v1", A, "integration")], "certified-fixture", QUALITY, None),
     m!("M28", "skeptical_incremental_yield", ReviewQuality, "findings_per_opportunity", [lane("review", "M28.v1", A, "opportunity")], "certified-fixture", QUALITY, Some("descriptive only: no preregistered randomized experiment")),
     m!("M29", "quality_attribution_coverage", ReviewQuality, "ratio", [lane("review", "M29.v1", A, "credit")], "certified-fixture", QUALITY, None),
-    m!("M30", "first_candidate_verification_rate", ReviewQuality, "ratio", [absent("M30.v1", A, "no_producer")], "absent", "no producer", None),
+    m!("M30", "first_candidate_verification_rate", ReviewQuality, "ratio", [Version { dimensions: &["agent_kind", "route", "task_class", "policy"], ..native("M30.submission-v1", A, "first_submission_time") }, absent("M30.v1", A, "no_producer")], "fixture", QUERY, None),
     m!("M31", "human_interventions_per_accepted_task", Attention, "interventions_per_task", [lane("accounting", "M31.attention-v1", T, "attention_interval")], "certified-live", CORE, None),
     m!("M32", "waiting_on_you_share", Attention, "ratio", [lane("accounting", "M32.attention-v1", AS, "attention_interval")], "certified-live", CORE, None),
     m!("M33", "permission_prompts_per_attempt", Attention, "prompts_per_attempt", [lane("accounting", "M33.attention-v1", A, "attention_interval")], "restricted", CORE, Some("attention_reason_not_exposed")),
@@ -212,7 +212,7 @@ pub const METRICS: &[Metric] = &[
     m!("verification_flip_rate", "verification_flip_rate", Proxy, "ratio", [lane("quality", "verification_flip_rate.v1", A, "verification_completed")], "fixture", "tests/telemetry_quality.rs (DG6)", Some("passive reruns only; accepted vs checks_failed; policy drill-down in quality flaky")),
 ];
 
-/// TM4.4 comparison estimators (`analytics-comparison.v1`,
+/// TM4.4 comparison estimators (`analytics-comparison.v2`,
 /// docs/telemetry/contracts-evaluation.md §2): the registry's declared
 /// statistical methods for configuration comparisons. Not metrics: a change
 /// here is a new comparison version.
@@ -232,8 +232,8 @@ pub struct Comparison {
 }
 
 pub const COMPARISON: Comparison = Comparison {
-    version: "analytics-comparison.v1",
-    metrics: &[("M02", "M02.cohort-v1", true), ("M07", "M07.cohort-v1", false)],
+    version: "analytics-comparison.v2",
+    metrics: &[("M02", "M02.cohort-v1", true), ("M07", "M07.cohort-v1", false), ("M30", "M30.submission-v1", true)],
     bootstrap: super::estimators::Bootstrap { method: "percentile_bootstrap.v1", iterations: 1000, seed: 0x544d_345f_636d_7072, level_permille: 950 },
     min_tasks: 20,
     pooling: "beta_binomial_eb.v1",

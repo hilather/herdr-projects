@@ -14,6 +14,8 @@ use std::path::Path;
 
 pub struct Attempt { pub id: String, pub state: String, pub decided: Option<i64>, pub reserved: Option<i64>, pub ended: Option<i64>, pub kind: Option<String> }
 
+pub struct FirstCandidate { pub at: i64, pub attempt: String, pub policy: String, pub policy_digest: String, pub outcome: &'static str }
+
 pub struct Task {
     pub id: String,
     pub state: String,
@@ -24,6 +26,7 @@ pub struct Task {
     pub attempts: Vec<Attempt>,
     /// A replay candidate (`replay_candidates`): outside every lifecycle cohort.
     pub replay: bool,
+    pub first_candidate: Option<FirstCandidate>,
 }
 
 impl Task {
@@ -46,6 +49,7 @@ impl Task {
     pub fn assigned_at(&self) -> Option<i64> { self.attempts.iter().filter_map(|a| a.decided.or(a.reserved)).min() }
     pub fn dimension(&self, name: &str) -> String {
         match name {
+            "policy" => self.first_candidate.as_ref().map(|f| format!("{}@{}", f.policy, f.policy_digest)).unwrap_or_else(|| "unknown".into()),
             "route" => self.route.clone().unwrap_or_else(|| "none".into()),
             "task_class" => self.class.clone().unwrap_or_else(|| "unclassified".into()),
             "agent_kind" => {
@@ -112,10 +116,40 @@ pub fn load(project: &Path) -> Result<Vec<Task>> {
         Some(sql) => db.prepare(&sql)?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?,
         None => BTreeSet::new(),
     };
+    // Read runs once; repeatedly scanning them for every policy/task would
+    // make every query and report quadratic in the verification history.
+    let mut verdicts = BTreeMap::<(String, String, String), (bool, bool)>::new();
+    let mut runs = db.prepare("SELECT v.submission_id,v.policy_id,v.policy_digest,v.state,
+        r.result_id IS NOT NULL FROM verification_runs v
+        LEFT JOIN verified_results r ON r.run_id=v.run_id AND r.submission_id=v.submission_id AND r.policy_digest=v.policy_digest")?;
+    for row in runs.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, bool>(4)?)))? {
+        let (submission, policy, digest, state, receipt) = row?;
+        let verdict = verdicts.entry((submission, policy, digest)).or_default();
+        verdict.0 |= state == "accepted" && receipt;
+        verdict.1 |= state == "rejected";
+    }
+    let mut firsts = BTreeMap::new();
+    let mut stmt = db.prepare("SELECT task_id,submission_id,attempt_id,contract_revision,created_unix_ms
+        FROM result_submissions ORDER BY task_id,created_unix_ms,submission_id")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?)))?;
+    for row in rows {
+        let (task, submission, attempt, revision, at) = row?;
+        if firsts.contains_key(&task) { continue; }
+        let policies: Vec<(String, String)> = db.prepare("SELECT policy_id,body FROM acceptance_policies WHERE task_id=?1 AND contract_revision=?2 ORDER BY policy_id")?
+            .query_map(rusqlite::params![task, revision], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        let (mut passed, mut rejected) = (0usize, false);
+        for (policy, body) in &policies {
+            let digest = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(body.as_bytes()));
+            let (accepted, failed) = verdicts.get(&(submission.clone(), policy.clone(), digest)).copied().unwrap_or_default();
+            if accepted { passed += 1; } else if failed { rejected = true; }
+        }
+        let outcome = if policies.is_empty() { "policy_unknown" } else if passed == policies.len() { "accepted" } else if rejected { "rejected" } else { "pending" };
+        firsts.insert(task, FirstCandidate { at, attempt, policy: policies.iter().map(|p| p.0.as_str()).collect::<Vec<_>>().join(","), policy_digest: super::sha256(serde_json::to_string(&policies)?.as_bytes()), outcome });
+    }
     Ok(evidence.into_iter().map(|(id, state, accepted)| {
         let route = routes.get(&id).cloned();
         let accepted_at = accepted.then(|| times.get(&id).and_then(|(verified, integrated)| if route.as_deref() == Some("verify_only") { *verified } else { *integrated })).flatten();
-        Task { attempts: attempts.remove(&id).unwrap_or_default(), class: classes.get(&id).cloned(), route, accepted, accepted_at, replay: replay.contains(&id), state, id }
+        Task { first_candidate: firsts.remove(&id), attempts: attempts.remove(&id).unwrap_or_default(), class: classes.get(&id).cloned(), route, accepted, accepted_at, replay: replay.contains(&id), state, id }
     }).collect())
 }
 
@@ -125,6 +159,7 @@ pub fn digest(tasks: &[Task]) -> String {
     let rows: Vec<Value> = tasks.iter().map(|t| {
         let mut row = json!([t.id, t.state, t.accepted, t.accepted_at, t.route, t.class,
             t.attempts.iter().map(|a| json!([a.id, a.state, a.decided, a.reserved, a.ended, a.kind])).collect::<Vec<_>>()]);
+        if let Some(f) = &t.first_candidate && let Value::Array(row) = &mut row { row.push(json!([f.at, f.attempt, f.policy, f.policy_digest, f.outcome])); }
         if t.replay && let Value::Array(row) = &mut row { row.push(json!("replay_candidate")); }
         row
     }).collect();
@@ -133,7 +168,7 @@ pub fn digest(tasks: &[Task]) -> String {
 
 /// Latest event time among the extracted rows (occurrence time, not observation).
 pub fn last_event(tasks: &[Task]) -> Option<i64> {
-    tasks.iter().flat_map(|t| t.attempts.iter().flat_map(|a| [a.decided, a.reserved, a.ended]).chain([t.accepted_at])).flatten().max()
+    tasks.iter().flat_map(|t| t.attempts.iter().flat_map(|a| [a.decided, a.reserved, a.ended]).chain([t.accepted_at, t.first_candidate.as_ref().map(|f| f.at)])).flatten().max()
 }
 
 /// One lineage row: `(entity_kind, entity_id, attrs)`.
@@ -153,6 +188,14 @@ fn cohort<'a>(tasks: &'a [Task], r: &Request) -> (Vec<Member<'a>>, BTreeMap<&'st
     for task in tasks {
         // Evaluation artefacts: measured by M49, never in a lifecycle cohort.
         if task.replay { excluded.entry("replay_candidate").or_default().push(task); continue; }
+        if r.metric == "M30" {
+            let Some(first) = &task.first_candidate else { excluded.entry("no_submission").or_default().push(task); continue; };
+            if !inside(first.at) { excluded.entry("outside_window").or_default().push(task); continue; }
+            cutoff = cutoff.max(Some(first.at));
+            if ["pending", "policy_unknown"].contains(&first.outcome) { excluded.entry(first.outcome).or_default().push(task); continue; }
+            members.push(Member { task, outcome: first.outcome });
+            continue;
+        }
         let disposition = task.disposition();
         match r.cohort {
             Cohort::Terminal => {
@@ -200,7 +243,7 @@ fn compute(metric: &str, members: &[&Member]) -> (Value, Value, Value, Option<&'
     for m in members { *breakdown.entry(m.outcome).or_default() += 1; }
     match metric {
         "M01" => (json!(accepted), Value::Null, json!(accepted), None, json!({"breakdown": breakdown})),
-        "M02" => { let (value, reason) = ratio(accepted, members.len()); (json!(accepted), json!(members.len()), value, reason, json!({"breakdown": breakdown})) }
+        "M02" | "M30" => { let (value, reason) = ratio(accepted, members.len()); (json!(accepted), json!(members.len()), value, reason, json!({"breakdown": breakdown})) }
         "M07" => {
             let attempts: Vec<&Attempt> = members.iter().flat_map(|m| &m.task.attempts).collect();
             let (value, reason) = ratio(attempts.len(), accepted);
@@ -239,6 +282,14 @@ pub fn evaluate(tasks: &[Task], r: &Request) -> (Value, Lineage) {
     if unknown > 0 { reasons.insert(if r.cohort == Cohort::Terminal { "terminal_time_unknown".into() } else { "assignment_time_unknown".into() }, json!(unknown)); }
     if r.metric == "M06" && known < expected { reasons.insert("acceptance_or_admission_time_unknown".into(), json!(expected - known)); }
     body["coverage"] = json!({"state": if known == expected { "complete" } else { "partial" }, "known": known, "expected": expected, "missing": expected - known, "reasons": reasons});
+    if r.metric == "M30" {
+        let pending = excluded.get("pending").map_or(0, Vec::len);
+        let unknown = excluded.get("policy_unknown").map_or(0, Vec::len);
+        body["pending"] = json!(pending);
+        body["coverage"] = json!({"state": if pending + unknown == 0 { "complete" } else { "partial" },
+            "known": members.len(), "expected": members.len() + pending + unknown, "missing": pending + unknown,
+            "reasons": {"pending": pending, "policy_unknown": unknown}});
+    }
     if r.cohort == Cohort::Assignment {
         let unfinished = members.iter().filter(|m| m.outcome == "unfinished").count();
         body["censored"] = json!({"unfinished": unfinished});
@@ -262,7 +313,7 @@ pub fn evaluate(tasks: &[Task], r: &Request) -> (Value, Lineage) {
     };
     lineage.insert("numerator".into(), numerator);
     lineage.insert("denominator".into(), match r.metric {
-        "M02" => members.iter().map(|m| task_row(m.task)).collect(),
+        "M02" | "M30" => members.iter().map(|m| task_row(m.task)).collect(),
         "M07" => members.iter().filter(|m| m.outcome == "accepted").map(|m| task_row(m.task)).collect(),
         _ => Vec::new(),
     });

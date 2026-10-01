@@ -28,8 +28,8 @@ Native definitions added by TM4.1 (the certified `slice-v1` ones stay
 servable by name): `M01.cohort-v1` accepted tasks, `M02.cohort-v1`
 acceptance rate, `M06.cohort-v1` lead-time p95 (nearest rank, ms, accepted
 tasks with both times; failed/open counted, never given a time),
-`M07.cohort-v1` attempt amplification. Absent producers: M03, M05, M10, M19,
-M30. M49 (`M49.v1`, central provider) is produced by the replay suite ([contracts-replay.md](contracts-replay.md)).
+`M07.cohort-v1` attempt amplification. Absent producers: M03, M05, M10, M19.
+M49 (`M49.v1`, central provider) is produced by the replay suite ([contracts-replay.md](contracts-replay.md)).
 M50's current definition `M50.recommendation-v1` (TM4.5,
 [contracts-health.md](contracts-health.md) §5) has provider
 `per_recommendation`: `query --metric M50` answers `unavailable:
@@ -123,6 +123,43 @@ Plan doc 07 §1. `T`/`A` evidence is exactly contracts §6 (`metrics::task_evide
   classification, else `unclassified`), `agent_kind` (the attempts' effective
   profile kind, `mixed`, `unknown` or `unassigned`). At most 64 cells.
 
+### DG1: first-candidate independent verification (M30)
+
+Registry v2 adds native `M30.submission-v1`; the historical absent `M30.v1`
+remains explicitly servable as `no_producer`. This follows dictionary doc 07
+M30: accepted first candidates / adjudicated first candidates, rather than
+all submitted tasks. No minimum applies to the descriptive query/report ratio.
+
+The cohort is `activity_window`, placed by the first submission's
+`created_unix_ms` in `[from,to)` (`first_submission_time`). First means earliest
+submission across every attempt and contract revision, with submission ID as
+the deterministic timestamp tie-breaker. Retries never replace it; later
+candidates neither supply its receipts nor remove an accepted first candidate.
+Verification may occur after the submission window. Replay candidates stay
+excluded. Required policies come from that submission's contract revision.
+Every required policy must have an accepted independent verification run joined
+to its `verified_results` receipt for that submission and policy digest. A
+required policy rejection without subsequent acceptance adjudicates the first
+candidate as rejected. Partial policy acceptance is pending; a contract with no
+recorded policies is `policy_unknown`, never assumed accepted.
+
+Pending and unknown-policy cases stay outside the denominator and appear in
+`exclusions`, `pending` and partial coverage (`known` adjudicated, `expected`
+submitted in-window). Empty denominators return null / `empty_denominator`,
+never zero. Dimensions include `policy` (sorted required policy IDs plus a digest of their
+immutable bodies) and
+`task_class`, plus `route` and `agent_kind`; native drill buckets and revision
+refresh/rebuild are supported. Report and export share this evaluation.
+
+`compare --metric M30 --by configuration` uses the same submission cohort;
+the arm is the first submission attempt's dispatch configuration, frozen across
+later attempts. M30 is compared separately from terminal/assignment metrics.
+Counts remain visible below the 20-adjudicated-candidate comparison minimum;
+values and rankings are suppressed as `insufficient_data`. Policy-body digest
+mixes are reported per arm and differing mixes prevent rankings, as differing difficulty
+mixes already do. Query policy/task-class strata remain separately available.
+There are no new tables, migrations or retention/backup classifications.
+
 ## 4. Aggregate revisions (stream `analytics`, version 3)
 
 `migrations/telemetry/analytics/0001_aggregate_revisions.sql`:
@@ -181,7 +218,7 @@ refreshed by then (`no_revision_as_of` otherwise).
 ## 5. Pagination and drill-down
 
 `--drill <bucket>` pages the identities behind one native metric: buckets
-`numerator`, `denominator` (M02, M07), `outcome.<disposition>`,
+`numerator`, `denominator` (M02, M07, M30), `outcome.<disposition>`,
 `excluded.<reason>`; rows `{entity, id, ...attrs}` (tasks: disposition,
 terminal and assignment times, attempts, route, agent kind, task class;
 attempts: task, state, decision time), ordered by id. `--page-size` 1–500
@@ -204,8 +241,9 @@ lane's ledger commands.
 
 `telemetry report` and the fleet pane read through the query service's read
 path (`analytics::query::report`: the central slice metrics, then each lane's,
-a lane key replacing a central one). Their output is byte-identical to before
-TM4.1: the report keeps each lane's own definitions and does not apply the
+a lane key replacing a central one). DG1 adds the native M30 body; the other
+report bodies retain their contracts. The report keeps each lane's own
+definitions and does not apply the
 registry's activation gate (every current family is active). For every
 metric the report prints, `query --metric <its definition>` returns that
 body as `detail` (`report_and_query_share_one_read_path`). The `analytics`
@@ -230,7 +268,7 @@ lane adds no report keys.
 through this service's lifecycle evaluation (the same membership and
 lineage as `query`), add no metric and no sidecar stream, and never write.
 The registry's `metrics registry --json` gains one additive key,
-`comparison` (`analytics-comparison.v1`: comparable definitions M02/M07,
+`comparison` (`analytics-comparison.v2`: comparable definitions M02/M07/M30,
 bootstrap method, seed and level, the 20-task cell minimum, the
 `beta_binomial_eb.v1` pooling prior, `hajek_ipw.v1` and the paired M42
 reference); the text form and every metric entry are unchanged.

@@ -43,6 +43,11 @@ pub fn report(project: &Path, since: Option<i64>) -> Result<Value> {
         Ok((metrics, tasks, lanes, after))
     })?;
     for (_, lane) in lanes { metrics.extend(lane); }
+    let (mut first, _) = lifecycle::evaluate(&lifecycle::load(project)?, &lifecycle::Request {
+        metric: "M30", cohort: Cohort::Activity, from: since, to: None, horizon: None, by: None });
+    first["definition"] = json!("M30.submission-v1");
+    first["name"] = json!("first_candidate_verification_rate");
+    metrics.insert("M30".into(), first);
     let mut report = json!({"metrics": metrics, "since_unix_ms": since, "tasks": tasks});
     if !after.is_empty() { report["after_termination"] = json!(after); }
     Ok(report)
@@ -321,6 +326,11 @@ pub fn evaluate(sources: &mut Sources, cell: &Cell) -> Result<(Value, Lineage)> 
             let (mut core, lineage) = lifecycle::evaluate(&sources.tasks, &request);
             if core["cells"].as_array().is_some_and(|cells| cells.len() > MAX_CELLS) {
                 return Ok((unavailable_core("too_many_cells", json!({"max": MAX_CELLS})), Lineage::new()));
+            }
+            if cell.metric.id == "M30" {
+                core["definition"] = json!(cell.version.definition);
+                core["name"] = json!(cell.metric.name);
+                core["detail"] = core.clone();
             }
             core["status"] = json!(if core["value"].is_null() { "empty" } else { "available" });
             Ok((core, lineage))

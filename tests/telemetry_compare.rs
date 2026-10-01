@@ -185,7 +185,7 @@ fn adversarial_cohort_exposes_failures_coverage_and_allocations_without_ranking(
 
     let raw = p.raw(&["compare", "--json", "--metric", "M02", "--by", "configuration"]);
     let r: Value = serde_json::from_slice(&raw).unwrap();
-    assert_eq!((&r["contract"], &r["analysis"]["kind"], &r["analysis"]["causal"]), (&json!("analytics-comparison.v1"), &json!("observational"), &json!(false)));
+    assert_eq!((&r["contract"], &r["analysis"]["kind"], &r["analysis"]["causal"]), (&json!("analytics-comparison.v2"), &json!("observational"), &json!(false)));
     assert!(r["analysis"]["routing"].as_str().unwrap().starts_with("never"));
     assert_eq!(r["population"]["members"], 11);
     assert_eq!(r["population"]["allocated"], 9);
@@ -198,7 +198,7 @@ fn adversarial_cohort_exposes_failures_coverage_and_allocations_without_ranking(
     let (ca, cb) = (arm(cell, &a), arm(cell, &b));
     assert_eq!((&ca["tasks"], &ca["numerator"], &ca["denominator"], &ca["breakdown"]), (&json!(5), &json!(2), &json!(5), &json!({"accepted": 2, "cancelled": 1, "failed": 2})));
     assert_eq!((&ca["status"], &ca["value"], &ca["interval"], &ca["pooled"]), (&json!("suppressed"), &unavailable("insufficient_data"), &unavailable("insufficient_data"), &unavailable("insufficient_data")));
-    assert_eq!(ca["min_sample"], json!({"value": 20, "unit": "terminal_tasks", "source": "analytics-comparison.v1"}));
+    assert_eq!(ca["min_sample"], json!({"value": 20, "unit": "terminal_tasks", "source": "analytics-comparison.v2"}));
     assert_eq!((&cb["numerator"], &cb["denominator"], &cb["status"]), (&json!(4), &json!(4), &json!("suppressed")));
     // Small samples: no ranking, in the class or overall.
     assert_eq!(cell["ranking"], json!({"status": "not_supported", "reasons": [{"insufficient_data": sorted(vec![a.clone(), b.clone()])}]}));
@@ -285,7 +285,7 @@ fn separated_intervals_rank_only_within_a_class_with_pooled_beside_raw() {
     let r = p.compare(&["--metric", "M02,M07"]);
     let interval = |lower: &str, upper: &str, lower_decimal: &str, upper_decimal: &str, clusters: u32| json!({"method": "percentile_bootstrap.v1", "resample": "task",
         "clusters": clusters, "iterations": 1000, "seed": SEED, "level": "0.95", "lower": lower, "upper": upper, "lower_decimal": lower_decimal, "upper_decimal": upper_decimal,
-        "source": "analytics-comparison.v1"});
+        "source": "analytics-comparison.v2"});
     let m02 = &r["results"][0];
     let (code, docs) = (&m02["cells"][0], &m02["cells"][1]);
     assert_eq!((&code["task_class"], &docs["task_class"]), (&json!("code"), &json!("docs")));
@@ -319,7 +319,7 @@ fn separated_intervals_rank_only_within_a_class_with_pooled_beside_raw() {
     // Reproducible with the recorded seed; an override is labelled and changes only the draws.
     assert_eq!(p.compare(&["--metric", "M02,M07"]), r);
     let o = p.compare(&["--metric", "M02", "--seed", "7", "--task-class", "code"]);
-    assert_eq!(o["estimators"]["bootstrap"]["source"], json!({"source": "override", "registry": {"seed": SEED, "source": "analytics-comparison.v1"}}));
+    assert_eq!(o["estimators"]["bootstrap"]["source"], json!({"source": "override", "registry": {"seed": SEED, "source": "analytics-comparison.v2"}}));
     let bo = arm(&o["results"][0]["cells"][0], &b);
     assert_eq!((&bo["interval"]["seed"], &bo["interval"]["lower"], &bo["interval"]["upper"]), (&json!("0x0000000000000007"), &json!(B_SEED7.0), &json!(B_SEED7.1)));
     // A class filter compares one class: the all-class row equals it and is still not a universal ranking.
@@ -424,7 +424,7 @@ fn experiment_sample_size_plan_golden() {
     // The registry publishes the comparison estimators.
     let registry = p.json(&["metrics", "registry", "--json"]);
     assert_eq!((&registry["comparison"]["version"], &registry["comparison"]["bootstrap"]["seed"], &registry["comparison"]["min_sample"]["value"]),
-        (&json!("analytics-comparison.v1"), &json!(SEED), &json!(20)));
+        (&json!("analytics-comparison.v2"), &json!(SEED), &json!(20)));
 }
 
 const STRICT_PER_ARM: u64 = 735;
@@ -529,7 +529,7 @@ fn experiment_report_is_intention_to_treat_and_causal_only_at_the_preregistered_
     let d = &e["differences"]["skeptical"];
     assert_eq!((&d["value"], &d["analyzable"]), (&json!("1"), &json!([2, 2])));
     assert_eq!(d["interval"], json!({"method": "percentile_bootstrap.v1", "resample": "task_within_arm", "clusters": [2, 2], "iterations": 1000, "seed": SEED,
-        "level": "0.95", "lower": "0", "upper": "2", "lower_decimal": "0.0000", "upper_decimal": "2.0000", "source": "analytics-comparison.v1"}));
+        "level": "0.95", "lower": "0", "upper": "2", "lower_decimal": "0.0000", "upper_decimal": "2.0000", "source": "analytics-comparison.v2"}));
     assert_eq!((&d["causal"]["status"], &d["causal"]["design"], &d["causal"]["analysis"]), (&json!("causal_estimate"), &json!("randomized"), &json!("intention_to_treat")));
     assert!(e["routing"].as_str().unwrap().starts_with("never"));
     let text = f.text(&["experiments", "report"]);

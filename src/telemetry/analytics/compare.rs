@@ -1,4 +1,4 @@
-//! TM4.4 configuration comparisons (`analytics-comparison.v1`,
+//! TM4.4 configuration comparisons (`analytics-comparison.v2`,
 //! docs/telemetry/contracts-evaluation.md §1–§5): `telemetry <slug> compare`.
 //! Cohort membership is the query service's (`lifecycle::evaluate`, the same
 //! lineage `query --drill` pages); arms are `AgentConfiguration`s from the
@@ -19,13 +19,13 @@ const ROUTING: &str = "never: advisory evidence only; nothing here is read by di
 /// `telemetry <slug> compare ...`
 #[derive(clap::Args, Clone, Debug)]
 pub struct Args {
-    /// Comparable registry metric (`M02`, `M07`); repeatable or comma-separated.
+    /// Comparable registry metric (`M02`, `M07`, `M30`); repeatable or comma-separated.
     #[arg(long = "metric", required = true, value_delimiter = ',')]
     pub metrics: Vec<String>,
     /// Comparison arm: `configuration` (the content-addressed AgentConfiguration).
     #[arg(long, default_value = "configuration")]
     pub by: String,
-    /// `terminal_cohort` (default) or `assignment_cohort`; `completed_task` is rejected.
+    /// `terminal_cohort` or `assignment_cohort`; M30 uses `activity_window` by default.
     #[arg(long)]
     pub cohort: Option<String>,
     /// Window start, inclusive, UTC Unix ms.
@@ -67,9 +67,11 @@ fn request(args: &Args) -> Result<Request> {
         };
         if !metrics.contains(&entry) { metrics.push(entry); }
     }
-    let cohort = match &args.cohort { None => Cohort::Terminal, Some(text) => Cohort::parse(text).map_err(|code| reject(json!({"code": code, "cohort": text,
-        "accepted": ["terminal_cohort", "assignment_cohort"]})))? };
-    if cohort == Cohort::Activity { return Err(reject(json!({"code": "cohort_unsupported", "cohort": cohort.as_str(), "supported": ["terminal_cohort", "assignment_cohort"]}))); }
+    let first_candidates = metrics.iter().any(|m| m.0 == "M30");
+    if first_candidates && metrics.len() > 1 { return Err(reject(json!({"code": "cohort_unsupported", "detail": "compare M30 separately: it uses a submission cohort"}))); }
+    let cohort = match &args.cohort { None => if first_candidates { Cohort::Activity } else { Cohort::Terminal }, Some(text) => Cohort::parse(text).map_err(|code| reject(json!({"code": code, "cohort": text,
+        "accepted": if first_candidates { vec!["activity_window"] } else { vec!["terminal_cohort", "assignment_cohort"] }})))? };
+    if (cohort == Cohort::Activity) != first_candidates { return Err(reject(json!({"code": "cohort_unsupported", "cohort": cohort.as_str(), "supported": if first_candidates { vec!["activity_window"] } else { vec!["terminal_cohort", "assignment_cohort"] }}))); }
     if args.from.zip(args.to).is_some_and(|(from, to)| from >= to) { return Err(reject(json!({"code": "empty_window", "from": args.from, "to": args.to}))); }
     if args.horizon_ms.is_some() && cohort != Cohort::Assignment { return Err(reject(json!({"code": "horizon_unsupported", "cohort": cohort.as_str()}))); }
     if args.horizon_ms.is_some_and(|h| h <= 0) { return Err(reject(json!({"code": "horizon_out_of_range"}))); }
@@ -159,6 +161,7 @@ fn same_mix(groups: &[Vec<&Unit>], key: for<'a, 'b> fn(&'a Unit<'b>) -> &'a str)
 }
 
 fn band_of<'a>(u: &'a Unit) -> &'a str { &u.band }
+fn policy_of<'a>(u: &'a Unit) -> &'a str { u.task.first_candidate.as_ref().map_or("unknown", |f| f.policy_digest.as_str()) }
 fn class_of<'a>(u: &'a Unit) -> &'a str { &u.class }
 
 /// A computed arm cell: its JSON, point value and interval bounds (for rankings).
@@ -181,12 +184,13 @@ fn cell(metric: &str, configuration: &str, units: &[&Unit], all: Option<(i64, i6
     let shown = units.len() >= COMPARISON.min_tasks as usize;
     let mut out = json!({"configuration_id": configuration, "tasks": units.len(), "numerator": num, "denominator": den,
         "breakdown": counts(units.iter().map(|u| u.outcome.as_str())), "difficulty": counts(units.iter().map(|u| u.band.as_str()))});
+    if metric == "M30" { out["policies"] = json!(counts(units.iter().map(|u| policy_of(u)))); }
     let (mut point, mut bounds) = (None, None);
     if !shown {
         // Plan doc 07 §6: suppressed below the registry minimum, counts still shown.
         out["status"] = json!("suppressed");
         out["value"] = unavailable("insufficient_data");
-        out["min_sample"] = json!({"value": COMPARISON.min_tasks, "unit": "terminal_tasks", "source": COMPARISON.version});
+        out["min_sample"] = json!({"value": COMPARISON.min_tasks, "unit": if metric == "M30" { "adjudicated_first_candidates" } else { "terminal_tasks" }, "source": COMPARISON.version});
         for key in ["interval", "pooled", "propensity_weighted"] { out[key] = unavailable("insufficient_data"); }
         return Cell { value: out, point, bounds, shown };
     }
@@ -347,7 +351,7 @@ fn run_report(project: &Path, args: &Args, workspace: bool) -> Result<Value> {
     let r = request(args)?;
     let sources = load(project)?;
     let sidecar = crate::telemetry::sidecar::read(project)?;
-    let (body, lineage) = lifecycle::evaluate(&sources.tasks, &lifecycle::Request { metric: "M02", cohort: r.cohort, from: r.from, to: r.to, horizon: r.horizon, by: None });
+    let (body, lineage) = lifecycle::evaluate(&sources.tasks, &lifecycle::Request { metric: r.metrics[0].0, cohort: r.cohort, from: r.from, to: r.to, horizon: r.horizon, by: None });
     let by_id: BTreeMap<&str, &Task> = sources.tasks.iter().map(|t| (t.id.as_str(), t)).collect();
     let mut units: Vec<Unit> = Vec::new();
     let mut filtered = 0usize;
@@ -357,7 +361,10 @@ fn run_report(project: &Path, args: &Args, workspace: bool) -> Result<Value> {
             let Some(task) = by_id.get(id.as_str()) else { continue };
             let class = task.dimension("task_class");
             if r.class.as_ref().is_some_and(|c| *c != class) { filtered += 1; continue; }
-            let (arm, first) = arm(task, &sources.decisions);
+            let (arm, first) = if r.metrics[0].0 == "M30" {
+                let decision = task.first_candidate.as_ref().and_then(|f| sources.decisions.get(&f.attempt));
+                (decision.map(|d| d.configuration.clone()).ok_or("configuration_unknown"), decision)
+            } else { arm(task, &sources.decisions) };
             units.push(Unit { task, outcome: outcome.to_owned(), band: sources.bands.get(&task.id).cloned().unwrap_or_else(|| "unclassified".into()), class, arm, first });
         }
     }
@@ -399,7 +406,7 @@ fn run_report(project: &Path, args: &Args, workspace: bool) -> Result<Value> {
         configurations.push(entry);
     }
 
-    notes.push(json!({"code": "failures_included", "detail": "failed, cancelled and succeeded-without-evidence tasks stay in every denominator; assignment-cohort unfinished tasks count as not accepted",
+    notes.push(json!({"code": "failures_included", "detail": if r.metrics[0].0 == "M30" { "adjudicated first candidates only; pending cases excluded and shown separately; configuration frozen to the first submission attempt" } else { "failed, cancelled and succeeded-without-evidence tasks stay in every denominator; assignment-cohort unfinished tasks count as not accepted" },
         "breakdown": body["breakdown"]}));
     if !unallocated.is_empty() {
         notes.push(json!({"code": "unallocated_tasks", "detail": "tasks dispatched on several configurations, without a dispatch decision, or never assigned belong to no arm", "counts": unallocated}));
@@ -427,7 +434,8 @@ fn run_report(project: &Path, args: &Args, workspace: bool) -> Result<Value> {
                 (*c, cell(metric, c, us, Some(total), propensity, &r.bootstrap, source))
             }).collect();
             let groups: Vec<Vec<&Unit>> = in_class.values().cloned().collect();
-            let matched: Vec<&'static str> = if same_mix(&groups, band_of) { Vec::new() } else { vec!["difficulty_mix_differs"] };
+            let mut matched: Vec<&'static str> = if same_mix(&groups, band_of) { Vec::new() } else { vec!["difficulty_mix_differs"] };
+            if metric == "M30" && !same_mix(&groups, policy_of) { matched.push("verification_policy_mix_differs"); }
             let refs: Vec<(&str, &Cell)> = computed.iter().map(|(c, cell)| (*c, cell)).collect();
             class_cells.push(json!({"task_class": class, "arms": computed.iter().map(|(_, c)| c.value.clone()).collect::<Vec<_>>(),
                 "propensity": match &weighted { Ok(_) => json!({"status": "available", "method": COMPARISON.propensity}), Err(reason) => reason.clone() },
@@ -459,7 +467,7 @@ fn run_report(project: &Path, args: &Args, workspace: bool) -> Result<Value> {
         "analysis": {"kind": "observational", "causal": false, "routing": ROUTING,
             "detail": "production assignment is not randomized: stronger arms may receive harder tasks; recorded covariates do not remove selection bias"},
         "estimators": {"bootstrap": {"method": r.bootstrap.method, "resample": "task", "iterations": r.bootstrap.iterations, "seed": r.bootstrap.seed_hex(),
-            "level": r.bootstrap.level(), "source": source}, "min_sample": {"value": COMPARISON.min_tasks, "unit": "terminal_tasks_per_configuration_class_cell", "source": COMPARISON.version},
+            "level": r.bootstrap.level(), "source": source}, "min_sample": {"value": COMPARISON.min_tasks, "unit": if r.metrics[0].0 == "M30" { "adjudicated_first_candidates_per_configuration_class_cell" } else { "terminal_tasks_per_configuration_class_cell" }, "source": COMPARISON.version},
             "pooling": {"model": COMPARISON.pooling, "prior_strength": COMPARISON.prior_strength, "prior_mean": "arm_all_class_rate"}, "propensity": COMPARISON.propensity},
         "population": {"cohort": r.cohort.as_str(), "members": units.len(), "allocated": units.len() - unallocated.values().sum::<usize>(), "unallocated": unallocated,
             "exclusions": exclusions, "coverage": body["coverage"], "censored": body.get("censored").cloned().unwrap_or(Value::Null)},
