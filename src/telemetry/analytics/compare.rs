@@ -19,13 +19,13 @@ const ROUTING: &str = "never: advisory evidence only; nothing here is read by di
 /// `telemetry <slug> compare ...`
 #[derive(clap::Args, Clone, Debug)]
 pub struct Args {
-    /// Comparable registry metric (`M02`, `M07`, `M30`); repeatable or comma-separated.
+    /// Comparable registry metric (`M02`, `M07`, `M30`, or separately `M10`); repeatable or comma-separated.
     #[arg(long = "metric", required = true, value_delimiter = ',')]
     pub metrics: Vec<String>,
     /// Comparison arm: `configuration` (the content-addressed AgentConfiguration).
     #[arg(long, default_value = "configuration")]
     pub by: String,
-    /// `terminal_cohort` or `assignment_cohort`; M30 uses `activity_window` by default.
+    /// `terminal_cohort` or `assignment_cohort`; M30 and M10 use `activity_window` by default.
     #[arg(long)]
     pub cohort: Option<String>,
     /// Window start, inclusive, UTC Unix ms.
@@ -342,7 +342,15 @@ fn model_allocation(sidecar: Option<&rusqlite::Connection>, units: &[&Unit]) -> 
 }
 
 /// `telemetry <slug> compare`: the full JSON report.
-pub fn run(project: &Path, args: &Args) -> Result<Value> { run_report(project, args, false) }
+pub fn run(project: &Path, args: &Args) -> Result<Value> {
+    if args.metrics.iter().any(|m| matches!(m.as_str(), "M10" | "M10.v1")) {
+        if args.metrics.iter().any(|m| !matches!(m.as_str(), "M10" | "M10.v1")) {
+            return Err(reject(json!({"code": "cohort_incompatible", "detail": "M10 activity consumption must be compared separately"})));
+        }
+        return crate::telemetry::accounting::cache::compare(project, args);
+    }
+    run_report(project, args, false)
+}
 
 /// Same cells and labels, without cost/model diagnostics the workspace does
 /// not consume. Called only while recording a workspace history revision.
@@ -482,6 +490,15 @@ pub fn text(report: &Value) -> String {
     let mut out = format!("{} cohort={} observational causal=false\n", report["contract"].as_str().unwrap_or(""), report["request"]["cohort"].as_str().unwrap_or(""));
     let short = |v: &Value| v.as_str().map_or(String::new(), |s| s.get(..19).unwrap_or(s).to_owned());
     let value = |v: &Value| match v { Value::String(s) => s.clone(), Value::Object(o) => format!("unavailable({})", o.get("reason").and_then(Value::as_str).unwrap_or("?")), _ => "null".into() };
+    if report["contract"] == "analytics-cache-comparison.v1" {
+        let cache_value = |v: &Value| v["reason"].as_str().map_or_else(|| value(v), |reason| format!("n/a ({reason})"));
+        out += &format!("M10 cache_read_share {}\n", cache_value(&report["metric"]["value"]));
+        for (arm, body) in report["configurations"].as_object().into_iter().flatten() {
+            out += &format!("  configuration {arm} value={} numerator={} denominator={} cache_write_tokens={}\n",
+                cache_value(&body["value"]), body["numerator"], body["denominator"], body["cache_write_tokens"]);
+        }
+        out += &format!("  configuration_unknown {}\n", cache_value(&report["configuration_unknown"]["value"]));
+    }
     for result in report["results"].as_array().into_iter().flatten() {
         out += &format!("{} {} {}\n", result["metric_id"].as_str().unwrap_or(""), result["name"].as_str().unwrap_or(""), result["definition"].as_str().unwrap_or(""));
         for c in result["cells"].as_array().into_iter().flatten() {

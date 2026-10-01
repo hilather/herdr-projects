@@ -8,7 +8,7 @@ are [contracts.md](contracts.md) §0. Code: `src/telemetry/analytics/`
 (TM4.3). Telemetry never grants launch, changes budgets or accepts results;
 nothing here writes `state.db`.
 
-## 1. Metric registry (`analytics-registry.v3`)
+## 1. Metric registry (`analytics-registry.v4`)
 
 `telemetry <slug> metrics registry [--json]` prints one declared table
 (`registry.rs`) of every metric `telemetry report` or `query` can name:
@@ -30,6 +30,8 @@ acceptance rate, `M06.cohort-v1` lead-time p95 (nearest rank, ms, accepted
 tasks with both times; failed/open counted, never given a time),
 `M07.cohort-v1` attempt amplification. Absent producers: M03, M05, M10, M19.
 M49 (`M49.v1`, central provider) is produced by the replay suite ([contracts-replay.md](contracts-replay.md)).
+`M07.cohort-v1` attempt amplification. Absent producers: M03, M05, M19,
+M30. M49 (`M49.v1`, central provider) is produced by the replay suite ([contracts-replay.md](contracts-replay.md)).
 M50's current definition `M50.recommendation-v1` (TM4.5,
 [contracts-health.md](contracts-health.md) §5) has provider
 `per_recommendation`: `query --metric M50` answers `unavailable:

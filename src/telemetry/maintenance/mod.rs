@@ -146,7 +146,7 @@ const BY_PATH: &[&str] = &["collect_offsets", "rollout_sources", "rollout_metada
     "rollout_turn_ends", "rollout_turn_terminations", "codex_tool_sources", "source_bindings", "session_graph_nodes", "usage_dispositions", "accounting_source_summary"];
 const BY_SESSION: &[&str] = &["codex_usage", "codex_usage_times", "codex_quarantine", "codex_discrepancy", "codex_rate_limits", "codex_rate_limit_windows", "codex_turns",
     "claude_messages", "claude_tool_results", "opencode_messages", "opencode_tools", "codex_tool_calls", "codex_tool_namespaces", "codex_exec_items", "codex_mcp_calls", "codex_agent_items", "codex_turn_aborts", "codex_fork_reconciliation", "usage_entries",
-    "model_segments", "quota_window_observations", "session_graph_nodes", "accounting_dirty_sessions", "accounting_usage_totals", "accounting_native_totals", "accounting_source_summary", "accounting_tool_summary"];
+    "model_segments", "quota_window_observations", "session_graph_nodes", "accounting_dirty_sessions", "accounting_usage_totals", "accounting_cache_totals", "accounting_native_totals", "accounting_source_summary", "accounting_tool_summary"];
 /// `(table, column)` holding the source's path digest.
 const BY_SOURCE: &[(&str, &str)] = &[("source_observations", "producer_epoch"), ("ingest_quarantine", "source"), ("coverage_gaps", "source"), ("source_cursors", "source")];
 /// Priced history that keeps a session id as a reference (R4).

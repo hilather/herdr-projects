@@ -29,7 +29,7 @@ for either. This is not a certification of an OTLP transport.
 | --- | --- |
 | Source | branch `telemetry/tm51-scale-certification` from `main` `20a763f`, plus the fixes in §5 |
 | Build | `cargo test --release --locked --offline -j 3 --features state-store --test telemetry_scale --no-run` (rustc 1.98.0), system SQLite 3.53.4 |
-| Stores | canonical `SCHEMA = 68`; sidecar streams `codex` 3, `ingest` 11, `accounting` 15, `quality` 3, `analytics` 3, `health` 1, `policies` 1 |
+| Stores | canonical `SCHEMA = 68`; sidecar streams `codex` 3, `ingest` 11, `accounting` 16, `quality` 3, `analytics` 3, `health` 1, `policies` 1 |
 | CPU / memory | Intel Core i7-8750H, 6 cores / 12 threads, 62 GiB RAM, zram swap |
 | Disk | Intel SSDPEKNW010T8 NVMe, LUKS, btrfs (`compress=zstd:3`). Every dataset lived under `bench-data/` on this disk, never on the RAM-backed `/tmp` |
 | OS | Linux 7.2.3-arch1-3 |
@@ -1527,6 +1527,70 @@ Files: `src/telemetry/analytics/{lifecycle,query,compare,store,registry}.rs`,
 registry pins in the analytics/export/quality contracts and phase-2 lanes,
 and this certificate. The rebased original DG1 retains its comparison contract
 and CLI cohort coverage.
+### 4.15 DG2: maintained M10 cache-read share (100k only)
+
+Branch `telemetry/dg2-m10`, accounting stream **16**, registry
+**analytics-registry.v4**. M10.v1 now reads accepted cache-read/input token
+sums from maintained session aggregates. This extends the P2 read path
+addressing L3; it does not close L3 or certify 1M. **Pending the steward's
+serial 1M certification.** No 1M run was performed.
+
+Built before and after with the §1 release command. Both measurements use
+one unchanged dataset under `$PWD/bench-data/dg2`, seed 5100,
+`SCALE_EVENTS=100000 SCALE_ACTIVE=64 SCALE_REPEATS=3`; queries also use
+`SCALE_PER_ROUND=1`. Run §1's `scale_0_generate`, `scale_1_ingest`, then
+`scale_2_queries` and `scale_9_analytics_refresh` with `SCALE_TAG=dg2-before`.
+After the change, settle the same dataset through public `accounting sync`
+and `analytics refresh`, then repeat the last two phases with
+`SCALE_TAG=dg2-after`. One bench process at a time; no concurrent builds or
+tests. The raw dataset and canonical state remain unchanged. Generated
+observations: **106,517**, rollout lines **99,926**, logical bytes
+**58,084,536** (rollouts **53,725,166**); 10,000 attempts, 64 active, eight
+synthetic execution homes. The dataset is removed before committing.
+
+| Surface, wall p50 / p95 (ms), n=3 | Before | After |
+| --- | --- | --- |
+| M08 lane query | 27.05 / 31.78 | 24.49 / 29.81 |
+| M13 coverage query | 51.94 / 53.63 | 40.15 / 41.74 |
+| Report (now includes M10) | 277.51 / 428.52 | 269.08 / 270.09 |
+| Cost view | 107.96 / 194.39 | 105.31 / 105.62 |
+| Analytics refresh | 933.44 / 952.43 | 893.16 / 911.94 |
+| Refresh peak RSS (KiB) | 78,600 | 78,276 |
+
+Load averages (1 / 5 / 15 minute), directly from phase results files:
+queries before **3.99 / 4.11 / 3.47 → 4.08 / 4.11 / 3.48**, after
+**4.29 / 4.23 / 3.82 → 3.87 / 4.13 / 3.80**; refresh before
+**4.04 / 4.11 / 3.49 → 3.88 / 4.08 / 3.48**, after
+**3.64 / 4.08 / 3.78 → 3.50 / 4.05 / 3.77**. These shared-host samples
+establish bounded producer overhead, not a general speedup claim. M10 had
+no producer before, so there is no comparable pre-change M10 latency.
+
+The new M10 query returns **50,862,666 / 202,285,731**, matching the
+hand-independent generator totals, with **19,800** accepted records and
+**990** certified sessions. Refresh results show `violations: []` and
+`canonical_unchanged: true` before and after. The unchanged
+`scale_gates_hold_under_load` passes, including exact totals, one acceptance
+per record, reproducible as-of results, byte-identical rebuild and untouched
+canonical digest. New CLI E2E workflows prove mixed Codex/Claude/OpenCode
+**470/1522**, writes **42**, exclusion reasons, frozen-configuration ratios,
+known zero versus unknown, late restatement and pinned as-of results.
+Gemini remains excluded because its message-update/SDK observations have
+no reconciled additive ledger denominator; this is an explicit coverage
+reason, never a fabricated zero. Non-Codex certification remains fixture-only.
+See contracts-accounting §17 and phase2-lanes DG2.
+
+The requested telemetry suites plus Claude/OpenCode/Gemini suites completed
+with **202 passed, 12 ignored**, and four failures only at sandbox-denied
+Unix-socket bind (`Operation not permitted`):
+`telemetry::attempts_show_attention_summary`,
+`telemetry_accounting::attention_intervals_union_and_censor`,
+`telemetry_health::recommendations_and_notices_change_no_canonical_state_and_no_dispatch`,
+and `telemetry_workspace::thread_start_records_the_dispatch_reason_and_the_sidebar_suffix`.
+The steward must run these outside the sandbox. Existing metric and coverage
+expectations are unchanged; only accounting stream and registry pins advance.
+Focused final M10 workflows also pass. Clippy (`--locked --offline -j 3`,
+state-store, changed test targets plus scale) has no warnings in changed lines;
+pre-existing unrelated diagnostics remain.
 
 ## 5. Inefficiencies found and fixed
 
@@ -1681,6 +1745,11 @@ owner. None is hidden by loosening the target.
   After is below main-pre (306.73/365.58 ms), but quieter main-post
   (242.37/282.08 ms) and the first busier full-phase M02 result prevent an
   unqualified no-regression/speedup claim. L3 remains open.
+  **DG2 extends maintained reads to M10. At 100k/64, M08/report p95
+  31.78/428.52 → 29.81/270.09 ms; refresh 952.43 → 911.94 ms,
+  pending the steward's 1M certification** (§4.15, all phase load averages
+  included). M10 previously had no producer; no general speedup or L3
+  closure is claimed.
   Owners: accounting lane, analytics (TM4.1).
 - **L4: the ticker's telemetry pass exceeds the 256 MiB envelope at 10,000
   bindings.** The collector itself stays within it (58–115 MB) and its byte

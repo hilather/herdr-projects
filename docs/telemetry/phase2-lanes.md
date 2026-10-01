@@ -352,6 +352,19 @@ Cards (gaps that stop those questions being answered):
   `cached_input_tokens` (collected in `codex_usage`), so this is a
   lane-accounting metric definition over existing data. The steward computed
   91–99 % by hand.
+- **DG1 M30 first-candidate verification rate** has no producer (registry:
+  `absent`). Produce it from the first submission's verification run per
+  task: verified-accepted on the first candidate or not. It is the direct
+  "clean on the first pass" measure.
+- **DG2 M10 cache-read share — done.** `M10.v1` (registry v3) reads
+  maintained accepted ledger totals: cache reads / compatible inclusive input,
+  with cache writes separate and explicit excluded-session reasons. Codex,
+  Claude and OpenCode native mappings count; Gemini message updates remain
+  excluded until their denominator is reconciled. Public configuration compare
+  uses the same activity cohort and token sums; it makes no savings or ranking
+  claim. Mixed-adapter CLI E2E proves `470/1522`, writes 42, unknown counters,
+  configuration arms and byte-identical analytics rebuild. Scale observations
+  are pending the steward's 1M certification (certificate-scale §4.15).
 - **DG3 M03 accepted throughput** lacks operating hours
   (`operating_hours_not_recorded`). Record the ticker's active intervals per
   project (it already publishes pass metrics) as the denominator.

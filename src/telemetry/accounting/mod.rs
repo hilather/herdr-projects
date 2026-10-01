@@ -9,6 +9,7 @@ use std::path::Path;
 
 pub mod attention;
 pub mod budget;
+pub(crate) mod cache;
 pub mod charges;
 pub mod cost;
 pub mod fleet;
@@ -34,7 +35,8 @@ pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/ac
     include_str!("../../../migrations/telemetry/accounting/0012_incremental_sync.sql"),
     include_str!("../../../migrations/telemetry/accounting/0013_claude_code.sql"),
     include_str!("../../../migrations/telemetry/accounting/0014_opencode.sql"),
-    include_str!("../../../migrations/telemetry/accounting/0015_read_aggregates.sql")];
+    include_str!("../../../migrations/telemetry/accounting/0015_read_aggregates.sql"),
+    include_str!("../../../migrations/telemetry/accounting/0016_cache_read_share.sql")];
 
 /// `herdr-projects telemetry <slug> accounting ...`
 #[derive(clap::Subcommand)]
@@ -324,7 +326,11 @@ pub(crate) fn metric_group(project: &Path, group: &str, since: Option<i64>) -> R
 
 pub(crate) fn metric_group_uncached(project: &Path, group: &str, since: Option<i64>, aggregates: bool) -> Result<BTreeMap<String, Value>> {
     match group {
-        "usage" => usage_metrics_with(project, since, aggregates),
+        "usage" => {
+            let mut metrics = usage_metrics_with(project, since, aggregates)?;
+            metrics.insert("M10".to_owned(), cache::metric(project, since, aggregates)?);
+            Ok(metrics)
+        },
         "cost" => cost::metrics_with(project, since, aggregates),
         "charges" => charges::metrics(project, since),
         "budget" => budget::metrics(project, since),

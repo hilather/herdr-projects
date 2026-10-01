@@ -128,6 +128,7 @@ fn prepare_sync(db: &Connection) -> Result<SyncPlan> {
     let dirty: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM accounting_dirty_sessions)", [], |r| r.get(0))?;
     let reason = invalidated.or_else(|| (watermark < 0 || watermark > sequence || (watermark != sequence && !dirty)).then(|| "watermark_inconsistent".to_owned()));
     let reason = reason.or(if synced(&tx)? { None } else { Some("ledger_missing".to_owned()) });
+    let reason = reason.or(if super::cache::complete(&tx)? { None } else { Some("cache_totals_missing".to_owned()) });
     let full = reason.is_some();
     tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS accounting_selected(session_id TEXT PRIMARY KEY); DELETE FROM accounting_selected;")?;
     if full {
@@ -205,12 +206,17 @@ pub fn sync(db: &mut Connection) -> Result<Value> {
     let new_floor: Option<i64> = tx.query_row("SELECT min(observed_unix_ms) FROM quota_window_observations
         WHERE session_id IN (SELECT session_id FROM accounting_selected)", [], |r| r.get(0))?;
     let quota_floor = match (quota_floor, new_floor) { (Some(a), Some(b)) => Some(a.min(b)), (a, b) => a.or(b) };
-    if full { tx.execute_batch("DELETE FROM accounting_usage_totals; DELETE FROM accounting_native_totals; DELETE FROM accounting_source_summary;")?; }
+    if full { tx.execute_batch("DELETE FROM accounting_usage_totals; DELETE FROM accounting_cache_totals; DELETE FROM accounting_native_totals; DELETE FROM accounting_source_summary;")?; }
     else { tx.execute_batch("DELETE FROM accounting_usage_totals WHERE session_id IN (SELECT session_id FROM accounting_selected);
+        DELETE FROM accounting_cache_totals WHERE session_id IN (SELECT session_id FROM accounting_selected);
         DELETE FROM accounting_native_totals WHERE session_id IN (SELECT session_id FROM accounting_selected);
         DELETE FROM accounting_source_summary WHERE session_id IN (SELECT session_id FROM accounting_selected);")?; }
     tx.execute_batch("INSERT INTO accounting_usage_totals
         SELECT s.session_id,coalesce(sum(e.input_tokens),0),coalesce(sum(e.output_tokens),0),coalesce(sum(e.reasoning_tokens),0)
+        FROM accounting_selected s LEFT JOIN usage_entries e ON e.session_id=s.session_id AND e.basis='delta'
+        AND EXISTS(SELECT 1 FROM usage_dispositions d WHERE d.entry_id=e.entry_id AND d.disposition='accepted') GROUP BY s.session_id;
+        INSERT INTO accounting_cache_totals
+        SELECT s.session_id,coalesce(sum(e.input_tokens),0),coalesce(sum(e.cache_read_tokens),0),coalesce(sum(e.cache_write_tokens),0),count(e.entry_id)
         FROM accounting_selected s LEFT JOIN usage_entries e ON e.session_id=s.session_id AND e.basis='delta'
         AND EXISTS(SELECT 1 FROM usage_dispositions d WHERE d.entry_id=e.entry_id AND d.disposition='accepted') GROUP BY s.session_id;
         INSERT INTO accounting_native_totals
@@ -239,6 +245,7 @@ pub fn sync(db: &mut Connection) -> Result<Value> {
         crate::telemetry::sidecar::store_termination_summary(project, &tx)?;
     }
     tx.execute_batch("DELETE FROM accounting_dirty_sessions;")?;
+    super::cache::store_frontier(&tx)?;
     // Preserve the public sync counts: they describe the entire stored projection.
     let entry_count: i64 = tx.query_row("SELECT count(*) FROM usage_entries", [], |r| r.get(0))?;
     counts.clear();

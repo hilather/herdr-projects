@@ -1,11 +1,11 @@
-//! The TM4.1 metric registry `analytics-registry.v3` (docs/telemetry/contracts-analytics.md §1):
+//! The TM4.1 metric registry `analytics-registry.v4` (docs/telemetry/contracts-analytics.md §1):
 //! one declared, read-only table of every metric the report or the query
 //! service can name, with its definition versions, family, cohorts, window
 //! semantics, unit, certification and activation. A change here is a new
 //! registry version, never an edit in place of a published definition.
 use serde_json::{Value, json};
 
-pub const VERSION: &str = "analytics-registry.v3";
+pub const VERSION: &str = "analytics-registry.v4";
 
 /// The TM3.5 quality certificate. Without it every validated-quality family is
 /// `unavailable: awaiting_quality_certificate`; landing or withdrawing it is
@@ -165,7 +165,7 @@ pub const METRICS: &[Metric] = &[
         central("M07.slice-v1", T, "attempt_decided_at_or_after_since")], "certified-fixture", CORE, None),
     m!("M08", "input_tokens", Consumption, "tokens", [lane("accounting", "M08.slice-v1", A, "session_start")], "certified-live", CORE, None),
     m!("M09", "output_tokens", Consumption, "tokens", [lane("accounting", "M09.slice-v1", A, "session_start")], "certified-live", CORE, None),
-    m!("M10", "cache_read_share", Consumption, "ratio", [absent("M10.v1", A, "no_producer")], "absent", "no producer", None),
+    m!("M10", "cache_read_share", Consumption, "ratio", [lane("accounting", "M10.v1", A, "session_start")], "certified-fixture", "docs/telemetry/contracts-accounting.md §17 (DG2 fixture workflow)", Some("compatible normalized input only; non-Codex fixture-only")),
     m!("M11", "reported_spend_subtotal", Cost, "currency", [lane("accounting", "M11.charges-v1", A, "charge_period")], "certified-fixture", CORE, Some("R2 no provider billing source")),
     m!("M12", "repriced_estimated_spend", Cost, "currency", [lane("accounting", "M12.cost-v1", A, "usage_time")], "certified-fixture", CORE, Some("R1 fixture-only rate cards")),
     m!("M13", "usage_coverage", Consumption, "ratio", [central("M13.slice-v1", A, "attempt_decided")], "certified-live", CORE, None),
@@ -260,6 +260,9 @@ pub fn freshness_json() -> Value {
 pub fn comparison_json() -> Value {
     let c = &COMPARISON;
     json!({"version": c.version, "metrics": c.metrics.iter().map(|(id, definition, higher)| json!({"id": id, "definition": definition, "higher_is_better": higher})).collect::<Vec<_>>(),
+        "activity_metrics": [{"id": "M10", "definition": "M10.v1", "contract": "analytics-cache-comparison.v1",
+            "cohort": "activity_window", "estimator": "ratio_of_token_sums.v1", "higher_is_better": null,
+            "ranking": "not_supported", "window": "session_start_at_or_after_from"}],
         "bootstrap": {"method": c.bootstrap.method, "resample": "task", "iterations": c.bootstrap.iterations, "seed": c.bootstrap.seed_hex(), "level": c.bootstrap.level()},
         "min_sample": {"value": c.min_tasks, "unit": "terminal_tasks_per_configuration_class_cell"},
         "pooling": {"model": c.pooling, "prior_mean": "arm_all_class_rate", "prior_strength": c.prior_strength, "metrics": ["M02"]},

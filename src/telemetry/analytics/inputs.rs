@@ -71,7 +71,7 @@ pub(crate) fn group(provider: Provider, id: &str) -> &'static str {
         Provider::Native => "native",
         Provider::Central => "central",
         Provider::Lane("accounting") => match id {
-            "M08" | "M09" | "M38" | "M39" => "usage",
+            "M08" | "M09" | "M10" | "M38" | "M39" => "usage",
             "M12" | "M14" => "cost",
             "M11" => "charges",
             "M04" => "budget",
@@ -92,7 +92,7 @@ pub(crate) fn stamp(group: &str, canonical: &Value, generations: &BTreeMap<Strin
     let relevant = |table: &str| table == "schema" || match group {
         "native" => false,
         "diagnostics" => matches!(table, "codex_usage" | "codex_usage_times" | "rollout_sources"),
-        "usage" => matches!(table, "rollout_sources" | "codex_usage" | "codex_quarantine" | "accounting_stream" | "accounting_dirty_sessions" | "accounting_usage_totals" | "accounting_source_summary"),
+        "usage" => matches!(table, "rollout_sources" | "codex_usage" | "codex_quarantine" | "accounting_stream" | "accounting_dirty_sessions" | "accounting_usage_totals" | "accounting_cache_totals" | "accounting_cache_frontier" | "accounting_source_summary"),
         "cost" => table.starts_with("valuation") || table.starts_with("rate_card") || table == "rollout_sources",
         "charges" => table.starts_with("provider_") || table.starts_with("valuation"),
         "budget" => table.starts_with("valuation") || table == "rollout_sources",

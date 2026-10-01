@@ -205,7 +205,7 @@ telemetry_export`; long cursors are shortened with `…`.
   "query": {
     "contract": "analytics-query.v1",
     "query_unix_ms": 1790766730450,
-    "registry": "analytics-registry.v3",
+    "registry": "analytics-registry.v4",
     "request": {
       "as_of": {
         "seq": null,
@@ -221,7 +221,7 @@ telemetry_export`; long cursors are shortened with `…`.
         "M49.v1"
       ],
       "page_size": 100,
-      "registry": "analytics-registry.v3",
+      "registry": "analytics-registry.v4",
       "schema_version": 1,
       "window": {
         "from_unix_ms": null,
@@ -308,7 +308,7 @@ Its `M49` entry (an absent producer: typed missing values, never 0):
   },
   "proxy": false,
   "reason": "no_replay_suite",
-  "registry": "analytics-registry.v3",
+  "registry": "analytics-registry.v4",
   "source_watermarks": {
     "canonical": {
       "events_head": 0,

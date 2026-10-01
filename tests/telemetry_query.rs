@@ -121,7 +121,7 @@ fn nd(m: &Value) -> (Value, Value, Value) { (m["numerator"].clone(), m["denomina
 fn registry_declares_every_metric_and_gates_families() {
     let p = Planted::new();
     let registry = p.json(&["metrics", "registry", "--json"]);
-    assert_eq!(registry["registry"], "analytics-registry.v3");
+    assert_eq!(registry["registry"], "analytics-registry.v4");
     assert_eq!(registry["rejected_cohorts"], json!({"completed_task": "ambiguous_cohort"}));
     let metrics = registry["metrics"].as_array().unwrap();
     let ids: Vec<&str> = metrics.iter().map(|m| m["id"].as_str().unwrap()).collect();
@@ -137,6 +137,9 @@ fn registry_declares_every_metric_and_gates_families() {
     assert_eq!((&m02["versions"][1]["definition"], &m02["versions"][1]["provider"]), (&json!("M02.slice-v1"), &json!({"kind": "central_report"})));
     assert_eq!(m02["activation"]["certificate"], "docs/telemetry/certificate-core.md");
     assert_eq!((&get("M08")["certification"]["status"], &get("M08")["versions"][0]["provider"]), (&json!("certified-live"), &json!({"kind": "lane", "stream": "accounting"})));
+    assert_eq!((&get("M10")["definition"], &get("M10")["versions"][0]["provider"]),
+        (&json!("M10.v1"), &json!({"kind": "lane", "stream": "accounting"})));
+    assert_eq!(registry["comparison"]["activity_metrics"][0]["estimator"], "ratio_of_token_sums.v1");
     assert_eq!(get("M18")["certification"]["restriction"], "execution_duration_not_exposed");
     // Quality families: active on the TM3.5 fixture certificate, statuses as its §2 table.
     assert_eq!(registry["quality_certificate"], "docs/telemetry/certificate-quality.md");

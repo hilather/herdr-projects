@@ -216,7 +216,7 @@ fn claude_upgrade_preserves_an_existing_codex_ledger() {
     drop(db);
     // A writable public command upgrades; every Codex byte visible in the ledger stays.
     f.cli("collect");
-    assert_eq!(f.cli_args(&["accounting", "status"]).0["version"], 15);
+    assert_eq!(f.cli_args(&["accounting", "status"]).0["version"], 16);
     assert_eq!(f.cli_args(&["accounting", "entries"]).1, before);
     assert_eq!(attempt_usage(&f)["total_tokens"], 1680);
 }

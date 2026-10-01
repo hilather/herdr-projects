@@ -33,6 +33,141 @@ const GUARDIAN_SID: &str = "00000000-0000-4000-8000-0000000c0de9";
 
 fn digest(path: &Path) -> String { format!("sha256:{:x}", Sha256::digest(path.as_os_str().as_encoded_bytes())) }
 
+/// DG2: hand-computed mixed native counters, collected from isolated homes.
+/// Codex 200/1000 + Claude 240/382 + OpenCode 30/140 = 470/1522.
+/// Writes (32 + 10) stay separate. Gemini updates have no reconciled denominator.
+#[test]
+fn cache_read_share_mixed_adapters_and_configuration_comparison() {
+    let mut f = Fixture::new();
+    f.rollout(&f.home, "cache-a", &[RECORD], &f.worktree(), f.decided + 1000, "0.154.0");
+    f.rollout(&f.home, "cache-resume", &[RECORD], &f.worktree(), f.decided + 1000, "0.154.0");
+    let mut configurations = std::collections::BTreeMap::new();
+    let canonical = f.project.join(".state/state.db");
+    let mut store = herdr_projects::store::SqliteStore::open(&canonical).unwrap();
+    let snapshot = store.read_snapshot(None).unwrap();
+    store.set_scheduler_policy(snapshot.head, snapshot.scheduler.unwrap().policy.revision, 1, 8).unwrap();
+    drop(store);
+    configurations.insert("codex", rusqlite::Connection::open(&canonical).unwrap().query_row(
+        "SELECT chosen_configuration_id FROM dispatch_decisions WHERE attempt_id=?1", [&f.attempt], |r| r.get::<_, String>(0)).unwrap());
+    for (kind, version) in [("claude", "2.1.3"), ("opencode", "1.18.34"), ("gemini", "0.62.0")] {
+        let home = f.tmp.path().join(format!("synthetic-{kind}-home"));
+        let mut profile = codex_profile(&f.config, kind, kind, Some(&home));
+        profile.agent.version = version.into();
+        plant_profile(&canonical, profile);
+        f.readmit(kind);
+        let db = rusqlite::Connection::open(&canonical).unwrap();
+        (f.attempt, f.decided) = db.query_row("SELECT a.id,d.decided_unix_ms FROM attempts a JOIN dispatch_decisions d ON d.attempt_id=a.id WHERE a.state='reserved'",
+            [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        configurations.insert(kind, db.query_row("SELECT chosen_configuration_id FROM dispatch_decisions WHERE attempt_id=?1",
+            [&f.attempt], |r| r.get::<_, String>(0)).unwrap());
+        f.home = home;
+        db.execute("INSERT INTO collector_bindings(attempt_id,revision,state,collector,execution_home,unix_ms,source)
+            VALUES(?1,1,'active',?2,?3,?4,'apply_launch_started')",
+            rusqlite::params![f.attempt, kind, f.home.display().to_string(), unix_ms()]).unwrap();
+        let at = f.decided + 1000;
+        let ts = jiff::Timestamp::from_millisecond(at).unwrap().to_string();
+        match kind {
+            "claude" => {
+                let dir = f.home.join(".claude/projects").join(f.worktree().replace('/', "-")); fs::create_dir_all(&dir).unwrap();
+                let text = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/telemetry/claude-code/session.jsonl")).unwrap()
+                    .replace("@SID@", "cache-claude").replace("@CWD@", &f.worktree()).replace("@VERSION@", version).replace("@TS@", &ts);
+                fs::write(dir.join("cache-claude.jsonl"), &text).unwrap();
+                // This source omits cache counters; it must never contribute a zero read.
+                let missing = text.replace("cache-claude", "cache-missing")
+                    .replace("\"cache_read_input_tokens\":200,", "").replace("\"cache_read_input_tokens\":40", "\"unreported\":null");
+                fs::write(dir.join("cache-missing.jsonl"), missing).unwrap();
+            }
+            "opencode" => {
+                let path = f.home.join(".local/share/opencode/opencode.db"); fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let native = rusqlite::Connection::open(path).unwrap();
+                native.execute_batch("CREATE TABLE session(id TEXT PRIMARY KEY,directory TEXT,version TEXT,time_created INTEGER);
+                    CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,time_updated INTEGER,data TEXT);
+                    CREATE TABLE part(id TEXT PRIMARY KEY,message_id TEXT,session_id TEXT,time_created INTEGER,time_updated INTEGER,data TEXT);").unwrap();
+                native.execute("INSERT INTO session VALUES('cache-open',?1,?2,?3)", rusqlite::params![f.worktree(), version, at]).unwrap();
+                let mut raw: serde_json::Value = serde_json::from_str(include_str!("fixtures/telemetry/opencode/assistant.json")).unwrap();
+                raw["time"] = json!({"created": at, "completed": at + 10});
+                native.execute("INSERT INTO message VALUES('cache-message','cache-open',?1,?1,?2)", rusqlite::params![at, raw.to_string()]).unwrap();
+            }
+            "gemini" => {
+                fs::create_dir_all(f.worktree()).unwrap();
+                let dir = f.home.join(".gemini/tmp/synthetic/chats"); fs::create_dir_all(&dir).unwrap();
+                fs::write(dir.join("cache-gemini.jsonl"), format!("{}\n{}\n",
+                    json!({"sessionId": "cache-gemini", "projectHash": format!("{:x}", Sha256::digest(f.worktree().as_bytes())), "startTime": ts}),
+                    json!({"sessionId": "cache-gemini", "type": "gemini", "id": "g1", "timestamp": ts,
+                        "tokens": {"input": 100, "cached": 80, "output": 20, "thoughts": 0, "tool": 0, "total": 120}}))).unwrap();
+            }
+            _ => unreachable!(),
+        }
+    }
+    f.cli("collect");
+    assert_eq!(f.report()["metrics"]["M10"]["value"]["reason"], "accounting_sync_required");
+    f.cli_args(&["accounting", "sync"]);
+    let m10 = f.report()["metrics"]["M10"].clone();
+    assert_eq!((&m10["value"], &m10["numerator"], &m10["denominator"], &m10["cache_write_tokens"]),
+        (&json!("470/1522"), &json!(470), &json!(1522), &json!(42)), "{m10}");
+    assert_eq!(m10["coverage"], json!({"certified_sessions": 3, "accepted_records": 4,
+        "excluded": {"cache_denominator_not_reconciled": 1, "records_not_accepted": 1}}));
+    let comparison = f.cli_args(&["compare", "--metric", "M10", "--json"]).0;
+    for (kind, value, n, d) in [("codex", "200/1000", 200, 1000), ("claude", "240/382", 240, 382), ("opencode", "30/140", 30, 140)] {
+        let arm = &comparison["configurations"][&configurations[kind]];
+        assert_eq!((&arm["value"], &arm["numerator"], &arm["denominator"]), (&json!(value), &json!(n), &json!(d)));
+    }
+    assert_eq!(comparison["configurations"][&configurations["gemini"]]["value"]["reason"], "no_eligible_cache_usage");
+    assert!(f.text(&["compare", "--metric", "M10"]).contains("470/1522"));
+    assert!(f.text(&["compare", "--metric", "M10"]).contains("n/a (no_eligible_cache_usage)"));
+    assert_eq!(f.report()["metrics"]["M08"]["value"], 1522);
+    f.cli_args(&["query", "--metric", "M10", "--json"]);
+    f.cli_args(&["analytics", "refresh"]);
+    let before = f.cli_args(&["analytics", "snapshot"]).1;
+    assert_eq!(f.cli_args(&["analytics", "rebuild", "--verify"]).0["identical"], true);
+    f.cli_args(&["analytics", "rebuild"]);
+    assert_eq!(f.cli_args(&["analytics", "snapshot"]).1, before);
+    f.cli("collect"); f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.report()["metrics"]["M10"], m10);
+}
+
+#[test]
+fn cache_share_zero_unknown_and_late_restatement() {
+    use std::io::Write;
+    let f = Fixture::new();
+    assert_eq!(f.report()["metrics"]["M10"]["value"]["reason"], "no_certified_source");
+    let path = f.rollout(&f.home, "cache-zero", &[RECORD], &f.worktree(), f.decided + 1000, "0.154.0");
+    let text = fs::read_to_string(&path).unwrap().replace("\"cached_input_tokens\":200", "\"cached_input_tokens\":0");
+    fs::write(&path, text).unwrap();
+    f.cli("collect"); f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.report()["metrics"]["M10"]["value"], "0/1000", "reported zero is known");
+    f.cli_args(&["query", "--metric", "M10", "--json"]); f.cli_args(&["analytics", "refresh"]);
+    let revision = f.cli_args(&["analytics", "revisions", "--metric", "M10"]).0["revisions"][0]["revision"].as_i64().unwrap().to_string();
+    let pinned = f.cli_args(&["query", "--metric", "M10", "--as-of-seq", &revision, "--json"]).0;
+    let mut late: serde_json::Value = serde_json::from_str(fs::read_to_string(&path).unwrap().lines().last().unwrap()).unwrap();
+    late["payload"]["response_id"] = json!("late-cache");
+    late["payload"]["usage"] = json!({"input_tokens": 100, "cached_input_tokens": 80, "cache_write_input_tokens": 5,
+        "output_tokens": 20, "reasoning_output_tokens": 0, "total_tokens": 120});
+    writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(), "{late}").unwrap();
+    f.cli("collect");
+    assert_eq!(f.report()["metrics"]["M10"]["value"]["reason"], "accounting_sync_required");
+    f.cli_args(&["accounting", "sync"]); f.cli_args(&["analytics", "refresh"]);
+    let m10 = f.report()["metrics"]["M10"].clone();
+    assert_eq!((&m10["value"], &m10["numerator"], &m10["denominator"], &m10["cache_write_tokens"]),
+        (&json!("80/1100"), &json!(80), &json!(1100), &json!(5)));
+    let again = f.cli_args(&["query", "--metric", "M10", "--as-of-seq", &revision, "--json"]).0;
+    for field in ["value", "detail", "source_watermarks"] { assert_eq!(again["results"][0][field], pinned["results"][0][field]); }
+    assert_eq!(again["results"][0]["projection"]["content_digest"], pinned["results"][0]["projection"]["content_digest"]);
+    assert_eq!(f.cli_args(&["analytics", "rebuild", "--verify"]).0["identical"], true);
+    f.sidecar().execute("DELETE FROM accounting_cache_totals", []).unwrap();
+    assert_eq!(f.report()["metrics"]["M10"]["value"]["reason"], "accounting_sync_required");
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "status"]).0["sync"]["rebuild_reason"], "cache_totals_missing");
+    assert_eq!(f.report()["metrics"]["M10"], m10, "public sync repairs missing summaries");
+    // Explicitly reported zero input has an empty denominator, never a zero ratio.
+    let g = Fixture::new();
+    let path = g.rollout(&g.home, "empty-cache", &[RECORD], &g.worktree(), g.decided + 1000, "0.154.0");
+    let text = fs::read_to_string(&path).unwrap().replace("\"input_tokens\":1000", "\"input_tokens\":0")
+        .replace("\"cached_input_tokens\":200", "\"cached_input_tokens\":0").replace("\"total_tokens\":1300", "\"total_tokens\":300");
+    fs::write(path, text).unwrap(); g.cli("collect"); g.cli_args(&["accounting", "sync"]);
+    assert_eq!(g.report()["metrics"]["M10"]["value"]["reason"], "empty_denominator");
+}
+
 /// Doc 05 §7 "input-inclusive 1,000 contains cache-read 200; output-inclusive
 /// 300 contains reasoning 80 → total 1,300; new input 800; reasoning is not
 /// added again", observed in two rollouts of one session (§2: one effective
@@ -1012,7 +1147,7 @@ fn attention_intervals_union_and_censor() {
         (serde_json::from_str(&text).unwrap_or(serde_json::Value::Null), text)
     };
     cli(&["collect"]);
-    assert_eq!(cli(&["accounting", "status"]).0, json!({"stream": "accounting", "version": 15}));
+    assert_eq!(cli(&["accounting", "status"]).0, json!({"stream": "accounting", "version": 16}));
     // Stream 8 dropped the superseded projections (v2, v4, v6); their replacements stay.
     let tables: Vec<String> = rusqlite::Connection::open(project.join(".state/telemetry.db")).unwrap()
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('session_graph','quota_observations','session_nodes','session_graph_nodes','quota_window_observations') ORDER BY name").unwrap()
@@ -1903,7 +2038,7 @@ fn provider_charges_reconcile_allocate_and_convert() {
     let current = f.cli_args(&["accounting", "charges"]).1;
     f.sidecar().execute("UPDATE telemetry_streams SET version=9 WHERE stream='accounting'", []).unwrap();
     assert_eq!(f.cli_args(&["accounting", "import-charges", &part("charges-2.json")]).0["charges"][0]["imported"], false);
-    assert_eq!((f.cli_args(&["accounting", "status"]).0["version"].clone(), f.cli_args(&["accounting", "charges"]).1), (json!(15), current));
+    assert_eq!((f.cli_args(&["accounting", "status"]).0["version"].clone(), f.cli_args(&["accounting", "charges"]).1), (json!(16), current));
 
     // Invoice allocation by a named, versioned rule: 12 × 2980/3480 and 12 × 500/3480 in units
     // of 10^-12; the one remaining unit goes to the larger remainder; the sum is exactly 12.

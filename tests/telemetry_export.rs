@@ -164,7 +164,7 @@ fn export_reconciles_with_query_and_round_trips() {
     sample("metrics.json", &p.raw(&["export", "--metric", "M02,M49"]));
     let m = &doc["manifest"];
     assert_eq!((&m["contract"], &m["schema_version"], &m["format"], &m["timezone"], &m["complete"]), (&json!("export.v1"), &json!(1), &json!("json"), &json!("UTC"), &json!(true)));
-    assert_eq!((&m["query"]["contract"], &m["query"]["registry"]), (&json!("analytics-query.v1"), &json!("analytics-registry.v3")));
+    assert_eq!((&m["query"]["contract"], &m["query"]["registry"]), (&json!("analytics-query.v1"), &json!("analytics-registry.v4")));
     assert_eq!(m["query"]["request"]["metrics"], json!(["M01.cohort-v1", "M02.cohort-v1", "M07.cohort-v1", "M49.v1"]));
     assert_eq!(m["page"], json!({"first": true, "last": true, "offset": 0, "rows": 0, "page_size": null, "total": null, "next_cursor": null, "next_cursor_expires_unix_ms": null}));
     assert!(m["export_id"].as_str().unwrap().starts_with("sha256:"));

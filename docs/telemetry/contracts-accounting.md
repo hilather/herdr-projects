@@ -1524,3 +1524,68 @@ groups entries by session once, and the sync reuses its insert statements.
 `unresolved` dispositions in SQL; TM4.5's `accounting_conflict` rule reads it
 instead of the whole ledger as JSON (same counts). Measurements:
 [certificate-scale.md](certificate-scale.md) §5.
+
+
+## 17. DG2: M10 cache-read share and maintained cache totals
+
+Accounting stream **16**, `0016_cache_read_share.sql`; registry
+**analytics-registry.v4**, definition **M10.v1**. Plan doc 07 M10 is
+cache-read input tokens / eligible total input tokens. The exact unreduced
+ratio `"numerator/denominator"` has integer token `numerator` and `denominator`,
+with `cache_write_tokens` shown separately. It makes no monetary savings claim.
+Codex input already includes cached reads; Claude and OpenCode normalize
+new input + cache reads + cache writes into inclusive input. Only reads
+enter the numerator. Provider-native counters and existing M08/M09 answers
+are unchanged. Non-Codex adapters retain their fixture-only certification.
+
+`accounting_cache_totals` maintains inclusive input, cache reads, cache writes
+and counted record count per session. Sync replaces only affected sessions
+in the ledger/frontier transaction; migration or missing cache rows forces
+a full replay. Retention purges these rows with their sessions; backup copies
+them and restore invalidates the frontier through the existing mechanism.
+`accounting_cache_frontier` pins mutation generations of `rollout_sources`,
+`codex_usage` and `codex_quarantine` in that same commit. Reads validate those
+actual inputs in one pinned snapshot, with no usage-history scan. Unrelated
+attention/tool changes and analytics-only schema upgrades preserve the answer;
+retention and restore invalidations still require sync. Missing/stale
+projections report `unavailable accounting_sync_required`;
+`accounting sync` restores them. Rebuild verification independently derives
+accepted entries and source certification from the original native rows.
+
+Eligibility is M08's bound known-attempt, accepted-version, non-quarantined,
+non-rejected session rule and session-start window. Repeated records,
+resumed rollouts and cumulative totals add no usage. `coverage` reports
+`certified_sessions`, `accepted_records` and excluded sessions by reason.
+Missing native cache counters fail native acceptance (`records_not_accepted`),
+and sources without accepted cache usage are `cache_counters_not_reported`;
+neither contributes a fabricated zero. Gemini native message updates and SDK
+observations are not reconciled additive ledger deltas on main: native
+sources are explicitly excluded as `cache_denominator_not_reconciled`.
+No eligible session is `unavailable no_eligible_cache_usage`; reported zero
+input is `unavailable empty_denominator`. A reported zero cache counter with
+positive input is a known `0/input` ratio.
+
+`by_configuration` sums the same eligible sessions under each attempt's
+frozen dispatch `chosen_configuration_id`, with unknown configuration apart.
+`compare --metric M10 --by configuration [--from MS] --json` exposes these
+arms under `analytics-cache-comparison.v1`, cohort `activity_window`, estimator
+`ratio_of_token_sums.v1`. It supports the lane's session-start lower bound;
+upper windows, task classes, horizons and bootstrap seeds are refused.
+Compare M10 separately from terminal/assignment outcomes. These descriptive
+observational token ratios have no higher-is-better direction, universal
+ranking or implied monetary savings; terminal-task success-rate pooling and
+minimum-sample rankings do not apply. Existing M02/M07 comparisons retain
+all estimators and exact values. Text compare prints every arm's exact ratio
+and separate writes, including unavailable arms.
+
+CLI E2E `cache_read_share_mixed_adapters_and_configuration_comparison` collects
+isolated Codex, Claude and OpenCode fixtures: **200/1000 + 240/382 + 30/140
+= 470/1522**, writes **42**, four accepted records, three eligible sessions.
+A missing-counter Claude source and unreconciled Gemini source are excluded;
+per-arm ratios remain 200/1000, 240/382 and 30/140. The public refresh,
+verify and rebuild retain identical snapshot bytes.
+`cache_share_zero_unknown_and_late_restatement` proves known zero, empty
+input, stale-frontier unavailability, late **80/1100** restatement and pinned
+as-of value/body/digest/watermarks. The unchanged scale gate remains the
+correctness oracle. 100k measurements: certificate-scale §4.15, pending the
+steward's serial 1M certification.

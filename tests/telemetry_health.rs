@@ -287,7 +287,7 @@ fn coverage_loss_grades_usage_coverage_exactly() {
     assert_eq!(s["evidence"]["incomplete"], json!({"not_bound": 1}));
     assert_eq!(codes(s), vec!["coverage_loss"]);
     assert_eq!(s["metric"]["definition"], "M13.slice-v1");
-    assert_eq!(s["metric"]["registry"], "analytics-registry.v3");
+    assert_eq!(s["metric"]["registry"], "analytics-registry.v4");
 
     p.sidecar().execute_batch("DELETE FROM codex_usage; DELETE FROM rollout_sources;").unwrap();
     let out = p.evaluate();
@@ -678,7 +678,7 @@ fn recommendation_carries_evidence_and_goes_stale_after_a_configuration_change()
     assert_eq!((&rec["contract"], &rec["status"], &rec["role"]), (&json!("telemetry-recommendation.v1"), &json!("recommended"), &json!("code")), "{rec}");
     assert_eq!(rec["advisory"], json!({"advisory": true, "authority": "none", "writes": "none",
         "routing": "advisory only: a person decides; nothing here is read by dispatch or admission, and it changes no authority, profile, model access, spending limit or acceptance check"}));
-    assert_eq!(rec["metric"], json!({"metric_id": "M02", "definition": "M02.cohort-v1", "higher_is_better": true, "registry": "analytics-registry.v3",
+    assert_eq!(rec["metric"], json!({"metric_id": "M02", "definition": "M02.cohort-v1", "higher_is_better": true, "registry": "analytics-registry.v4",
         "comparison": "analytics-comparison.v2", "freshness": "M50.recommendation-v1"}));
     assert_eq!(rec["evidence_window"], json!({"cohort": "terminal_cohort", "from_unix_ms": null, "to_unix_ms": null, "semantics": "half_open", "time_basis": "task_terminal_time"}));
     assert_eq!(rec["recommendation"]["configuration_id"], json!(codex));
