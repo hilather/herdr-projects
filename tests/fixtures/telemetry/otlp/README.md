@@ -20,7 +20,9 @@ executable/documentation conflict on cost and cache creation, external JSON
 conversion and exact binding requirements, and uncertified native files.
 
 DG4k Devin fixture certificate (2026-10-01): `devin-logs.json` and
-`devin-metrics.json` are synthetic, shaped from read-only `strings` of the
-installed Devin CLI `3000.11.3 (9c803229faa4)` static binary. Resource service
-is `devin-local`, version `3000.11.3 (9c803229faa4)`; forbidden canary is
-`DEVIN_SECRET_*`. See contracts-collection.md DG4k.
+`devin-metrics.json` carry the real shapes of a live Devin CLI `3000.11.3`
+export, with the redacted live structure in
+`devin-3000.11.3-live-structure.txt`. Resource service is `devin-local`, version
+`3000.11.3` (no build suffix); events carry both `eventName` and an `event.name`
+attribute; `devin.token.usage` is a DELTA Sum. All strings except identifiers
+are synthetic; forbidden canary is `DEVIN_SECRET_*`. See contracts-collection.md DG4k.

@@ -34,6 +34,7 @@ pub fn certified(version: &str) -> bool {
 /// Adapter-qualified versions keep fixture Claude acceptance separate from live Codex certification.
 pub fn accepted_version(version: &str) -> bool {
     if let Some(v) = version.strip_prefix("grok/") { return v == "1.0.46"; }
+    if let Some(v) = version.strip_prefix("devin/") { return v == "3000.11.3"; }
     if let Some(v) = version.strip_prefix("muse/") { return muse::FIXTURE_VERSIONS.contains(&v); }
     if let Some(v) = version.strip_prefix("opencode/") { return opencode::FIXTURE_VERSIONS.contains(&v); }
     version.strip_prefix("claude-code/").map_or_else(|| certified(version), |v| claude::FIXTURE_VERSIONS.contains(&v))
@@ -91,7 +92,7 @@ impl CanonicalAttempt {
         self.kind.as_deref() == Some("codex")
     }
 
-    pub(super) fn grok(&self) -> bool { self.kind.as_deref() == Some("grok") }
+    pub(super) fn grok(&self) -> bool { matches!(self.kind.as_deref(), Some("grok" | "devin")) }
 
     pub fn supported(&self) -> bool { self.codex() || matches!(self.kind.as_deref(), Some("claude" | "gemini" | "opencode" | "muse")) }
 

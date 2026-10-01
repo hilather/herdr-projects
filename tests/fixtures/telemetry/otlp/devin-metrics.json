@@ -12,7 +12,7 @@
           {
             "key": "service.version",
             "value": {
-              "stringValue": "3000.11.3 (9c803229faa4)"
+              "stringValue": "3000.11.3"
             }
           },
           {
@@ -44,12 +44,12 @@
       "scopeMetrics": [
         {
           "scope": {
-            "name": "ai.devin.local"
+            "name": "devin"
           },
           "metrics": [
             {
-              "name": "devin.token.usage",
-              "unit": "tokens",
+              "name": "devin.session.count",
+              "unit": "",
               "sum": {
                 "aggregationTemporality": 1,
                 "isMonotonic": true,
@@ -57,62 +57,64 @@
                   {
                     "attributes": [
                       {
-                        "key": "type",
+                        "key": "session.id",
                         "value": {
-                          "stringValue": "input"
+                          "stringValue": "DEVIN_SECRET_SESSION"
                         }
                       },
                       {
-                        "key": "model",
+                        "key": "terminal.type",
                         "value": {
-                          "stringValue": "synthetic-model"
-                        }
-                      }
-                    ],
-                    "asInt": "100",
-                    "startTimeUnixNano": "1771087000000000000",
-                    "timeUnixNano": "1771088000123456000"
-                  },
-                  {
-                    "attributes": [
-                      {
-                        "key": "type",
-                        "value": {
-                          "stringValue": "output"
+                          "stringValue": "devin-cli"
                         }
                       },
                       {
-                        "key": "model",
+                        "key": "user.id",
                         "value": {
-                          "stringValue": "synthetic-model"
-                        }
-                      }
-                    ],
-                    "asInt": "20",
-                    "startTimeUnixNano": "1771087000000000000",
-                    "timeUnixNano": "1771088000123456000"
-                  },
-                  {
-                    "attributes": [
-                      {
-                        "key": "type",
-                        "value": {
-                          "stringValue": "cacheRead"
+                          "stringValue": "DEVIN_SECRET_USER"
                         }
                       },
                       {
-                        "key": "model",
+                        "key": "start_type",
                         "value": {
-                          "stringValue": "synthetic-model"
+                          "stringValue": "new"
                         }
                       }
                     ],
-                    "asInt": "30",
-                    "startTimeUnixNano": "1771087000000000000",
-                    "timeUnixNano": "1771088000123456000"
-                  },
+                    "startTimeUnixNano": "1771088000000000000",
+                    "timeUnixNano": "1771088001000000000",
+                    "asInt": "1"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "devin.token.usage",
+              "unit": "",
+              "sum": {
+                "aggregationTemporality": 1,
+                "isMonotonic": true,
+                "dataPoints": [
                   {
                     "attributes": [
+                      {
+                        "key": "session.id",
+                        "value": {
+                          "stringValue": "DEVIN_SECRET_SESSION"
+                        }
+                      },
+                      {
+                        "key": "terminal.type",
+                        "value": {
+                          "stringValue": "devin-cli"
+                        }
+                      },
+                      {
+                        "key": "user.id",
+                        "value": {
+                          "stringValue": "DEVIN_SECRET_USER"
+                        }
+                      },
                       {
                         "key": "type",
                         "value": {
@@ -122,74 +124,139 @@
                       {
                         "key": "model",
                         "value": {
-                          "stringValue": "synthetic-model"
+                          "stringValue": "swe-2-high"
                         }
                       }
                     ],
-                    "asInt": "5",
-                    "startTimeUnixNano": "1771087000000000000",
-                    "timeUnixNano": "1771088000123456000"
-                  }
-                ]
-              }
-            },
-            {
-              "name": "devin.session.count",
-              "unit": "{session}",
-              "sum": {
-                "aggregationTemporality": 1,
-                "isMonotonic": true,
-                "dataPoints": [
-                  {
-                    "attributes": [],
-                    "asInt": "1",
-                    "startTimeUnixNano": "1771087000000000000",
-                    "timeUnixNano": "1771088000123456000"
-                  }
-                ]
-              }
-            },
-            {
-              "name": "devin.lines_of_code.count",
-              "unit": "{line}",
-              "sum": {
-                "aggregationTemporality": 1,
-                "isMonotonic": true,
-                "dataPoints": [
+                    "startTimeUnixNano": "1771088000000000000",
+                    "timeUnixNano": "1771088001000000000",
+                    "asInt": "0"
+                  },
                   {
                     "attributes": [
                       {
+                        "key": "session.id",
+                        "value": {
+                          "stringValue": "DEVIN_SECRET_SESSION"
+                        }
+                      },
+                      {
+                        "key": "terminal.type",
+                        "value": {
+                          "stringValue": "devin-cli"
+                        }
+                      },
+                      {
+                        "key": "user.id",
+                        "value": {
+                          "stringValue": "DEVIN_SECRET_USER"
+                        }
+                      },
+                      {
                         "key": "type",
                         "value": {
-                          "stringValue": "added"
+                          "stringValue": "cacheRead"
                         }
                       },
                       {
                         "key": "model",
                         "value": {
-                          "stringValue": "synthetic-model"
+                          "stringValue": "swe-2-high"
                         }
                       }
                     ],
-                    "asInt": "12",
-                    "startTimeUnixNano": "1771087000000000000",
-                    "timeUnixNano": "1771088000123456000"
+                    "startTimeUnixNano": "1771088000000000000",
+                    "timeUnixNano": "1771088001000000000",
+                    "asInt": "5984"
+                  },
+                  {
+                    "attributes": [
+                      {
+                        "key": "session.id",
+                        "value": {
+                          "stringValue": "DEVIN_SECRET_SESSION"
+                        }
+                      },
+                      {
+                        "key": "terminal.type",
+                        "value": {
+                          "stringValue": "devin-cli"
+                        }
+                      },
+                      {
+                        "key": "user.id",
+                        "value": {
+                          "stringValue": "DEVIN_SECRET_USER"
+                        }
+                      },
+                      {
+                        "key": "type",
+                        "value": {
+                          "stringValue": "input"
+                        }
+                      },
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "swe-2-high"
+                        }
+                      }
+                    ],
+                    "startTimeUnixNano": "1771088000000000000",
+                    "timeUnixNano": "1771088001000000000",
+                    "asInt": "5885"
+                  },
+                  {
+                    "attributes": [
+                      {
+                        "key": "session.id",
+                        "value": {
+                          "stringValue": "DEVIN_SECRET_SESSION"
+                        }
+                      },
+                      {
+                        "key": "terminal.type",
+                        "value": {
+                          "stringValue": "devin-cli"
+                        }
+                      },
+                      {
+                        "key": "user.id",
+                        "value": {
+                          "stringValue": "DEVIN_SECRET_USER"
+                        }
+                      },
+                      {
+                        "key": "type",
+                        "value": {
+                          "stringValue": "output"
+                        }
+                      },
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "swe-2-high"
+                        }
+                      }
+                    ],
+                    "startTimeUnixNano": "1771088000000000000",
+                    "timeUnixNano": "1771088001000000000",
+                    "asInt": "40"
                   }
                 ]
               }
             },
             {
               "name": "devin.active_time.total",
-              "unit": "s",
+              "unit": "",
               "sum": {
                 "aggregationTemporality": 1,
                 "isMonotonic": true,
                 "dataPoints": [
                   {
-                    "attributes": [],
-                    "asInt": "33",
-                    "startTimeUnixNano": "1771087000000000000",
-                    "timeUnixNano": "1771088000123456000"
+                    "startTimeUnixNano": "1771088000000000000",
+                    "timeUnixNano": "1771088001000000000",
+                    "asDouble": 2.5
                   }
                 ]
               }

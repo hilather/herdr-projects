@@ -711,3 +711,9 @@ with stable identity, native-first attempt/harness precedence and change
 capture. OTLP-derived sessions retain `sidecar.otlp` retention and full-backup
 coverage; ledger/aggregate rows follow sources. No canonical schema change.
 See [contracts-collection.md DG4j](contracts-collection.md#dg4j-certified-otlp-usage-in-the-accounting-ledger).
+
+DG4k adds sidecar `accounting` **0020_otlp_devin.sql**: admits the `otlp:devin`
+ledger source (cache-exclusive input normalized to `otlp-devin-exclusive-v1`)
+and the Devin `api_request` clause of `otlp_ledger_sources`; rows preserved, no
+new table, `sidecar.otlp` retention/backup coverage unchanged. No canonical
+schema change. See [contracts-collection.md DG4k](contracts-collection.md#dg4k-devin-cli-3000113-otlp-mapping-fixture-certification).

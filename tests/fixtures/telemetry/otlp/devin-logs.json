@@ -12,7 +12,7 @@
           {
             "key": "service.version",
             "value": {
-              "stringValue": "3000.11.3 (9c803229faa4)"
+              "stringValue": "3000.11.3"
             }
           },
           {
@@ -44,12 +44,13 @@
       "scopeLogs": [
         {
           "scope": {
-            "name": "ai.devin.local.events"
+            "name": "devin"
           },
           "logRecords": [
             {
-              "timeUnixNano": "1771088000123456000",
+              "timeUnixNano": "1771088000000000000",
               "severityNumber": 9,
+              "eventName": "session_start",
               "body": {
                 "stringValue": "DEVIN_SECRET_CONTENT"
               },
@@ -57,7 +58,19 @@
                 {
                   "key": "event.name",
                   "value": {
-                    "stringValue": "api_request"
+                    "stringValue": "session_start"
+                  }
+                },
+                {
+                  "key": "event.timestamp",
+                  "value": {
+                    "stringValue": "2026-02-14T16:53:20.000Z"
+                  }
+                },
+                {
+                  "key": "event.sequence",
+                  "value": {
+                    "intValue": "0"
                   }
                 },
                 {
@@ -67,127 +80,29 @@
                   }
                 },
                 {
-                  "key": "prompt.id",
+                  "key": "terminal.type",
                   "value": {
-                    "stringValue": "DEVIN_SECRET_PROMPT"
+                    "stringValue": "devin-cli"
                   }
                 },
                 {
-                  "key": "request_id",
+                  "key": "user.id",
                   "value": {
-                    "stringValue": "req-synthetic-1"
+                    "stringValue": "DEVIN_SECRET_USER"
                   }
                 },
                 {
-                  "key": "model",
+                  "key": "start_type",
                   "value": {
-                    "stringValue": "synthetic-model"
-                  }
-                },
-                {
-                  "key": "duration_ms",
-                  "value": {
-                    "intValue": "250"
-                  }
-                },
-                {
-                  "key": "input_tokens",
-                  "value": {
-                    "intValue": "100"
-                  }
-                },
-                {
-                  "key": "output_tokens",
-                  "value": {
-                    "intValue": "20"
-                  }
-                },
-                {
-                  "key": "cache_read_tokens",
-                  "value": {
-                    "intValue": "30"
-                  }
-                },
-                {
-                  "key": "cache_creation_tokens",
-                  "value": {
-                    "intValue": "5"
-                  }
-                },
-                {
-                  "key": "prompt",
-                  "value": {
-                    "stringValue": "DEVIN_SECRET_CONTENT"
+                    "stringValue": "new"
                   }
                 }
               ]
             },
             {
-              "timeUnixNano": "1771088000123456000",
+              "timeUnixNano": "1771088000001000000",
               "severityNumber": 9,
-              "body": {
-                "stringValue": "DEVIN_SECRET_CONTENT"
-              },
-              "attributes": [
-                {
-                  "key": "event.name",
-                  "value": {
-                    "stringValue": "tool_result"
-                  }
-                },
-                {
-                  "key": "session.id",
-                  "value": {
-                    "stringValue": "DEVIN_SECRET_SESSION"
-                  }
-                },
-                {
-                  "key": "prompt.id",
-                  "value": {
-                    "stringValue": "DEVIN_SECRET_PROMPT"
-                  }
-                },
-                {
-                  "key": "tool_name",
-                  "value": {
-                    "stringValue": "exec"
-                  }
-                },
-                {
-                  "key": "tool_use_id",
-                  "value": {
-                    "stringValue": "DEVIN_SECRET_TOOLUSE"
-                  }
-                },
-                {
-                  "key": "success",
-                  "value": {
-                    "boolValue": true
-                  }
-                },
-                {
-                  "key": "tool_input",
-                  "value": {
-                    "stringValue": "DEVIN_SECRET_CONTENT"
-                  }
-                },
-                {
-                  "key": "tool_input_size_bytes",
-                  "value": {
-                    "intValue": "42"
-                  }
-                },
-                {
-                  "key": "tool_result_size_bytes",
-                  "value": {
-                    "intValue": "7"
-                  }
-                }
-              ]
-            },
-            {
-              "timeUnixNano": "1771088000123456000",
-              "severityNumber": 9,
+              "eventName": "user_prompt",
               "body": {
                 "stringValue": "DEVIN_SECRET_CONTENT"
               },
@@ -199,9 +114,33 @@
                   }
                 },
                 {
+                  "key": "event.timestamp",
+                  "value": {
+                    "stringValue": "2026-02-14T16:53:20.001Z"
+                  }
+                },
+                {
+                  "key": "event.sequence",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
                   "key": "session.id",
                   "value": {
                     "stringValue": "DEVIN_SECRET_SESSION"
+                  }
+                },
+                {
+                  "key": "terminal.type",
+                  "value": {
+                    "stringValue": "devin-cli"
+                  }
+                },
+                {
+                  "key": "user.id",
+                  "value": {
+                    "stringValue": "DEVIN_SECRET_USER"
                   }
                 },
                 {
@@ -211,15 +150,231 @@
                   }
                 },
                 {
-                  "key": "prompt_length",
+                  "key": "message.uuid",
                   "value": {
-                    "intValue": "9"
+                    "stringValue": "DEVIN_SECRET_MESSAGE"
                   }
                 },
                 {
-                  "key": "prompt",
+                  "key": "prompt_length",
                   "value": {
-                    "stringValue": "DEVIN_SECRET_CONTENT"
+                    "stringValue": "22"
+                  }
+                }
+              ]
+            },
+            {
+              "timeUnixNano": "1771088000002000000",
+              "severityNumber": 9,
+              "eventName": "api_request",
+              "body": {
+                "stringValue": "DEVIN_SECRET_CONTENT"
+              },
+              "attributes": [
+                {
+                  "key": "event.name",
+                  "value": {
+                    "stringValue": "api_request"
+                  }
+                },
+                {
+                  "key": "event.timestamp",
+                  "value": {
+                    "stringValue": "2026-02-14T16:53:20.002Z"
+                  }
+                },
+                {
+                  "key": "event.sequence",
+                  "value": {
+                    "intValue": "2"
+                  }
+                },
+                {
+                  "key": "session.id",
+                  "value": {
+                    "stringValue": "DEVIN_SECRET_SESSION"
+                  }
+                },
+                {
+                  "key": "terminal.type",
+                  "value": {
+                    "stringValue": "devin-cli"
+                  }
+                },
+                {
+                  "key": "user.id",
+                  "value": {
+                    "stringValue": "DEVIN_SECRET_USER"
+                  }
+                },
+                {
+                  "key": "prompt.id",
+                  "value": {
+                    "stringValue": "DEVIN_SECRET_PROMPT"
+                  }
+                },
+                {
+                  "key": "model",
+                  "value": {
+                    "stringValue": "swe-2-high"
+                  }
+                },
+                {
+                  "key": "request_id",
+                  "value": {
+                    "stringValue": "req-synthetic-1"
+                  }
+                },
+                {
+                  "key": "duration_ms",
+                  "value": {
+                    "intValue": "2333"
+                  }
+                },
+                {
+                  "key": "input_tokens",
+                  "value": {
+                    "intValue": "5885"
+                  }
+                },
+                {
+                  "key": "output_tokens",
+                  "value": {
+                    "intValue": "40"
+                  }
+                },
+                {
+                  "key": "cache_read_tokens",
+                  "value": {
+                    "intValue": "5984"
+                  }
+                },
+                {
+                  "key": "cache_creation_tokens",
+                  "value": {
+                    "intValue": "0"
+                  }
+                }
+              ]
+            },
+            {
+              "timeUnixNano": "1771088000003000000",
+              "severityNumber": 9,
+              "eventName": "assistant_response",
+              "body": {
+                "stringValue": "DEVIN_SECRET_CONTENT"
+              },
+              "attributes": [
+                {
+                  "key": "event.name",
+                  "value": {
+                    "stringValue": "assistant_response"
+                  }
+                },
+                {
+                  "key": "event.timestamp",
+                  "value": {
+                    "stringValue": "2026-02-14T16:53:20.003Z"
+                  }
+                },
+                {
+                  "key": "event.sequence",
+                  "value": {
+                    "intValue": "3"
+                  }
+                },
+                {
+                  "key": "session.id",
+                  "value": {
+                    "stringValue": "DEVIN_SECRET_SESSION"
+                  }
+                },
+                {
+                  "key": "terminal.type",
+                  "value": {
+                    "stringValue": "devin-cli"
+                  }
+                },
+                {
+                  "key": "user.id",
+                  "value": {
+                    "stringValue": "DEVIN_SECRET_USER"
+                  }
+                },
+                {
+                  "key": "prompt.id",
+                  "value": {
+                    "stringValue": "DEVIN_SECRET_PROMPT"
+                  }
+                },
+                {
+                  "key": "model",
+                  "value": {
+                    "stringValue": "swe-2-high"
+                  }
+                },
+                {
+                  "key": "message.uuid",
+                  "value": {
+                    "stringValue": "DEVIN_SECRET_MESSAGE"
+                  }
+                },
+                {
+                  "key": "response_length",
+                  "value": {
+                    "intValue": "2"
+                  }
+                }
+              ]
+            },
+            {
+              "timeUnixNano": "1771088000004000000",
+              "severityNumber": 9,
+              "eventName": "session_end",
+              "body": {
+                "stringValue": "DEVIN_SECRET_CONTENT"
+              },
+              "attributes": [
+                {
+                  "key": "event.name",
+                  "value": {
+                    "stringValue": "session_end"
+                  }
+                },
+                {
+                  "key": "event.timestamp",
+                  "value": {
+                    "stringValue": "2026-02-14T16:53:20.004Z"
+                  }
+                },
+                {
+                  "key": "event.sequence",
+                  "value": {
+                    "intValue": "4"
+                  }
+                },
+                {
+                  "key": "session.id",
+                  "value": {
+                    "stringValue": "DEVIN_SECRET_SESSION"
+                  }
+                },
+                {
+                  "key": "terminal.type",
+                  "value": {
+                    "stringValue": "devin-cli"
+                  }
+                },
+                {
+                  "key": "user.id",
+                  "value": {
+                    "stringValue": "DEVIN_SECRET_USER"
+                  }
+                },
+                {
+                  "key": "reason",
+                  "value": {
+                    "stringValue": "exit"
                   }
                 }
               ]

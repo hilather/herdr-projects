@@ -222,7 +222,7 @@ fn sync_with_wait(db: &mut Connection, wait: &mut crate::telemetry::writer::Writ
         tx.prepare_cached("INSERT INTO usage_entries(entry_id,source,session_id,basis,scope,normalization_version,precedence,position,response_id,model,native,
             input_tokens,cache_read_tokens,new_input_tokens,cache_write_tokens,output_tokens,reasoning_tokens,total_tokens)
             VALUES(?1,?18,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)")?
-                .execute(params![e.id, e.session, e.basis, e.scope, if e.session.starts_with("otlp:") { "otlp-inclusive-v1" } else if e.session.starts_with("muse:") { "muse-v1" } else if e.session.starts_with("opencode:") { "opencode-v1" } else if e.session.starts_with("claude-code:") { "claude-code-v1" } else { NORMALIZATION }, e.precedence, e.position, e.response_id, e.model, native,
+                .execute(params![e.id, e.session, e.basis, e.scope, if e.session.starts_with("otlp:devin:") { "otlp-devin-exclusive-v1" } else if e.session.starts_with("otlp:") { "otlp-inclusive-v1" } else if e.session.starts_with("muse:") { "muse-v1" } else if e.session.starts_with("opencode:") { "opencode-v1" } else if e.session.starts_with("claude-code:") { "claude-code-v1" } else { NORMALIZATION }, e.precedence, e.position, e.response_id, e.model, native,
                 n[0], n[1], n[2], n[3], n[4], n[5], n[6], source(&e.session)])?;
         for (path, disposition, reason) in &e.provenance {
             tx.prepare_cached("INSERT INTO usage_dispositions(entry_id,path_digest,disposition,reason) VALUES(?1,?2,?3,?4)")?
@@ -379,5 +379,5 @@ pub(crate) fn status(db: &Connection) -> Result<Option<Value>> {
 }
 
 fn source(session: &str) -> &'static str {
-    if session.starts_with("otlp:grok:") { "otlp:grok" } else if session.starts_with("otlp:claude-code:") { "otlp:claude-code" } else if session.starts_with("otlp:muse:") { "otlp:muse" } else if session.starts_with("muse:") { "muse" } else if session.starts_with("opencode:") { "opencode" } else if session.starts_with("claude-code:") { "claude-code" } else { "codex" }
+    if session.starts_with("otlp:grok:") { "otlp:grok" } else if session.starts_with("otlp:devin:") { "otlp:devin" } else if session.starts_with("otlp:claude-code:") { "otlp:claude-code" } else if session.starts_with("otlp:muse:") { "otlp:muse" } else if session.starts_with("muse:") { "muse" } else if session.starts_with("opencode:") { "opencode" } else if session.starts_with("claude-code:") { "claude-code" } else { "codex" }
 }

@@ -467,11 +467,13 @@ Cards (gaps that stop those questions being answered):
     replay; Grok's live report now reconciles ledger totals. Steward live
     rerun pending. See contracts-collection.md DG4j.
   - **Done (DG4k): Devin CLI 3000.11.3 OTLP mapping.** The owner uses it.
-    Installed-binary `strings` evidence: OTel logs/metrics over http/protobuf
-    (`devin.token.usage`, `api_request` token attributes). `otlp:devin` is
-    fixture-only, version-gated to `3000.11.3`, content-free; native `devin`
-    is none (usage sits in an unestablished `sessions.metadata` JSON / content
-    JSON). `devin_live` added for the steward. See contracts-collection.md DG4k.
+    Live-probed OTel export (config-enabled, http/protobuf). `otlp:devin` is
+    fixture-certified and version-gated to `3000.11.3`, content-free (no
+    `user.id`); `api_request` is its ledger authority (accounting 0020,
+    `otlp-devin-exclusive-v1`: input excludes cache); the DELTA token metric is
+    reconciliation-only. Native `devin` is none (`sessions.metadata` has only
+    credit costs). `devin_live` reconciles metric vs ledger. See
+    contracts-collection.md DG4k.
   - **Done (DG4f installed-format review): Cursor (`cursor-agent`) 2026.09.28.**
     Installed program reports `2026.09.28-64d2043`, default service
     `cursor-agent-cli`. Its configured OTel exporter sends protobuf traces;

@@ -1,0 +1,14 @@
+== 001_v1_logs.x-protobuf
+  log event session_start {'event.name': "'session_start'", 'event.timestamp': '<str>', 'event.sequence': 0, 'session.id': '<str>', 'terminal.type': "'devin-cli'", 'user.id': '<str>', 'start_type': '<str>'}
+  log event user_prompt {'event.name': "'user_prompt'", 'event.timestamp': '<str>', 'event.sequence': 1, 'session.id': '<str>', 'terminal.type': "'devin-cli'", 'user.id': '<str>', 'prompt.id': '<str>', 'message.uuid': '<str>', 'prompt_length': '<str>'}
+== 002_v1_metrics.x-protobuf
+ resource {'os.type': '<str>', 'host.arch': '<str>', 'service.name': "'devin-local'", 'os.version': '<str>', 'service.version': "'3000.11.3'", 'user.id': '<str>'}
+  metric devin.session.count sum temporality=[1] points=1 [({'session.id': '<str>', 'start_type': '<str>', 'terminal.type': "'devin-cli'", 'user.id': '<str>'}, 1)]
+== 003_v1_metrics.x-protobuf
+ resource {'os.type': '<str>', 'host.arch': '<str>', 'service.name': "'devin-local'", 'os.version': '<str>', 'service.version': "'3000.11.3'", 'user.id': '<str>'}
+  metric devin.token.usage sum temporality=[1] points=4 [({'session.id': '<str>', 'terminal.type': "'devin-cli'", 'user.id': '<str>', 'type': "'cacheCreation'", 'model': "'swe-2-high'"}, 0), ({'session.id': '<str>', 'terminal.type': "'devin-cli'", 'user.id': '<str>', 'type': "'cacheRead'", 'model': "'swe-2-high'"}, 5984), ({'model': "'swe-2-high'", 'session.id': '<str>', 'terminal.type': "'devin-cli'", 'type': "'input'", 'user.id': '<str>'}, 5885), ({'session.id': '<str>', 'terminal.type': "'devin-cli'", 'user.id': '<str>', 'type': "'output'", 'model': "'swe-2-high'"}, 40)]
+  metric devin.active_time.total sum temporality=[1] points=1 
+== 004_v1_logs.x-protobuf
+  log event api_request {'event.name': "'api_request'", 'event.timestamp': '<str>', 'event.sequence': 2, 'session.id': '<str>', 'terminal.type': "'devin-cli'", 'user.id': '<str>', 'prompt.id': '<str>', 'model': "'swe-2-high'", 'request_id': '<str>', 'duration_ms': 2333, 'input_tokens': 5885, 'output_tokens': 40, 'cache_read_tokens': 5984, 'cache_creation_tokens': 0}
+  log event assistant_response {'event.name': "'assistant_response'", 'event.timestamp': '<str>', 'event.sequence': 3, 'session.id': '<str>', 'terminal.type': "'devin-cli'", 'user.id': '<str>', 'prompt.id': '<str>', 'model': "'swe-2-high'", 'message.uuid': '<str>', 'response_length': 2}
+  log event session_end {'event.name': "'session_end'", 'event.timestamp': '<str>', 'event.sequence': 4, 'session.id': '<str>', 'terminal.type': "'devin-cli'", 'user.id': '<str>', 'reason': '<str>'}

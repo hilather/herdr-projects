@@ -2619,7 +2619,7 @@ Identified harness: Cognition's **Devin CLI**, `devin 3000.11.3 (9c803229faa4)`
 `strings -n 8` of that one installed binary
 (`~/.local/share/devin/cli/_versions/3000.11.3/bin/devin`, never executed) was
 read; no owner Devin/agent data directory was listed or opened and no agent CLI
-ran. Fixtures are synthetic. `otlp:devin` is fixture-only for `3000.11.3`;
+ran; the live structure was later captured by the steward (below). `otlp:devin` is fixture-certified for `3000.11.3` and its `api_request` reaches the ledger;
 native `devin` is **none**. Line numbers below refer to the `strings -n 8`
 output, not source files.
 
@@ -2641,72 +2641,108 @@ output, not source files.
 No `--output-format`, no stdout JSON usage and no usage in `models --format
 json` was found: the headless run is plain text.
 
+### Live evidence (steward probe, 2026-10-01)
+
+The steward ran owner-approved probes of `3000.11.3` in a throwaway home
+(copied login, deleted after) and captured the real OTLP export. The decoded,
+redacted structure is `tests/fixtures/telemetry/otlp/devin-3000.11.3-live-structure.txt`
+(names, attribute keys, safe identifiers and every number are real; other
+strings are `<str>`). Findings:
+
+- **Export needs config.** Environment variables alone sent nothing.
+  `~/.config/devin/config.json` `{"otel":{"enabled":true,"logs_endpoint":"<receiver>/v1/logs",
+  "log_export_interval_ms":500,"metric_export_interval_ms":500,
+  "disable_user_prompt_logging":true,"disable_tool_logging":true}}` plus
+  `OTEL_EXPORTER_OTLP_ENDPOINT` (metrics) worked; without short intervals a
+  short run exits before exporting.
+- **Real shapes.** Resource `service.name="devin-local"`,
+  `service.version="3000.11.3"` (no build suffix), plus `os.type`, `host.arch`,
+  `os.version`, `user.id`. Log events carry both `eventName` and an `event.name`
+  attribute: `session_start`, `user_prompt`, `api_request`, `assistant_response`,
+  `session_end`; names are unprefixed. `api_request` carries `model`
+  (`swe-2-high`), `request_id`, `prompt.id`, `session.id`, `event.sequence`,
+  `duration_ms`, `input_tokens`, `output_tokens`, `cache_read_tokens`,
+  `cache_creation_tokens`. Metrics are `devin.token.usage` (a DELTA Sum, `type`
+  in `input`/`output`/`cacheRead`/`cacheCreation`, `model`), `devin.session.count`
+  and `devin.active_time.total`.
+- **`input_tokens` excludes cache.** One live request reported 5,885 input and
+  5,984 cache-read tokens (the DELTA metric agrees).
+- **`sessions.metadata` carries no tokens**, only `total_credit_cost` /
+  `total_acu_cost`. Native `devin` stays none and the live harness no longer
+  reads `sessions.db`.
+- `user.id` is on every record and resource; `prompt.id` and `message.uuid` are
+  on events.
+
 ### Mapping, privacy and binding
 
-Resource `service.name` must be `devin-local`; identity is the leading
-whitespace-delimited semver of `service.version` and must equal `3000.11.3`.
-The `(<12 hex>)` build is retained as `service_build` only when it has that
-shape. Other versions (and missing ones) keep only unmapped diagnostics with
-`cli_version_uncertified`. Fixture/accepted versions are `["3000.11.3"]`;
-`certified_versions` is empty and no field is live.
+Resource `service.name` must be `devin-local`; `service.version` must equal
+`3000.11.3` exactly. Other versions (and missing ones) keep only unmapped
+diagnostics with `cli_version_uncertified`. Fixture/accepted versions are
+`["3000.11.3"]`; `certified_versions` is empty and no field is live. The
+earlier `devin.`/`ai.devin.local.` name-prefix stripping and the `tool_result`
+mapping were unproven and are removed; only the live-observed unprefixed names
+map.
 
 | Signal | Stored kind | Allowlisted attributes |
 | --- | --- | --- |
-| log `api_request` | usage | `model`, `request_id` (bounded excerpt), `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `duration_ms` |
-| log `tool_result` | tool | `tool_name`, `success` (sizes and `tool_use_id` stay keys-only) |
-| metric `devin.token.usage` | usage (reconciliation evidence) | `type` (the four reviewed values), `model`; unit `tokens`; explicit temporality |
+| log `api_request` | usage (ledger authority) | `model`, `request_id`, `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `duration_ms` |
+| metric `devin.token.usage` | unmapped, `usage_reconciliation_only` | `type` (the four reviewed values), `model`; explicit temporality |
 
-Everything else (`user_prompt`, `session_*`, `tool_decision`, `api_error`, the
-other instruments) is stored as keys-only unmapped diagnostics; identical
-key-less diagnostics collapse by digest. Log names come from `event.name`
-(attribute) or `eventName`, never from the log body: Devin's body may carry
-message text and the protobuf path drops bodies anyway. Because the exporter
-prefix is unproven, `devin.` and `ai.devin.local.` prefixes are stripped before
-matching. Prompts, tool input, `user.id`, `session.id`, `prompt.id` and
-`tool_use_id` are never stored or hashed. Binding is by exact resource
-`herdr.attempt_id` (`OTEL_RESOURCE_ATTRIBUTES` and config `resource_attributes`
-are honoured) or the DG4h per-attempt bearer token (`OTEL_EXPORTER_OTLP_HEADERS`);
-missing stays unbound, unknown is dropped. gRPC is not used by Devin.
+Everything else (`user_prompt`, `session_*`, `assistant_response`, the other
+instruments) is stored as keys-only unmapped diagnostics. Log names come from
+the `event.name` attribute or `eventName`, never from the log body (Devin's
+body may carry message text and the protobuf path drops bodies anyway).
+`user.id`, `session.id`, `prompt.id`, `message.uuid`, `prompt_length` and
+`response_length` are never stored, not even hashed; `session.id` and
+`event.sequence` feed only a one-way usage identity digest. Binding is by exact
+resource `herdr.attempt_id` or the DG4h per-attempt bearer token; missing stays
+unbound, unknown is dropped. gRPC is not used by Devin.
 
-Devin is **not** in `declare_usage` (DG4j): fixture rows never reach the
-accounting ledger; the semantics of `input_tokens` (inclusive of cache or not)
-are unestablished. Existing adapters are unchanged.
+### Ledger (accounting 0020)
+
+`api_request` is Devin's usage authority (DG4j `declare_usage` path), deduped
+by `(session.id, event.sequence)` (falling back to `request_id`) through a
+one-way digest, so a replay is one entry. Normalization is explicit
+`otlp-devin-exclusive-v1`: normalized input = `input_tokens` + `cache_read_tokens`
++ `cache_creation_tokens`; cached = `cache_read_tokens`; cache write =
+`cache_creation_tokens`; total = input + output. The record keeps the raw value
+as `exclusive_input_tokens`. Accounting **0020_otlp_devin.sql** admits source
+`otlp:devin` to `usage_entries` (rebuilt, rows preserved, stream invalidated) and
+adds the Devin clause to `otlp_ledger_sources`; `accepted_version("devin/…")`
+accepts only `3000.11.3`. The metric stays reconciliation-only and never adds
+entries. No new retained table: projections follow `sidecar.otlp` retention and
+full-backup coverage. Native-first precedence is unchanged (there is no native
+Devin source).
 
 ### Native source: none
 
-Capability `devin` is `interface none`, reason `local_usage_schema_not_established`.
-The sessions database does hold per-session cumulative totals, but they live in
-`sessions.metadata` whose JSON field names are not recoverable from strings
-(only the struct name `SessionJsonMetadata`), and per-request usage sits inside
-the content-bearing `message_nodes.chat_message` JSON (prompts, tool output).
-Reading either would guess a persisted schema or touch content. Live evidence
-(`devin_live` below) settles whether `sessions.metadata` is a stable
-metadata-only source, as it did for Muse. No execution-home traversal is added.
+Capability `devin` is `interface none`, reason `local_usage_schema_not_established`:
+`sessions.metadata` holds only credit costs (live-verified) and per-request
+usage sits inside content-bearing `message_nodes.chat_message`. No
+execution-home traversal is added.
 
 ### Retention, backup, fixtures and coverage
 
-No schema change: rows share `otlp_records` and stream migration 0003; retention
-class `sidecar.otlp` stays retain and full sidecar backups include them.
-`tests/fixtures/telemetry/otlp/devin-{logs,metrics}.json` are synthetic with
-`DEVIN_SECRET_*` canaries (body, `prompt`, `tool_input`, user/session/prompt/
-tool-use ids). `tests/telemetry_otlp.rs`
-`devin_3000_11_3_contract_is_version_gated_bound_and_content_free` and
+Rows share `otlp_records`; retention class `sidecar.otlp` stays retain and full
+sidecar backups include them. `tests/fixtures/telemetry/otlp/devin-{logs,metrics}.json`
+reproduce the live shapes with `DEVIN_SECRET_*` planted canaries (body, user,
+session, prompt and message ids). `tests/telemetry_otlp.rs`
+`devin_3000_11_3_contract_is_version_gated_bound_and_content_free`,
+`devin_api_request_reaches_the_ledger_with_exclusive_normalization` and
 `devin_protobuf_export_matches_json_rows` assert exact rows, replay dedupe,
-prefix-tolerant names, version gating, exact/unbound/unknown binding, absence
-of `usage_authority`, fixture-only capabilities and zero secret hits in rows and
-SQLite/WAL/SHM. `telemetry_certification` lists `devin` as a declared adapter
-with its `none` reason and adds no recorded-live entry.
+version gating, binding, ledger entries with the exclusive normalization, the
+reconciliation-only metric and zero secret hits in rows and SQLite/WAL/SHM.
+`telemetry_certification` lists `devin` as a declared adapter with its `none`
+reason and adds no recorded-live entry.
 
 ### Live harness
 
-`telemetry_live::devin_live` (ignored, `HERDR_LIVE=1`): see live-harness.md.
-It writes `otel.enabled` into the disposable home's `.config/devin/config.json`
-only if absent, mints an attempt token, and reconciles Devin's own
-`sessions.metadata` numeric leaves against exact-bound `api_request` rows and
-DELTA `devin.token.usage` metrics. Unverified guesses to confirm live: config
-section name `otel`, whether `OTEL_EXPORTER_OTLP_*` alone enables export,
-exact `service.name`/`service.version`/event-name spelling and the sessions DB
-path under the data dir.
+`telemetry_live::devin_live` (ignored, `HERDR_LIVE=1`): see live-harness.md. It
+writes the config above (with `logs_headers`/`metrics_headers`/`headers` maps
+carrying the attempt token; the strings show those keys exist but not their
+shape, so a map is an unverified guess) into the disposable home only if absent,
+and compares the ledger built from `api_request` with the DELTA
+`devin.token.usage` sums from the receiver's own records.
 
 ### DG4k sandbox validation
 

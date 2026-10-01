@@ -125,7 +125,7 @@ fn replay_tasks(db: &Connection) -> Result<BTreeSet<String>> {
 fn usage_metrics(sidecar: Option<&Connection>, attempts: &[Attempt], since: Option<i64>, in_window: &dyn Fn(&Attempt) -> bool, metrics: &mut BTreeMap<&str, Value>, aggregates: bool) -> Result<()> {
     let terminated: Vec<&Attempt> = attempts.iter().filter(|a| TERMINAL.contains(&a.state.as_str()) && in_window(a)).collect();
     let grok_bound: BTreeSet<String> = if let Some(db) = sidecar {
-        db.prepare("SELECT DISTINCT attempt_id FROM rollout_sources WHERE originator='otlp:grok' AND binding='bound'")?
+        db.prepare("SELECT DISTINCT attempt_id FROM rollout_sources WHERE originator IN ('otlp:grok','otlp:devin') AND binding='bound'")?
             .query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
     } else { BTreeSet::new() };
     let adapter_absent = terminated.iter().filter(|a| a.kind.as_deref().is_some_and(|k| !matches!(k, "codex" | "claude" | "opencode" | "muse")) && !grok_bound.contains(&a.id)).count();

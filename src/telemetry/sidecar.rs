@@ -272,7 +272,7 @@ pub fn report(project: &Path) -> Result<Value> {
     }
     let mut out = Vec::new();
     for attempt in &attempts {
-        let usage = if attempt.supported() || (attempt.grok() && db.query_row("SELECT EXISTS(SELECT 1 FROM rollout_sources WHERE attempt_id=?1 AND originator='otlp:grok' AND binding='bound')", [&attempt.id], |r| r.get::<_, bool>(0))?) { attempt_usage(&db, &attempt.id)? } else { unavailable("adapter_absent") };
+        let usage = if attempt.supported() || (attempt.grok() && db.query_row("SELECT EXISTS(SELECT 1 FROM rollout_sources WHERE attempt_id=?1 AND originator IN ('otlp:grok','otlp:devin') AND binding='bound')", [&attempt.id], |r| r.get::<_, bool>(0))?) { attempt_usage(&db, &attempt.id)? } else { unavailable("adapter_absent") };
         let after_termination = after_termination(&db, &attempt.id, attempt.terminated_unix_ms())?;
         out.push(json!({"attempt_id": attempt.id, "usage": usage, "after_termination": after_termination}));
     }

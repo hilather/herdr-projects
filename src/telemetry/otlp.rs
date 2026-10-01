@@ -115,12 +115,13 @@ const MAPPINGS: &[(&str, &str, &str, &[&str])] = &[
     ("grok", "grok_code.error.count", "tool", &["error_category", "model"]),
     ("devin", "api_request", "usage", &["model", "request_id", "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "duration_ms"]),
     ("devin", "devin.token.usage", "usage", &["type", "model"]),
-    ("devin", "tool_result", "tool", &["tool_name", "success"]),
 ];
 
-/// Devin CLI 3000.11.3 (DG4k): the reviewed `--version` token and resource service.
+/// Devin CLI 3000.11.3 (DG4k): the live-observed resource version and service.
 const DEVIN_VERSION: &str = "3000.11.3";
 const DEVIN_SERVICE: &str = "devin-local";
+/// Devin `input_tokens` excludes cache reads and writes; the ledger stores their sum.
+const DEVIN_NORMALIZATION: &str = "otlp-devin-exclusive-v1";
 
 const GROK_LIVE_FIELDS: &[&str] = &["model", "input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens", "cache_creation_tokens"];
 
@@ -327,8 +328,8 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                 service_version.map(|v| v.split_whitespace().next().unwrap_or(""))
             })
         } else if harness == "devin" {
-            // `--version` prints `<semver> (<build>)`; only the leading semver is identity.
-            service_version.map(|v| v.split_whitespace().next().unwrap_or(""))
+            // Live 3000.11.3 reports the bare version; anything else is uncertified.
+            service_version
         } else { service_version };
         let known = matches!(service, "claude-code" | "gemini-cli" | "grok-cli" | "tbh" | DEVIN_SERVICE);
         let adapter = if known {
@@ -363,8 +364,8 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                 let name = if metrics {
                     entry["name"].as_str()
                 } else if harness == "devin" {
-                    // Devin's body may be message content: the name comes from the
-                    // `event.name` attribute (or eventName) only, never the body.
+                    // Devin carries both `eventName` and an `event.name` attribute; its
+                    // body may be message content, so the name never comes from it.
                     ea.get("event.name").and_then(Value::as_str).or_else(|| entry["eventName"].as_str())
                 } else {
                     entry["eventName"]
@@ -373,11 +374,6 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                         .or_else(|| ea.get("event.name").and_then(Value::as_str))
                 }
                 .unwrap_or("");
-                // Devin event names are not proven to carry a product prefix; accept
-                // the reviewed unprefixed names and the two plausible exporter prefixes.
-                let name = if harness == "devin" && !metrics {
-                    name.strip_prefix("ai.devin.local.").or_else(|| name.strip_prefix("devin.")).unwrap_or(name)
-                } else { name };
                 let unsupported = metrics
                     && (entry.get("exponentialHistogram").is_some() || entry.get("summary").is_some());
                 if metrics {
@@ -439,14 +435,6 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                         }
                     }
                     if harness == "devin" {
-                        if cli_version == Some(DEVIN_VERSION) {
-                            // Only the reviewed build-string shape may leave the exporter.
-                            if let Some(build) = service_version.filter(|v| {
-                                v.strip_prefix(DEVIN_VERSION).and_then(|r| r.strip_prefix(" ("))
-                                    .and_then(|r| r.strip_suffix(')'))
-                                    .is_some_and(|b| b.len() == 12 && b.chars().all(|c| c.is_ascii_hexdigit()))
-                            }) { payload["service_build"] = json!(build); }
-                        }
                         payload["cli_version"] = if cli_version == Some(DEVIN_VERSION) { json!(DEVIN_VERSION) } else { Value::Null };
                         if cli_version != Some(DEVIN_VERSION) {
                             payload["mapping_certified"] = json!("none");
@@ -521,6 +509,50 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                             }
                         }
                         payload["attributes"] = json!(allowed);
+                        if harness == "devin" {
+                            if metrics {
+                                if *kind == "usage" {
+                                    // The delta metric only reconciles; `api_request` is the authority.
+                                    payload["kind"] = json!("unmapped");
+                                    payload["reason"] = json!("usage_reconciliation_only");
+                                }
+                            } else if *native == "api_request" {
+                                let session = attrs.get("session.id").and_then(Value::as_str).filter(|s| !s.is_empty());
+                                let sequence = attrs.get("event.sequence").and_then(integer).filter(|n| *n >= 0);
+                                let request = payload["attributes"]["request_id"].as_str().map(str::to_owned);
+                                let key = session.zip(sequence).map(|(s, n)| json!(["session_sequence", s, n]))
+                                    .or_else(|| request.map(|r| json!(["request_id", r])));
+                                let counters = (|| {
+                                    let a = &payload["attributes"];
+                                    let (input, read, write) = (a["input_tokens"].as_u64()?, a["cache_read_tokens"].as_u64()?, a["cache_creation_tokens"].as_u64()?);
+                                    let output = a["output_tokens"].as_u64()?;
+                                    // Devin's `input_tokens` excludes cache reads: total input is the sum.
+                                    let total_input = input.checked_add(read)?.checked_add(write)?;
+                                    let total = total_input.checked_add(output)?;
+                                    (total <= 1 << 53).then_some((input, total_input, read, write, output, total))
+                                })();
+                                match (key, counters) {
+                                    (Some(key), Some((exclusive, total_input, read, write, output, total))) => {
+                                        payload["usage_source_key"] = json!(format!("{:x}", Sha256::digest(serde_json::to_vec(&key)?)));
+                                        payload["usage_authority"] = json!("api_request");
+                                        payload["normalization"] = json!(DEVIN_NORMALIZATION);
+                                        let a = &mut payload["attributes"];
+                                        a["exclusive_input_tokens"] = json!(exclusive);
+                                        a["input_tokens"] = json!(total_input);
+                                        a["cached_input_tokens"] = json!(read);
+                                        a["cache_write_input_tokens"] = json!(write);
+                                        a["reasoning_output_tokens"] = json!(0);
+                                        a["output_tokens"] = json!(output);
+                                        a["total_tokens"] = json!(total);
+                                    }
+                                    (None, Some(_)) => {
+                                        payload["kind"] = json!("unmapped");
+                                        payload["reason"] = json!("missing_usage_identity");
+                                    }
+                                    _ => invalid_usage = true,
+                                }
+                            }
+                        }
                         if harness == "grok" {
                             if metrics {
                                 if *kind == "usage" {
@@ -635,7 +667,7 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
     for record in records {
         let text = serde_json::to_string(&record)?;
         let identity = if record["usage_authority"] == "api_request" {
-            format!("grok-api:{:x}", Sha256::digest(serde_json::to_vec(&json!([
+            format!("{}:{:x}", if record["adapter"] == "otlp:devin" { "devin-api" } else { "grok-api" }, Sha256::digest(serde_json::to_vec(&json!([
                 record["attempt_id"], record["binding"], record["usage_source_key"]
             ]))?))
         } else { format!("sha256:{:x}", Sha256::digest(text.as_bytes())) };

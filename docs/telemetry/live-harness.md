@@ -132,21 +132,19 @@ attribution events are excluded. Native fixture certification precedes the
 steward's live ledger reconciliation; public-build OTLP export may be disabled.
 
 DG4k: `devin_live` (e.g. `HERDR_LIVE_ARGS='-p {prompt} --permission-mode auto'`)
-sets the DG4h receiver, bearer header and `OTEL_RESOURCE_ATTRIBUTES`, and writes
-`otel.enabled=true` (prompt/tool logging disabled) to the home's
-`.config/devin/config.json` only if absent. Version is `devin --version`'s semver
-(`3000.11.3`; the parenthesized build `9c803229faa4` is diagnostics). Devin's
-stdout has no usage JSON, so set `HERDR_LIVE_USAGE_FILES` to the fresh
-`sessions.db`/`cli_sessions.db` path(s) relative to the home (find them yourself
-after a run: the harness never walks the home). The harness reads only numeric
-leaves of `sessions.metadata` (`input_tokens`/`output_tokens`/
-`cache_read_tokens`/`cache_creation_tokens`/cache/total aliases; other numeric
-keys are reported as `unmapped_keys`, never `message_nodes`). Devin is
-fixture-only and outside the ledger, so `ledger_totals` are the exact-bound
-`api_request` rows and `metric_reconciliation` sums DELTA `devin.token.usage`.
-TODOs: confirm export is enabled by the config key (else add the real key),
-exporter event names/prefix, whether input is cache-inclusive, and whether
-`sessions.metadata` carries a stable usage schema; a stable one justifies a
-native `devin` adapter (bound by `sessions.working_directory`, sessions read
-only from recorded `devin`-kind execution homes). Recording a live report and
+sets the DG4h receiver, bearer header and `OTEL_RESOURCE_ATTRIBUTES`, and
+writes, only if absent, the home's `.config/devin/config.json` as exactly
+`{"otel":{"enabled":true,"logs_endpoint":"<receiver>/v1/logs","log_export_interval_ms":500,
+"metric_export_interval_ms":500,"disable_user_prompt_logging":true,"disable_tool_logging":true}}`
+plus `headers`/`logs_headers`/`metrics_headers` maps carrying the attempt token
+(env vars alone export nothing; short intervals are needed so a brief run
+exports before exit; the header-map shape is unverified, the token also rides
+`OTEL_EXPORTER_OTLP_HEADERS` for metrics). Version is `service.version`
+(`3000.11.3`, no build suffix). `sessions.metadata` holds only credit costs, so
+`sessions.db` is not read and `HERDR_LIVE_USAGE_FILES` is unused. Devin's own
+reported totals are the DELTA `devin.token.usage` sums from the receiver's
+records (model from the metric's `model`), normalized as input + cacheRead +
+cacheCreation, and are compared against the ledger built from `api_request`
+(`otlp-devin-exclusive-v1`). The run fails if the ledger is empty or any counter
+differs. Recording a live report and
 adding it to the certification registry remains a separate reviewed change.
