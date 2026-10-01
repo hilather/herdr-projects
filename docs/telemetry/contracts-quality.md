@@ -395,3 +395,84 @@ pane always use the registry.
 M42 estimator: `percentile_bootstrap.v1`, `B = 1000`, seed
 `0x4d34325f626f6f74`, level 0.95 (§4). The other lane C metrics (M45–M48)
 declare no minimum.
+
+## 6. DG6 passive verification flakes
+
+DG6a–c are telemetry only. DG6d/e (stress or rerun policy) remain unbuilt.
+`quality collect` scans at most 10,000 new canonical runs per call into
+quality stream version 3, migration `0003_verification_flakes.sql`; the
+existing tick scans at most 256. An immutable canonical insertion-row
+cursor (`quality_verification_cursor`) advances over excluded runs too,
+atomically with the projections, making collection incremental and replay
+idempotent without repeatedly scanning infrastructure-failure history. The canonical
+connection is read-only. `quality_verification_runs` stores run identity,
+source insertion row, tree/object format, policy id/digest, verdict/time,
+load and test availability. `quality_test_results` stores only run id,
+sanitized name and outcome. No output bodies cross the database boundary.
+These tables are `sidecar.derived_projections` in maintenance, retained
+without their own TTL, rebuildable from canonical records and included in
+ordinary sidecar backups. Canonical evidence follows the canonical lifecycle.
+
+`quality flaky [--since MS]` is read-only. `verification_flip_rate.v1`
+(`analytics-registry.v2`, family proxy, activity window, since-only provider)
+is also in `quality report`, `telemetry report` and `query --metric
+verification_flip_rate`. Group key is `(object_format, tree_oid, policy_id,
+policy_digest)` within this project. Numerator: groups containing accepted
+and rejected checks. Denominator: groups with at least two eligible runs.
+One pair counts once regardless of repeat count or verdict alternations.
+No denominator is unavailable, never zero. A stream created by another collector remains `verification_not_collected`
+until the quality collector records its first scan, even when empty.
+`by_policy` carries the exact
+ratios separately for each policy id and digest. Windowing uses completion
+record time; both runs must be in the requested window. Health uses a
+half-open last-30-days window. This is passive evidence conditional on
+reruns, not an estimate of all possible flaky candidates.
+
+Eligible runs are accepted or rejected with reason `checks_failed` and a
+known candidate tree. Cancelled executions produce no canonical verdict.
+Timeouts, isolation/setup failures, policy mismatches, missing outputs,
+scope checks and tree-tampering rejections are excluded: they do not attest
+a completed execution of the same checks. Different trees, policy ids or
+policy digests never combine. A submission with unknown tree is excluded.
+`flips` lists up to 100 pairs, each with total completed runs and one
+representative run id/verdict of each kind; identities are evidence, never
+metric labels. The metric counts all pairs even when evidence is capped.
+
+`failure_rate_by_load` is adjacent to the flip ratio, over the same eligible
+runs: buckets `<2`, `2-8` (inclusive 2 and 8), `>8`, and `unknown`; failures
+are `checks_failed` / runs, exact `n/d`. Unknown load is not zero. The
+verifier samples `/proc/loadavg` and `/proc/pressure/{cpu,io}` immediately
+before the isolated command, storing decimal strings (contracts §0), with null and `unreadable_or_invalid` on missing
+or malformed input. PSI is `some avg10`, not `full` or the cumulative total.
+Concurrency includes this execution and other verifiers for this project
+currently holding execution slots (not queued jobs, worker attempts or
+other projects). A 1024-slot OFD byte-lock file works across processes and
+releases locks on close/crash. Slot exhaustion or unavailable kernel/file
+support gives null with `execution_slots_unavailable`; no polling process
+or subprocess is introduced. Sampling is an instantaneous observation,
+not an average or a claim that host load measures project-local CPU use.
+Early setup/policy rejection has no execution metadata.
+
+Test outcomes are parsed by the verifier from command stdout: stable
+libtest `test NAME ... ok|FAILED|ignored` (summary lines ignored), libtest
+JSON test events, or a restricted JUnit XML document. JUnit combines
+`classname::name` when classname is present; failure/error is fail, skipped
+is ignored. Failure text and system-out/system-err are discarded. Five
+predefined XML entities are supported; DTDs, custom entities, other XML
+processing declarations and CDATA are refused. Nesting is capped at 64;
+attributes at 64 per element. Unsupported/malformed output is unavailable,
+not an empty passing suite, and never changes the verification verdict.
+
+Input is capped at 2 MiB (truncation refuses the entire result set), at most
+5,000 unique tests, raw names at most 256 UTF-8 bytes with no controls.
+Names use the existing privacy sanitizer (home prefixes, tokens and URL
+queries redacted; 160-character excerpt cap) and remain at most 256 bytes.
+Duplicate or sanitization-colliding names refuse the entire result set.
+The serialized test map is capped at 1.5 MB; canonical metadata at 2 MiB.
+No partial prefix of an oversized or malformed suite is reported as complete.
+Historical NULL metadata is unavailable. `quality flaky.tests` lists up to
+100 names whose pass/fail outcome differs across eligible runs of the same
+key; ignored and absent tests do not count as flips. This attributes a
+verdict signal; it does not establish the underlying race or cause. The
+existing `flaky_tests.proxy-v1` newly-flaky-test metric stays unavailable:
+DG6 has no temporal baseline proving a test is *newly* flaky.

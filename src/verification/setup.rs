@@ -4,7 +4,6 @@ use crate::execution_guard::GatedSpawn;
 use std::{
     ffi::CString,
     fs,
-    io::Write,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     process::Command,
@@ -156,17 +155,20 @@ fn enter(parsed: &Args) -> i32 {
         None => return fail("diff", 0),
     }
     // The copied checkout is the check cwd. Signed argv cannot name that path.
-    let output = match Command::new(&checks[0])
+    // Stream to the parent supervisor, which bounds capture. Do not buffer
+    // arbitrary test output in this isolated process.
+    let status = match Command::new(&checks[0])
         .args(&checks[1..])
         .current_dir(&parsed.checkout)
-        .output_gated()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status_gated()
     {
         Ok(output) => output,
         Err(error) => return fail("exec", error.raw_os_error().unwrap_or(0)),
     };
-    let _ = std::io::stdout().write_all(&output.stdout);
-    let _ = std::io::stderr().write_all(&output.stderr);
-    let code = output.status.code();
+    let code = status.code();
     match code {
         Some(code) => eprintln!("hp-verify checks={code}"),
         None => eprintln!("hp-verify checks=signal"),

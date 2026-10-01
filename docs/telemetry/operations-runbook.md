@@ -53,7 +53,7 @@ column named in `age_from`).
 | `sidecar.attention_samples` | `attention_samples` | 90 d | source of truth (sampled live, R4) | prune, destructive |
 | `sidecar.health_evaluations` | `health_evaluations` | 90 d | derivable | prune |
 | `sidecar.analytics_revisions` | superseded `analytics_revisions`, their `analytics_lineage` and `analytics_workspace_metrics`; `analytics_workspace_comparisons` outside the window (latest kept) | 365 d | derivable | prune (the current revision of every cell is kept) |
-| `sidecar.derived_projections` | ledger, graph, quota windows, proxy signals, integration outcomes, policy shadow, health states and alerts, analytics cells | — | derivable | follows its sources |
+| `sidecar.derived_projections` | ledger, graph, quota windows, proxy signals, integration outcomes, verification runs/test results, policy shadow, health states and alerts, analytics cells | — | derivable | follows its sources |
 | `sidecar.accounting_imports` | rate cards, charges, invoices, FX tables | — | source of truth (R4: re-import needs the files) | retain |
 | `sidecar.valuation_history` | valuation revisions, deltas, bases, inputs | — | source of truth (as-of views) | retain |
 | `ops.tombstones` | `telemetry-ops.db` | 400 d | source of truth | listed when expired, never pruned by `retention.v1` |
@@ -132,6 +132,7 @@ artefact.backups prune 30d source_of_truth destructive
 optin.external_export_files prune 7d source_of_truth destructive
 optin.captured_evidence not_built 7d source_of_truth destructive
 canonical.state external_lifecycle - canonical destructive
+canonical.verification_execution_slots external_lifecycle - derivable
 native.codex_rollouts external_lifecycle - source_of_truth destructive
 secret.cursor_key external_lifecycle - source_of_truth destructive
 ```

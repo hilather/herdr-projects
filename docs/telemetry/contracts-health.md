@@ -41,12 +41,13 @@ warn, critical, unknown}, states[], alerts {open[], last_evaluated_unix_ms}
 | `evidence` | the numbers the state rests on (numerator/denominator, age, remaining, longest wait, counts by reason); unavailable values stay `{status: unavailable, reason}` |
 | `thresholds` | `{direction, warn, critical, unit, window_ms, cooldown_ms}` from the rule table |
 
-## 2. Rule table (`health-rules.v2`, `rules.rs` `RULES`)
+## 2. Rule table (`health-rules.v3`, `rules.rs` `RULES`)
 
 A change of a rule, threshold or read path is a new rules version.
 
 | rule | family / service | read path | warn | critical | cooldown |
 |---|---|---|---|---|---|
+| `verification_flaky` | proxy | `quality flaky`, last 30 days | ≥ 1 flipped tree/policy pair | — | 1 h |
 | `collector_stale` | collection / codex | query `source_watermarks.sidecar.last_collect_unix_ms` | age ≥ 15 min | ≥ 60 min | 1 h |
 | `usage_after_termination` | consumption / codex | `usage.after_termination` (bound record times and canonical receipts) | ≥ 1 record | — | 1 h |
 | `usage_coverage` | consumption / codex | query M13 | < 100 % | < 50 % | 1 h |
@@ -241,3 +242,15 @@ deployment's own shipper under its existing authorization.
   defaults, revisable only as a new rules version.
 - Queue age and spool-cap alerts (doc 08 §6, doc 15 §7) have no read path in
   the query service yet.
+
+## 8. Passive verification alert (DG6a)
+
+`verification_flaky` warns on any accepted / `checks_failed` flip among
+eligible runs in `[now − 30 days, now)`, read from quality stream 0003.
+Evidence includes tree, object format, policy id/digest, contrasting verdicts
+and representative canonical run ids, plus exact pair counts and load/test
+context. The evidence arrays are capped at 100; counts are not capped.
+Missing collection is unknown; an observed empty window is ok. The rule
+uses ordinary deduplication/cooldown and never reruns checks, suppresses
+failures or changes acceptance. Exclusions and privacy bounds are in
+[contracts-quality.md §6](contracts-quality.md#6-dg6-passive-verification-flakes).

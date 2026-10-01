@@ -1,4 +1,4 @@
-//! The declared health-rule table `health-rules.v2`
+//! The declared health-rule table `health-rules.v3`
 //! (docs/telemetry/contracts-health.md §2). Each rule reads only through the
 //! TM4.1 query service (`analytics::query`) or a lane's own read path
 //! (`accounting quota|attention|entries|budget-shadow`, TM4.4 `compare`), and
@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-pub const VERSION: &str = "health-rules.v2";
+pub const VERSION: &str = "health-rules.v3";
 const MINUTE: i64 = 60_000;
 const HOUR: i64 = 60 * MINUTE;
 const DAY: i64 = 24 * HOUR;
@@ -38,6 +38,8 @@ impl State {
 /// How a rule reads its source.
 #[derive(Clone, Copy, Debug)]
 pub enum Eval {
+    /// Passive verification flips with canonical run evidence.
+    VerificationFlaky,
     /// Query-service source watermark: time since the last collect.
     Collector,
     /// A ratio metric that should be complete (`n/d` below thresholds).
@@ -87,6 +89,9 @@ pub struct Rule {
 }
 
 pub const RULES: &[Rule] = &[
+    Rule { name: "verification_flaky", family: "proxy", service: None, source: "lane:quality flaky", eval: Eval::VerificationFlaky,
+        direction: Direction::Above, warn: 1, critical: i64::MAX, unit: "flipped_pairs", window_ms: Some(30 * DAY), cooldown_ms: HOUR,
+        detail: "any accepted/checks_failed verdict flip for the same tree and policy in the last 30 days warns" },
     Rule { name: "usage_after_termination", family: "consumption", service: Some("codex"), source: "lane:usage after_termination", eval: Eval::AfterTermination,
         direction: Direction::Above, warn: 1, critical: i64::MAX, unit: "records", window_ms: None, cooldown_ms: HOUR,
         detail: "bound usage after termination warns; records remain counted in M08" },
@@ -281,6 +286,15 @@ pub fn evaluate(project: &Path, now: i64) -> Vec<Outcome> {
 fn evaluate_rule(ctx: &mut Ctx, rule: &'static Rule) -> Result<Vec<Outcome>> {
     let now = ctx.now;
     Ok(vec![match rule.eval {
+        Eval::VerificationFlaky => {
+            let from = rule.window_ms.map(|w| now - w);
+            let evidence = crate::telemetry::quality::flakes::report(ctx.project, from, Some(now))?;
+            let metric = lane_metric(rule.source);
+            let window = json!({"from_unix_ms": from, "to_unix_ms": now, "semantics": "half_open", "time_basis": "verification_completed"});
+            if evidence["status"] == "unavailable" { return Ok(vec![unknown(rule, evidence["reason"].as_str().unwrap_or("unavailable"), metric, window)]); }
+            let n = evidence["numerator"].as_i64().unwrap_or(0);
+            outcome(rule, if n > 0 { State::Warn } else { State::Ok }, vec![code(if n > 0 { "verification_verdict_flip" } else { "none_observed" })], metric, window, evidence)
+        }
         Eval::Collector => {
             let r = ctx.result("M08", None, None)?;
             let metric = json!({"read": query::CONTRACT, "field": "source_watermarks.sidecar.last_collect_unix_ms", "registry": registry::VERSION});

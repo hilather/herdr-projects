@@ -97,7 +97,7 @@ fn first_candidate_ci_proxy_and_test_weakening_flag() {
     let (collected, _) = f.cli_args(&["quality", "collect"]);
     assert_eq!(collected["proxy_signals"], json!({"observed": 3, "flagged": 1, "weakening_unavailable": 0, "deferred": 0}));
     assert_eq!(f.cli_args(&["quality", "collect"]).0["proxy_signals"], json!({"observed": 0, "flagged": 0, "weakening_unavailable": 0, "deferred": 0}), "settled signals are not re-observed");
-    assert_eq!(f.cli_args(&["quality", "status"]).0, json!({"stream": "quality", "version": 2}));
+    assert_eq!(f.cli_args(&["quality", "status"]).0, json!({"stream": "quality", "version": 3}));
 
     let after = f.report();
     let m45 = &f.cli_args(&["quality", "report"]).0["metrics"]["M45"];
@@ -695,4 +695,84 @@ fn a_worker_cannot_create_a_group_or_select_its_own_arm() {
     assert!(as_worker(&["show"]).status.success());
     assert_eq!(f.cli_args(&["quality", "groups", "select", &group, "--rule"]).0["selection"]["arm"], json!(2));
     assert_eq!(selections(), 1);
+}
+
+/// DG6 passive reruns: A flips once (even with a third run), B stays accepted,
+/// C/D have opposing verdicts on different trees, and policy digests stay separate.
+/// Hand-computed flip rate 1/2; load buckets <2=1/1, 2-8=0/3, >8=0/2,
+/// unknown=2/2. Infrastructure rejections and timeouts are not verdicts here.
+#[test]
+fn verification_flips_load_buckets_and_test_attribution_are_read_only() {
+    let f = Fixture::new();
+    let path = f.project.join(".state/state.db");
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    let at = unix_ms() - 10_000;
+    let hex = |c: char| c.to_string().repeat(64);
+    let cases = [
+        ('1','a','p',"rejected",Some("checks_failed"),Some(1.9),"fail"),
+        ('2','a','p',"accepted",None,Some(2.0),"pass"),
+        ('3','a','p',"accepted",None,Some(8.1),"pass"),
+        ('4','b','p',"accepted",None,Some(8.0),"pass"),
+        ('5','b','p',"accepted",None,Some(8.1),"pass"),
+        ('6','c','p',"rejected",Some("checks_failed"),None,"fail"),
+        ('7','d','p',"accepted",None,Some(2.0),"pass"),
+        ('8','b','p',"rejected",Some("isolation_setup_failed"),Some(9.0),"fail"),
+        ('9','b','p',"rejected",Some("timeout"),Some(9.0),"fail"),
+        ('a','a','q',"rejected",Some("checks_failed"),None,"fail"),
+    ];
+    assert_eq!(f.cli_args(&["quality","flaky"]).0, json!({"status":"unavailable","reason":"collection_not_run"}));
+    for (id,tree,policy,state,reason,load,changed) in cases {
+        let sub = hex(id);
+        db.execute("INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,artifact_manifest,claimed_checks,created_unix_ms)
+            VALUES(?1,'store',?1,?2,'{}','work',1,?2,?3,'/fixture',?4,?4,'sha1','[]','[]',?5)",
+            rusqlite::params![sub,hex('0'),f.attempt,tree.to_string().repeat(40),at]).unwrap();
+        let metadata = if id == 'a' { None } else { Some(json!({"version":"verification-metadata.v1","load":{"host_load_1m":load.map(|n: f64| n.to_string())},"tests":{"status":"available","results":[
+            {"name":"steady","outcome":"pass"},{"name":"racy","outcome":changed},{"name":"skipped","outcome":"ignored"}]}}).to_string()) };
+        db.execute("INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms,metadata)
+            VALUES(?1,'store',?1,?2,?1,'work',1,?2,?3,'ci',?4,?5,?5,'sha1',0,'linux-unshare-user-pid-mount-v1','[]','[]',?6,?7,?8,?9,1,1,?10,?11)",
+            rusqlite::params![sub,hex('0'),f.attempt,hex(policy),tree.to_string().repeat(40),state,reason,if state=="accepted" {0} else {1},(state=="accepted").then(||hex('0')),at,metadata]).unwrap();
+        if id == '2' {
+            f.cli("collect");
+            assert_eq!(f.cli_args(&["quality","flaky"]).0,json!({"status":"unavailable","reason":"verification_not_collected"}));
+            assert_eq!(f.report()["metrics"]["verification_flip_rate"]["value"],json!({"status":"unavailable","reason":"verification_not_collected"}));
+            assert_eq!(f.cli_args(&["quality","collect"]).0["verification_runs"]["observed"],2);
+            let two = f.cli_args(&["quality","flaky"]).0;
+            assert_eq!((&two["numerator"],&two["denominator"],&two["value"]),(&json!(1),&json!(1),&json!("1/1")));
+            assert_eq!(two["flips"][0]["completed_runs"],2);
+        }
+    }
+    drop(db);
+    let canonical = canonical_bytes(&f.project);
+    assert_eq!(f.cli_args(&["quality","collect"]).0["verification_runs"]["observed"],6);
+    assert_eq!(f.cli_args(&["quality","collect"]).0["verification_runs"]["observed"],0);
+    assert_eq!(f.count("quality_verification_runs"),8);
+    let report = f.cli_args(&["quality","flaky"]).0;
+    assert_eq!((&report["numerator"],&report["denominator"],&report["value"]),(&json!(1),&json!(2),&json!("1/2")));
+    assert_eq!(report["flips"],json!([{"tree":"a".repeat(40),"object_format":"sha1","policy_id":"ci","policy_digest":hex('p'),"completed_runs":3,
+        "runs":[{"run_id":hex('2'),"verdict":"accepted"},{"run_id":hex('1'),"verdict":"rejected"}]}]));
+    assert_eq!(report["failure_rate_by_load"],json!([
+        {"bucket":"2-8","failures":0,"runs":3,"value":"0/3"},
+        {"bucket":"<2","failures":1,"runs":1,"value":"1/1"},
+        {"bucket":">8","failures":0,"runs":2,"value":"0/2"},
+        {"bucket":"unknown","failures":2,"runs":2,"value":"2/2"}]));
+    assert_eq!(report["tests"],json!([{"tree":"a".repeat(40),"object_format":"sha1","policy_id":"ci","policy_digest":hex('p'),"name":"racy","outcomes":["pass","fail"]}]));
+    let metric = &f.report()["metrics"]["verification_flip_rate"];
+    assert_eq!((&metric["definition"],&metric["value"]),(&json!("verification_flip_rate.v1"),&json!("1/2")));
+    let query = f.cli_args(&["query","--metric","verification_flip_rate","--json"]).0;
+    assert_eq!(query["results"][0]["value"],"1/2");
+    f.cli_args(&["health","evaluate","--json"]);
+    let health = f.cli_args(&["health","--json"]).0;
+    let alert = health["alerts"]["open"].as_array().unwrap().iter().find(|r|r["rule"]=="verification_flaky").unwrap();
+    assert_eq!(alert["state"],"warn");
+    assert_eq!(alert["evidence"]["flips"],report["flips"]);
+    let backup = f.tmp.path().join("flake-backup");
+    f.cli_args(&["backup","create","--out",backup.to_str().unwrap()]);
+    assert_eq!(f.cli_args(&["backup","verify","--from",backup.to_str().unwrap()]).0["verified"],true);
+    let saved=rusqlite::Connection::open(backup.join("telemetry.db")).unwrap();
+    assert_eq!(saved.query_row("SELECT count(*) FROM quality_verification_runs",[],|r|r.get::<_,i64>(0)).unwrap(),8);
+    assert_eq!(saved.query_row("SELECT count(*) FROM quality_test_results",[],|r|r.get::<_,i64>(0)).unwrap(),21);
+    assert_eq!(canonical_bytes(&f.project),canonical);
+    let later = (at+1).to_string();
+    assert_eq!(f.cli_args(&["quality","flaky","--since",&later]).0["value"],json!({"status":"unavailable","reason":"empty_denominator"}));
 }

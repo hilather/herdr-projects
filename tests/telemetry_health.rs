@@ -2,7 +2,7 @@
 //! (docs/telemetry/contracts-health.md), through `herdr-projects telemetry`
 //! on the CLI over planted canonical and sidecar rows. Every expected value is
 //! hand-computed from the planted rows and the declared rule table
-//! (`health-rules.v2`); none is read back from a production aggregate.
+//! (`health-rules.v3`); none is read back from a production aggregate.
 
 #![cfg(all(feature = "state-store", target_os = "linux"))]
 #![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
@@ -226,7 +226,7 @@ fn ticker_health_requires_operator_opt_in_obeys_interval_and_never_notifies() {
 fn stale_collector_and_missing_sources_are_health_states_never_zero_usage() {
     let p = Planted::new();
     let out = p.health();
-    assert_eq!((&out["contract"], &out["rules_version"], &out["project"]), (&json!("telemetry-health.v1"), &json!("health-rules.v2"), &json!("demo")));
+    assert_eq!((&out["contract"], &out["rules_version"], &out["project"]), (&json!("telemetry-health.v1"), &json!("health-rules.v3"), &json!("demo")));
     for rule in ["collector_stale", "usage_coverage", "cost_coverage", "accounting_conflict", "quota_headroom", "waiting_on_you"] {
         let s = state(&out, rule);
         assert_eq!((&s["state"], codes(s)), (&json!("unknown"), vec!["collection_not_run".to_owned()]), "{rule}: {s}");
@@ -287,7 +287,7 @@ fn coverage_loss_grades_usage_coverage_exactly() {
     assert_eq!(s["evidence"]["incomplete"], json!({"not_bound": 1}));
     assert_eq!(codes(s), vec!["coverage_loss"]);
     assert_eq!(s["metric"]["definition"], "M13.slice-v1");
-    assert_eq!(s["metric"]["registry"], "analytics-registry.v1");
+    assert_eq!(s["metric"]["registry"], "analytics-registry.v2");
 
     p.sidecar().execute_batch("DELETE FROM codex_usage; DELETE FROM rollout_sources;").unwrap();
     let out = p.evaluate();
@@ -459,7 +459,7 @@ fn cooldown_dedup_and_inbox_notice_written_once() {
     let update = again["updated"].as_array().unwrap().iter().find(|a| a["rule"] == "quota_headroom").unwrap();
     assert_eq!((&update["alert_id"], &update["deduplicated"]), (&json!(id), &json!(true)));
     let alert = open_alert(&p.alerts(), "quota_headroom").unwrap().clone();
-    assert_eq!((&alert["occurrences"], &alert["metric"]["read"], &alert["rules_version"]), (&json!(2), &json!("lane:accounting quota"), &json!("health-rules.v2")));
+    assert_eq!((&alert["occurrences"], &alert["metric"]["read"], &alert["rules_version"]), (&json!(2), &json!("lane:accounting quota"), &json!("health-rules.v3")));
 
     // Inbox: one notice for the open alert, never two.
     let before = |p: &Planted| p.db().query_row("SELECT count(*) FROM inbox_items WHERE json_extract(payload,'$.kind')='telemetry-health'", [], |r| r.get::<_, i64>(0)).unwrap();
@@ -678,7 +678,7 @@ fn recommendation_carries_evidence_and_goes_stale_after_a_configuration_change()
     assert_eq!((&rec["contract"], &rec["status"], &rec["role"]), (&json!("telemetry-recommendation.v1"), &json!("recommended"), &json!("code")), "{rec}");
     assert_eq!(rec["advisory"], json!({"advisory": true, "authority": "none", "writes": "none",
         "routing": "advisory only: a person decides; nothing here is read by dispatch or admission, and it changes no authority, profile, model access, spending limit or acceptance check"}));
-    assert_eq!(rec["metric"], json!({"metric_id": "M02", "definition": "M02.cohort-v1", "higher_is_better": true, "registry": "analytics-registry.v1",
+    assert_eq!(rec["metric"], json!({"metric_id": "M02", "definition": "M02.cohort-v1", "higher_is_better": true, "registry": "analytics-registry.v2",
         "comparison": "analytics-comparison.v1", "freshness": "M50.recommendation-v1"}));
     assert_eq!(rec["evidence_window"], json!({"cohort": "terminal_cohort", "from_unix_ms": null, "to_unix_ms": null, "semantics": "half_open", "time_basis": "task_terminal_time"}));
     assert_eq!(rec["recommendation"]["configuration_id"], json!(codex));
@@ -1141,14 +1141,14 @@ fn recommendations_and_notices_change_no_canonical_state_and_no_dispatch() {
 fn rule_table_is_declared_with_bounded_labels() {
     let p = Planted::new();
     let rules = p.json(&["health", "rules"]);
-    assert_eq!((&rules["rules_version"], &rules["labels"]), (&json!("health-rules.v2"), &json!(["project", "family", "rule", "service", "role"])));
+    assert_eq!((&rules["rules_version"], &rules["labels"]), (&json!("health-rules.v3"), &json!(["project", "family", "rule", "service", "role"])));
     let names: Vec<&str> = rules["rules"].as_array().unwrap().iter().map(|r| r["rule"].as_str().unwrap()).collect();
-    assert_eq!(names, ["usage_after_termination", "collector_stale", "usage_coverage", "cost_coverage", "accounting_conflict", "budget_exposure", "fix_reopened", "integration_reverted",
+    assert_eq!(names, ["verification_flaky", "usage_after_termination", "collector_stale", "usage_coverage", "cost_coverage", "accounting_conflict", "budget_exposure", "fix_reopened", "integration_reverted",
         "latency_shift", "attempt_cost_shift", "service_throttled", "quota_headroom", "waiting_on_you", "recommendation_stale"]);
     let quota = rules["rules"].as_array().unwrap().iter().find(|r| r["rule"] == "quota_headroom").unwrap();
     assert_eq!(quota["thresholds"], json!({"direction": "below", "warn": 20000, "critical": 5000, "unit": "millipercent_remaining", "window_ms": null, "cooldown_ms": HOUR}));
     let text = String::from_utf8(p.raw(&["health"])).unwrap();
-    assert!(text.starts_with("demo · health · health-rules.v2 · live_read_only\n"), "{text}");
+    assert!(text.starts_with("demo · health · health-rules.v3 · live_read_only\n"), "{text}");
     assert!(text.contains("  collector_stale [collection service=codex]: unknown collection_not_run\n"), "{text}");
     assert!(text.ends_with("alerts n/a (collection_not_run)\n"), "{text}");
     assert_eq!(p.json(&["health", "status"]), json!({"stream": "health", "version": {"status": "unavailable", "reason": "collection_not_run"}}));

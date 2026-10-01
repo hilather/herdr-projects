@@ -8,7 +8,7 @@ are [contracts.md](contracts.md) §0. Code: `src/telemetry/analytics/`
 (TM4.3). Telemetry never grants launch, changes budgets or accepts results;
 nothing here writes `state.db`.
 
-## 1. Metric registry (`analytics-registry.v1`)
+## 1. Metric registry (`analytics-registry.v2`)
 
 `telemetry <slug> metrics registry [--json]` prints one declared table
 (`registry.rs`) of every metric `telemetry report` or `query` can name:
@@ -233,3 +233,8 @@ Analytics stream 2 adds disposable `analytics_workspace_metrics` and
 `analytics_workspace_comparisons` rendering projections. Metrics follow their
 revision deletion; comparisons retain the latest row and the analytics retention
 window. Rebuild recreates metric projections from recorded revision bodies.
+
+DG6 adds `verification_flip_rate.v1` in registry v2: quality lane,
+activity window, since-only, completed verification record time, per-project
+pair ratio with per-policy id/digest drill-down. See contracts-quality.md §6.
+The prior metric definitions retain their meanings.

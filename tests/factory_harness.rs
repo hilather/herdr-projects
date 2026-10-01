@@ -1487,6 +1487,15 @@ fn install_fixture_contract(
     path: &str,
     capability_flags: &[&str],
 ) -> String {
+    install_fixture_verification_contract(db_path, task, repository, oid, object_format, path, capability_flags, PLANNING_POLICY)
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn install_fixture_verification_contract(
+    db_path: &Path, task: &str, repository: &str, oid: &str, object_format: &str,
+    path: &str, capability_flags: &[&str], policy: &str,
+) -> String {
     let store = fs::canonicalize(db_path).unwrap().display().to_string();
     let conn = rusqlite::Connection::open(db_path).unwrap();
     let expected_head: i64 = conn.query_row("SELECT COALESCE(MAX(sequence),0) FROM events", [], |r| r.get(0)).unwrap();
@@ -1496,7 +1505,7 @@ fn install_fixture_contract(
         "deliverable": "fixture work", "non_goals": "no provider calls",
         "repository": repository, "base_oid": oid, "object_format": object_format,
         "scope": {"paths":[{"path":path,"access":"write"}]},
-        "acceptance_policies": [{"id":"builds","text":PLANNING_POLICY}],
+        "acceptance_policies": [{"id":"builds","text":policy}],
         "dependencies": [], "capability_flags": capability_flags, "profile_kind":"codex",
         "retry_class":"none", "result_schema_id":"result-v1", "route":"verify_only",
         "authority":{"id":"fixture-owner","revision":1,"digest":"ab".repeat(32)}
@@ -1519,7 +1528,7 @@ fn install_fixture_contract(
     .unwrap();
     conn.execute(
         "INSERT INTO acceptance_policies(task_id,contract_revision,policy_id,body) VALUES(?1,1,'builds',?2)",
-        rusqlite::params![task, PLANNING_POLICY],
+        rusqlite::params![task, policy],
     )
     .unwrap();
     conn.execute(
@@ -4168,4 +4177,65 @@ fn fault_campaign_and_restore_rehearsal() {
         .join(".state/migration/journal.json")
         .is_file());
     assert!(herdr_projects::migration::abort(&published.project).is_err());
+}
+
+/// Real verifier public ingress: Git emits fixture test output from the retained
+/// candidate. Only bounded names/outcomes survive in immutable run metadata.
+#[cfg(target_os = "linux")]
+#[test]
+fn verification_receipts_capture_load_and_bounded_test_metadata() {
+    let cases = [
+        ("human", "running 3 tests\ntest stable ... ok\ntest racy ... FAILED\ntest skip ... ignored\ntest result: FAILED. 1 passed; 1 failed; 1 ignored\n".into(), Some(serde_json::json!([
+            {"name":"racy","outcome":"fail"},{"name":"skip","outcome":"ignored"},{"name":"stable","outcome":"pass"}]))),
+        ("json", "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"stable\",\"stdout\":\"PRIVATE-BODY\"}\n".into(), Some(serde_json::json!([{"name":"stable","outcome":"pass"}]))),
+        ("junit", "<?xml version=\"1.0\"?><testsuite><testcase classname=\"suite\" name=\"steady\"/><testcase classname=\"suite\" name=\"racy\"><failure>PRIVATE-BODY</failure></testcase><testcase name=\"skip\"><skipped/></testcase></testsuite>".into(), Some(serde_json::json!([
+            {"name":"skip","outcome":"ignored"},{"name":"suite::racy","outcome":"fail"},{"name":"suite::steady","outcome":"pass"}]))),
+        ("oversized", "test stable ... ok\n".repeat(120_000), None),
+        ("too-many", (0..5001).map(|n|format!("test t{n} ... ok\n")).collect(), None),
+        ("long-name", format!("test {} ... ok\n","x".repeat(257)), None),
+        ("malformed", "<testsuite><testcase name=\"lost\"><failure>PRIVATE-BODY</testcase></testsuite>".into(), None),
+        ("entities", "<!DOCTYPE x [<!ENTITY secret SYSTEM 'file:///etc/passwd'>]><testsuite><testcase name=\"&secret;\"/></testsuite>".into(), None),
+        ("duplicate", "test same ... ok\ntest same ... FAILED\n".into(), None),
+    ];
+    for (case, output, expected) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = classification_project(tmp.path(), "tests", None);
+        let path = project.join(".state/state.db");
+        let repo = tmp.path().join("repo");
+        fs::write(repo.join("test-output.txt"),output).unwrap();
+        git(&repo,&["add","test-output.txt"]);git(&repo,&["commit","-qm","test output"]);
+        let oid = git(&repo,&["rev-parse","HEAD"]).trim().to_owned();
+        let body = r#"{"version":1,"checks":["/usr/bin/git","show","HEAD:test-output.txt"]}"#;
+        let digest = install_fixture_verification_contract(&path,"tests",repo.to_str().unwrap(),&oid,"sha1","test-output.txt",&[],body);
+        admit_ready(&project);
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        let attempt:String = raw.query_row("SELECT id FROM attempts",[],|r|r.get(0)).unwrap();
+        let object_list = git(&repo,&["rev-list","--objects","--no-object-names","HEAD"]);
+        let objects:Vec<_> = object_list.lines().map(|oid|serde_json::json!({"oid":oid,"relative_path":format!("{}/{}",&oid[..2],&oid[2..])})).collect();
+        let mut store = SqliteStore::open(&path).unwrap();
+        let submission = store.submit_result(&serde_json::to_vec(&serde_json::json!({"idempotency_key":"submit","task_id":"tests","contract_revision":1,"contract_digest":digest,
+            "attempt_id":attempt,"repository":repo,"base_oid":oid,"candidate_oid":oid,"object_format":"sha1","artifact_manifest":[],"claimed_checks":[],"objects":objects})).unwrap()).unwrap();
+        let policy = tmp.path().join("policy.json");fs::write(&policy,body).unwrap();
+        let work = tmp.path().join("scratch");fs::create_dir(&work).unwrap();
+        let request = herdr_projects::verification::VerifyRequest::new(submission.submission_id,"builds",&policy,"verify",Duration::from_secs(30),&work);
+        let outcome = herdr_projects::verification::verify(&mut store,&request).unwrap();
+        assert_eq!(outcome.state,"accepted","{case}: {:?}",outcome.reason);
+        let metadata:String = raw.query_row("SELECT metadata FROM verification_runs WHERE run_id=?1",[&outcome.run_id],|r|r.get(0)).unwrap();
+        let metadata:serde_json::Value=serde_json::from_str(&metadata).unwrap();
+        assert_eq!(metadata["version"],"verification-metadata.v1");
+        assert_eq!(metadata["load"]["project_concurrent_runs"],1);
+        assert!(metadata["load"]["host_load_1m"].as_str().and_then(|s|s.parse::<f64>().ok()).is_some());
+        match expected {
+            Some(results) => { assert_eq!(metadata["tests"]["status"],"available","{case}");assert_eq!(metadata["tests"]["results"],results,"{case}"); }
+            None => { assert_eq!(metadata["tests"]["status"],"unavailable","{case}");assert_eq!(metadata["tests"]["results"],serde_json::json!([]),"{case}"); }
+        }
+        assert!(!metadata.to_string().contains("PRIVATE-BODY"));
+        let replay=herdr_projects::verification::verify(&mut store,&request).unwrap();assert!(replay.replayed);
+        assert_eq!(raw.query_row("SELECT count(*) FROM verification_runs",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        // A fresh run after the first has finished must not count a stale slot.
+        let next = herdr_projects::verification::VerifyRequest::new(request.submission_id.clone(),"builds",&policy,"verify-again",Duration::from_secs(30),&work);
+        let rerun=herdr_projects::verification::verify(&mut store,&next).unwrap();
+        let rerun_metadata:String=raw.query_row("SELECT metadata FROM verification_runs WHERE run_id=?1",[rerun.run_id],|r|r.get(0)).unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&rerun_metadata).unwrap()["load"]["project_concurrent_runs"],1);
+    }
 }

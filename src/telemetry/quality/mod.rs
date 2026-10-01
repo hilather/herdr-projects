@@ -10,6 +10,7 @@ use std::path::Path;
 pub(crate) mod groups;
 mod outcomes;
 mod proxy;
+pub(crate) mod flakes;
 mod registry;
 
 pub const STREAM: &str = "quality";
@@ -17,6 +18,7 @@ pub const STREAM: &str = "quality";
 pub const MIGRATIONS: &[&str] = &[
     include_str!("../../../migrations/telemetry/quality/0001_proxy_signals.sql"),
     include_str!("../../../migrations/telemetry/quality/0002_integration_outcomes.sql"),
+    include_str!("../../../migrations/telemetry/quality/0003_verification_flakes.sql"),
 ];
 
 /// `herdr-projects telemetry <slug> quality ...`
@@ -24,6 +26,11 @@ pub const MIGRATIONS: &[&str] = &[
 pub enum Command {
     /// Stream version of this lane's sidecar tables. Read-only.
     Status,
+    /// Verdict flips, load buckets and tests with differing pass/fail outcomes. Read-only.
+    Flaky {
+        #[arg(long)]
+        since: Option<i64>,
+    },
     /// Observe TM3.7 proxy signals (first-candidate CI, test weakening) and
     /// integration outcomes (revert, survival) into the sidecar. Reads
     /// `state.db` read-only; never changes acceptance.
@@ -51,8 +58,10 @@ pub enum Command {
 /// The command's stdout.
 pub fn run(project: &Path, command: Command) -> Result<String> {
     let value = match command {
+        Command::Flaky { since } => flakes::report(project, since, None)?,
         Command::Status => super::sidecar::status(project, STREAM)?,
         Command::Collect { horizon_days } => serde_json::json!({
+            "verification_runs": flakes::collect(project, true, 10_000)?,
             "proxy_signals": proxy::collect(project, true, usize::MAX)?,
             "integration_outcomes": outcomes::collect(project, true, horizon_days, COLLECT_INTEGRATIONS * outcomes::CALLS_PER_INTEGRATION)?,
         }),
@@ -72,6 +81,7 @@ fn lane_metrics(project: &Path, since: Option<i64>, horizon_days: u32) -> Result
     let unavailable = |definition: &str, name: &str, reason: &str| serde_json::json!({"definition": definition, "name": name, "proxy": true,
         "source_trust": "proxy_observed", "value": {"status": "unavailable", "reason": reason}});
     let mut metrics = BTreeMap::from([
+        ("verification_flip_rate".to_owned(), flakes::metric(project, since)?),
         ("M45".to_owned(), proxy::m45(project, since)?),
         ("M46".to_owned(), unavailable("M46.proxy-v1", "main_breakage_after_integration_proxy", "no_main_check_producer")),
         ("M47".to_owned(), m47),
@@ -93,6 +103,7 @@ pub fn metrics(project: &Path, since: Option<i64>) -> Result<BTreeMap<String, Va
 /// integration's outcome (default horizon) per pass.
 pub fn tick(project: &Path, _budget: super::codex::Budget) -> Result<()> {
     const TICK_DIFFS: usize = 16;
+    flakes::collect(project, false, 256)?;
     proxy::collect(project, false, TICK_DIFFS)?;
     outcomes::collect(project, false, outcomes::DEFAULT_HORIZON_DAYS, outcomes::CALLS_PER_INTEGRATION).map(drop)
 }

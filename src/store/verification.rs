@@ -323,10 +323,20 @@ impl SqliteStore {
 
     /// Record the run. A receipt is inserted only when the recheck still matches.
     /// Scope violations request cancellation atomically; release still requires proof.
+    #[cfg(test)]
     pub(crate) fn commit_verification(
         &mut self,
         target: &VerifyTarget,
         draft: RunDraft,
+    ) -> Result<(ExistingRun, Option<VerificationReceipt>)> {
+        self.commit_verification_metadata(target, draft, None)
+    }
+
+    pub(crate) fn commit_verification_metadata(
+        &mut self,
+        target: &VerifyTarget,
+        draft: RunDraft,
+        metadata: Option<&serde_json::Value>,
     ) -> Result<(ExistingRun, Option<VerificationReceipt>)> {
         target.pin_matches()?;
         let tx = self
@@ -422,8 +432,9 @@ impl SqliteStore {
             draft.exit_status
         };
         let now = jiff::Timestamp::now().as_millisecond();
+        let metadata = metadata.map(serde_json::to_string).transpose().map_err(|e| invalid(&e.to_string()))?;
         tx.execute(
-            "INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
+            "INSERT INTO verification_runs(run_id,project_store,idempotency_key,payload_digest,submission_id,task_id,contract_revision,contract_digest,attempt_id,policy_id,policy_digest,commit_oid,tree_oid,object_format,memory_fence,isolation,argv,library_manifest,state,reason,exit_status,receipt_digest,store_device,store_inode,created_unix_ms,metadata) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26)",
             params![
                 run_id,
                 target.project_store,
@@ -449,7 +460,8 @@ impl SqliteStore {
                 receipt_digest,
                 target.store_device,
                 target.store_inode,
-                now
+                now,
+                metadata
             ],
         )?;
         if state == "accepted" {

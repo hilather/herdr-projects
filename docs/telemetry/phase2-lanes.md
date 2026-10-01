@@ -402,15 +402,15 @@ Cards (gaps that stop those questions being answered):
   A change can pass alone and fail when other work runs alongside it. In the
   2026-09-30 log, cx2 was a racy test and P3 a real lock-hold regression, so
   a flake is a signal, never noise to hide.
-  - **DG6a verdict flip rate (telemetry).** When the same tree and
+  - **Done (DG6a) verdict flip rate (telemetry).** When the same tree and
     verification policy get differing verdicts across runs, record a flip.
     Add a metric (flip rate per policy and project) and a health rule.
     Passive; it sees only flakes that happen to be re-run.
-  - **DG6b load context per verification run (telemetry).** Record the host
+  - **Done (DG6b, canonical 0068) load context per verification run (telemetry).** Record the host
     load average, concurrent verifications and CPU/IO pressure with each run,
     so failures can be correlated with contention (e.g. "fails 12 % above
     load 8, 0 % below").
-  - **DG6c per-test results (telemetry).** Capture the runner's structured
+  - **Done (DG6c, quality 0003) per-test results (telemetry).** Capture the runner's structured
     test outcomes (test names and pass/fail: metadata, within the privacy
     default) so a flake is attributed to a specific test, not a whole
     verdict.

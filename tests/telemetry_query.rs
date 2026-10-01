@@ -121,12 +121,14 @@ fn nd(m: &Value) -> (Value, Value, Value) { (m["numerator"].clone(), m["denomina
 fn registry_declares_every_metric_and_gates_families() {
     let p = Planted::new();
     let registry = p.json(&["metrics", "registry", "--json"]);
-    assert_eq!(registry["registry"], "analytics-registry.v1");
+    assert_eq!(registry["registry"], "analytics-registry.v2");
     assert_eq!(registry["rejected_cohorts"], json!({"completed_task": "ambiguous_cohort"}));
     let metrics = registry["metrics"].as_array().unwrap();
     let ids: Vec<&str> = metrics.iter().map(|m| m["id"].as_str().unwrap()).collect();
     let mut expected: Vec<String> = (1..=50).map(|n| format!("M{n:02}")).collect();
     expected.push("flaky_tests".into());
+    expected.push("verification_flip_rate".into());
+    expected.sort();
     assert_eq!(ids, expected, "M01-M50 and the lane C flaky-test proxy, once each, in order");
     let get = |id: &str| metrics.iter().find(|m| m["id"] == id).unwrap().clone();
     let m02 = get("M02");
@@ -153,7 +155,7 @@ fn registry_declares_every_metric_and_gates_families() {
     assert_eq!((&get("M49")["active"], &get("M49")["activation"]["card"]), (&json!(true), &json!("TM4.6")));
     // Text form: one line per metric.
     let text = String::from_utf8(p.raw(&["metrics", "registry"])).unwrap();
-    assert_eq!(text.lines().count(), 52, "{text}");
+    assert_eq!(text.lines().count(), 53, "{text}");
     assert!(text.contains("M20 review_completion M20.v1 review family=review_quality cohorts=assignment_cohort unit=ratio certification=certified-fixture active"), "{text}");
     assert!(text.contains("M49 replay_suite_pass_rate M49.v1 central family=replay cohorts=activity_window unit=ratio certification=fixture active"), "{text}");
 

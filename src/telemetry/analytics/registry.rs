@@ -1,11 +1,11 @@
-//! The TM4.1 metric registry `analytics-registry.v1` (docs/telemetry/contracts-analytics.md §1):
+//! The TM4.1 metric registry `analytics-registry.v2` (docs/telemetry/contracts-analytics.md §1):
 //! one declared, read-only table of every metric the report or the query
 //! service can name, with its definition versions, family, cohorts, window
 //! semantics, unit, certification and activation. A change here is a new
 //! registry version, never an edit in place of a published definition.
 use serde_json::{Value, json};
 
-pub const VERSION: &str = "analytics-registry.v1";
+pub const VERSION: &str = "analytics-registry.v2";
 
 /// The TM3.5 quality certificate. Without it every validated-quality family is
 /// `unavailable: awaiting_quality_certificate`; landing or withdrawing it is
@@ -209,6 +209,7 @@ pub const METRICS: &[Metric] = &[
         window: Window::HalfOpen, time_basis: "task_terminal_time", dimensions: &[] }, absent("M50.v1", A, "no_producer")], "fixture",
         "tests/telemetry_health.rs (TM4.5 fixtures)", Some("per recommendation only; lineage by profile name, else agent kind")),
     m!("flaky_tests", "newly_flaky_tests_proxy", Proxy, "tests", [lane("quality", "flaky_tests.proxy-v1", A, "ci_run")], "unavailable", QUALITY, Some("no_repeat_runs")),
+    m!("verification_flip_rate", "verification_flip_rate", Proxy, "ratio", [lane("quality", "verification_flip_rate.v1", A, "verification_completed")], "fixture", "tests/telemetry_quality.rs (DG6)", Some("passive reruns only; accepted vs checks_failed; policy drill-down in quality flaky")),
 ];
 
 /// TM4.4 comparison estimators (`analytics-comparison.v1`,

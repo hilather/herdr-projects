@@ -575,8 +575,11 @@ fn happy_path_checks_out_retained_objects_and_keeps_capacity() {
     let raw=rusqlite::Connection::open(&world.db_path).unwrap();
     let retained=|| {
         ["verification_runs","verified_results"].map(|table| {
-            let mut statement=raw.prepare(&format!("SELECT * FROM {table}")).unwrap();let columns=statement.column_count();
-            statement.query_map([],|row|(0..columns).map(|column|row.get::<_,rusqlite::types::Value>(column)).collect::<rusqlite::Result<Vec<_>>>()).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+            let mut statement=raw.prepare(&format!("SELECT * FROM {table}")).unwrap();
+            // Compare the historical receipt fields: schema 35 cannot carry
+            // verifier metadata first introduced in schema 68.
+            let columns: Vec<_> = statement.column_names().iter().enumerate().filter_map(|(i,name)| (*name != "metadata").then_some(i)).collect();
+            statement.query_map([],|row|columns.iter().map(|column|row.get::<_,rusqlite::types::Value>(*column)).collect::<rusqlite::Result<Vec<_>>>()).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
         })
     };
     let verification_before=retained();assert_eq!(verification_before[0].len(),1);assert_eq!(verification_before[1].len(),1);

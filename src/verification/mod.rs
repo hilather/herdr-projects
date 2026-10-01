@@ -4,6 +4,7 @@
 //! let _: VerificationReceipt = serde_json::from_str("{}").unwrap();
 //! ```
 mod checkout;
+mod evidence;
 mod manifest;
 mod setup;
 pub(crate) mod supervise;
@@ -493,12 +494,13 @@ fn verify_owned(store: &mut SqliteStore, request: &VerifyRequest, ownership: Opt
             None,
             String::new(),
             None,
+            None,
         );
     }
     let checks = parse_checks(&policy_bytes)?;
     let hidden = parse_hidden(&policy_bytes)?;
     if !hidden.is_empty() && !hidden_inputs_ok(Path::new(&target.project_store), &hidden) {
-        return persist(store, &target, request, payload_digest, Vec::new(), Vec::new(), None, Some("hidden_check_unavailable"), None, String::new(), None);
+        return persist(store, &target, request, payload_digest, Vec::new(), Vec::new(), None, Some("hidden_check_unavailable"), None, String::new(), None, None);
     }
     let checkout = checkout::materialize(
         &request.work_dir,
@@ -515,7 +517,7 @@ fn verify_owned(store: &mut SqliteStore, request: &VerifyRequest, ownership: Opt
         };
         if let Some(reason) = reason {
             return persist(store, &target, request, payload_digest, Vec::new(), Vec::new(),
-                Some(checkout.tree), Some(reason), None, String::new(), None);
+                Some(checkout.tree), Some(reason), None, String::new(), None, None);
         }
     }
     // Inspect the materialized candidate, never the worker's artifact claims.
@@ -533,7 +535,7 @@ fn verify_owned(store: &mut SqliteStore, request: &VerifyRequest, ownership: Opt
         })
     }) {
         return persist(store, &target, request, payload_digest, Vec::new(), Vec::new(),
-            Some(checkout.tree), Some("required_output_missing"), None, String::new(), None);
+            Some(checkout.tree), Some("required_output_missing"), None, String::new(), None, None);
     }
     if !program_allowed(&checks[0], &checkout.path) {
         return persist(
@@ -547,6 +549,7 @@ fn verify_owned(store: &mut SqliteStore, request: &VerifyRequest, ownership: Opt
             Some("checks_not_allowlisted"),
             None,
             String::new(),
+            None,
             None,
         );
     }
@@ -598,6 +601,7 @@ fn verify_owned(store: &mut SqliteStore, request: &VerifyRequest, ownership: Opt
                 None,
                 String::new(),
                 None,
+                None,
             );
         }
     };
@@ -626,14 +630,18 @@ fn verify_owned(store: &mut SqliteStore, request: &VerifyRequest, ownership: Opt
             None,
             String::new(),
             None,
+            None,
         );
     }
+    launch.cmd.capture_limit = 2 * 1024 * 1024 + 1;
     launch.cmd.cancellation = request.cancellation.clone();
+    let mut execution = evidence::Execution::start(Path::new(&target.project_store));
     // The check touches only its own scratch; record only if the inputs still hold.
     let (ran, target) = match ownership {
         Some(ownership) => {
             ownership.release()?;
             let ran = RealRunner.run(&launch.cmd);
+            execution.completed();
             ownership.reacquire(store)?;
             let fresh = store.load_verify_target(&request.submission_id, &request.policy_id)
                 .map_err(|error| FenceChanged(format!("{error}")))?;
@@ -646,7 +654,11 @@ fn verify_owned(store: &mut SqliteStore, request: &VerifyRequest, ownership: Opt
             }
             (ran, fresh)
         }
-        None => (RealRunner.run(&launch.cmd), target),
+        None => {
+            let ran = RealRunner.run(&launch.cmd);
+            execution.completed();
+            (ran, target)
+        },
     };
     let output = match ran {
         // A cancelled check is no verdict: record nothing and let the caller retry.
@@ -664,6 +676,7 @@ fn verify_owned(store: &mut SqliteStore, request: &VerifyRequest, ownership: Opt
                 Some("isolation_setup_failed"),
                 None,
                 String::new(),
+                None,
                 None,
             );
         }
@@ -684,6 +697,7 @@ fn verify_owned(store: &mut SqliteStore, request: &VerifyRequest, ownership: Opt
     } else {
         None
     };
+    let metadata = execution.metadata(&report.stdout, output.stdout_truncated);
     persist(
         store,
         &target,
@@ -696,9 +710,11 @@ fn verify_owned(store: &mut SqliteStore, request: &VerifyRequest, ownership: Opt
         receipt,
         report.stdout,
         report.exit_status,
+        Some(metadata),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn persist(
     store: &mut SqliteStore,
     target: &VerifyTarget,
@@ -711,12 +727,13 @@ fn persist(
     receipt: Option<VerificationReceipt>,
     stdout: String,
     exit_status: Option<i32>,
+    metadata: Option<serde_json::Value>,
 ) -> Result<VerifyOutcome> {
     let libraries = libraries
         .iter()
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>();
-    let (stored, receipt) = store.commit_verification(
+    let (stored, receipt) = store.commit_verification_metadata(
         target,
         RunDraft {
             idempotency_key: request.idempotency_key.clone(),
@@ -728,6 +745,7 @@ fn persist(
             reason: reason.map(str::to_string),
             receipt,
         },
+        metadata.as_ref(),
     )?;
     Ok(VerifyOutcome {
         run_id: stored.run_id,

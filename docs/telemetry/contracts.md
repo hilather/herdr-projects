@@ -53,7 +53,7 @@ needs a new reviewed revision, not a silent reinterpretation.
   (RFC 8785 subset, as doc 03 §4). Digests are `sha256:` + lowercase hex.
 - **Time.** Unix milliseconds from the controller's `now` at the transition.
   Codex times are kept as reported and never reorder canonical events.
-- **Stores.** Canonical: `<project>/.state/state.db`, migrations 0049–0067 (0052 collector bindings, contracts-collection.md; 0053 candidate groups, contracts-quality.md §3; 0054 review capture, contracts-review.md; 0055 finding triage and duplicate history, contracts-review.md §5; 0056 fix attribution, regressions and role credit, contracts-review.md §6; 0057 review protocols, passes and preregistered experiments, contracts-review.md §7; 0058 seeded defects, recall and the seeded-candidate integration guard, contracts-review.md §8; 0059 review ledger, contracts-review.md §9; 0060 accepted supersession reasons, contracts-accounting.md §10; 0061 delegated code_review authority, review acceptance decisions and revocations, contracts-review.md §10; 0062 review launch: blind review briefs bound to review tasks, review sessions recorded by the reservation that launches them, and delegated decisions in the shared review ledger, contracts-review.md §11; 0063 review opportunity openings and assignments in the shared review ledger, so every `--as-of` review, seed and protocol view replays them, contracts-review.md §9; 0065 assignment-policy settings, owner-signed `randomized_assignment` grants and the policy record of assigned decisions, contracts-evaluation.md §9; 0064 replay suite registry, hidden checks and replay candidates, contracts-replay.md; 0066 owner-signed revocations of randomized-assignment grants, contracts-evaluation.md §9; 0067 read indexes for the telemetry projections, `verified_results(submission_id)` and `result_submissions(attempt_id)`, certificate-scale.md §5).
+- **Stores.** Canonical: `<project>/.state/state.db`, migrations 0049–0068 (0052 collector bindings, contracts-collection.md; 0053 candidate groups, contracts-quality.md §3; 0054 review capture, contracts-review.md; 0055 finding triage and duplicate history, contracts-review.md §5; 0056 fix attribution, regressions and role credit, contracts-review.md §6; 0057 review protocols, passes and preregistered experiments, contracts-review.md §7; 0058 seeded defects, recall and the seeded-candidate integration guard, contracts-review.md §8; 0059 review ledger, contracts-review.md §9; 0060 accepted supersession reasons, contracts-accounting.md §10; 0061 delegated code_review authority, review acceptance decisions and revocations, contracts-review.md §10; 0062 review launch: blind review briefs bound to review tasks, review sessions recorded by the reservation that launches them, and delegated decisions in the shared review ledger, contracts-review.md §11; 0063 review opportunity openings and assignments in the shared review ledger, so every `--as-of` review, seed and protocol view replays them, contracts-review.md §9; 0065 assignment-policy settings, owner-signed `randomized_assignment` grants and the policy record of assigned decisions, contracts-evaluation.md §9; 0064 replay suite registry, hidden checks and replay candidates, contracts-replay.md; 0066 owner-signed revocations of randomized-assignment grants, contracts-evaluation.md §9; 0067 read indexes for the telemetry projections, `verified_results(submission_id)` and `result_submissions(attempt_id)`, certificate-scale.md §5; 0068 verifier-owned run metadata: load context and bounded test names/outcomes, contracts-quality.md §6).
   Sidecar: `<project>/.state/telemetry.db`, own sequence under
   `migrations/telemetry/` (per-lane streams; see the lane contracts: e.g.
     `ingest` 0006 tool/exec metadata, 0007 subagent detail, per-source ingest
@@ -651,3 +651,24 @@ reveal/discard lifecycle, the seeded-candidate integration guard and
 M43/M44 (contracts-review.md §5–§8), fleet efficiency M34–M37 with the
 coordinator scope and allocation rule v1, owner-recorded supersession
 reasons (0060) and worker-observed rebases (contracts-accounting.md §10).
+
+## 9. Verifier-owned run metadata (DG6, canonical 0068)
+
+Migration 0068 (`SCHEMA = 68`) adds nullable `verification_runs.metadata`.
+The verifier writes `verification-metadata.v1` in the same immutable run
+transaction. Historical rows remain NULL; exact replay never executes again
+or invents metadata. This is the verifier's own evidence, not a telemetry
+write: collectors still open canonical state read-only. It belongs here
+because a later collector cannot reconstruct execution-time host load or
+per-test outcomes from a canonical verdict. It is advisory metadata, outside
+the trusted receipt digest and every acceptance/reuse decision.
+
+Allowlisted fields: sample time, host one-minute load average, executing
+project verification count, Linux CPU/IO PSI `some avg10`, fixed absence
+reasons, sanitized test name and pass/fail/ignored outcome. Output bodies,
+failure descriptions and XML attributes other than test identity are never
+persisted. Bounds and semantics: [contracts-quality.md §6](contracts-quality.md#6-dg6-passive-verification-flakes).
+Canonical metadata follows canonical retention/backup, never telemetry
+pruning. Empty `verification-load.lock` is an ephemeral verifier-owned lock
+file; live kernel locks are not backup data. No telemetry backup includes
+canonical metadata; sidecar derived copies follow their surviving source.
