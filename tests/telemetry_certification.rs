@@ -926,7 +926,8 @@ fn accounting_fields_match_the_adapter_certificate() {
     // Recorded live evidence registry. Adding an adapter/version requires a
     // reviewed report, not merely a successful invocation of the live test.
     let recorded_live = [("codex", "0.154.0", "docs/telemetry/certificate-live.md"),
-        ("codex", "0.159.2", "docs/telemetry/codex-live-0.159.2.md")];
+        ("codex", "0.159.2", "docs/telemetry/codex-live-0.159.2.md"),
+        ("claude-code", "2.1.286", "docs/telemetry/claude-live-2.1.286.md")];
     for adapter in adapters {
         let claims_live = adapter["fields"].as_array().into_iter().flatten().any(|f| f["certified"] == "live");
         if claims_live {

@@ -3,6 +3,11 @@
 use super::*;
 
 pub const FIXTURE_VERSIONS: &[&str] = &["2.1.3", "2.1.286"];
+/// Versions with a recorded steward live reconciliation (owner-approved).
+pub const LIVE_VERSIONS: &[&str] = &["2.1.286"];
+const LIVE_FIELDS: &[&str] = &["sessionId", "timestamp", "cwd", "version", "type", "message.model", "message.id",
+    "message.usage.input_tokens", "message.usage.output_tokens", "message.usage.cache_creation_input_tokens",
+    "message.usage.cache_read_input_tokens"];
 
 pub(super) fn walk(root: &Path, out: &mut Vec<PathBuf>) {
     if !root.parent().is_some_and(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()))
@@ -29,11 +34,16 @@ pub fn capabilities() -> Value {
         ("message.content.tool_result.tool_use_id", Id), ("message.content.tool_result.is_error", Bool)];
     let fields = source_fields.into_iter().map(|(field, class)| json!({"kind": "line", "field": field,
         "available": true, "basis": match class { Text | Tag => "reported_excerpt", Path => "binding_only_home_redacted", _ => "reported" },
-        "certified": "fixture", "caveat": if field == "cwd" { Some("binding_only") } else { None }})).chain(
+        // Live run of 2.1.286 (docs/telemetry/claude-live-2.1.286.md) observed the
+        // binding inputs, line type, model, message id and the four usage counters.
+        // Tool and sidechain fields stay fixture: the live run used no tools.
+        "certified": if LIVE_FIELDS.contains(&field) { "live" } else { "fixture" },
+        "live_versions": if LIVE_FIELDS.contains(&field) { LIVE_VERSIONS } else { &[] as &[&str] },
+        "caveat": if field == "cwd" { Some("binding_only") } else { None }})).chain(
         ["message.text", "message.thinking", "tool_use.input", "tool_result.content", "toolUseResult", "summary", "user_prompt"].map(|field|
             json!({"kind": "line", "field": field, "available": false, "basis": "unavailable", "certified": "none", "reason": "content_forbidden"})));
-    json!({"adapter": "claude-code", "interface": "session_jsonl", "certified_versions": [], "fixture_versions": FIXTURE_VERSIONS,
-        "accepted_versions": FIXTURE_VERSIONS, "certification": "fixture", "uncertified_version": "cli_version_uncertified",
+    json!({"adapter": "claude-code", "interface": "session_jsonl", "certified_versions": LIVE_VERSIONS, "fixture_versions": FIXTURE_VERSIONS,
+        "accepted_versions": FIXTURE_VERSIONS, "certification": "live", "uncertified_version": "cli_version_uncertified",
         "fields": fields.collect::<Vec<_>>(), "profiles": [], "live_certification": "separate_owner_gated_step"})
 }
 

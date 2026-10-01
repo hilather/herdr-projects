@@ -87,7 +87,16 @@ fn native_claude_usage_tools_sidechains_and_privacy() {
     let capabilities = f.cli_args(&["collectors", "capabilities", "--json"]).0;
     let adapter = capabilities["adapters"].as_array().unwrap().iter().find(|a| a["adapter"] == "claude-code").unwrap();
     assert_eq!(adapter["fixture_versions"], json!(["2.1.3", "2.1.286"]));
-    assert!(adapter["fields"].as_array().unwrap().iter().all(|f| f["certified"] != "live"));
+    // Live only for the fields the 2.1.286 live run observed; tools stay fixture.
+    assert_eq!(adapter["certified_versions"], json!(["2.1.286"]));
+    let live: Vec<&str> = adapter["fields"].as_array().unwrap().iter().filter(|f| f["certified"] == "live")
+        .map(|f| f["field"].as_str().unwrap()).collect();
+    assert_eq!(live, ["sessionId", "timestamp", "cwd", "version", "type", "message.model", "message.id",
+        "message.usage.input_tokens", "message.usage.output_tokens", "message.usage.cache_creation_input_tokens",
+        "message.usage.cache_read_input_tokens"]);
+    assert!(adapter["fields"].as_array().unwrap().iter()
+        .filter(|f| f["field"].as_str().unwrap().contains("tool") || f["field"] == "isSidechain")
+        .all(|f| f["certified"] != "live"));
     no_secrets(&f);
 }
 
