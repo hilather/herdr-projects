@@ -423,7 +423,7 @@ without their own TTL, rebuildable from canonical records and included in
 ordinary sidecar backups. Canonical evidence follows the canonical lifecycle.
 
 `quality flaky [--since MS]` is read-only. `verification_flip_rate.v1`
-(`analytics-registry.v4`, family proxy, activity window, since-only provider)
+(`analytics-registry.v5`, family proxy, activity window, since-only provider)
 is also in `quality report`, `telemetry report` and `query --metric
 verification_flip_rate`. Group key is `(object_format, tree_oid, policy_id,
 policy_digest)` within this project. Numerator: groups containing accepted

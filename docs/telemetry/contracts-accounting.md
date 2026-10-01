@@ -1529,7 +1529,7 @@ instead of the whole ledger as JSON (same counts). Measurements:
 ## 17. DG2: M10 cache-read share and maintained cache totals
 
 Accounting stream **16**, `0016_cache_read_share.sql`; registry
-**analytics-registry.v4**, definition **M10.v1**. Plan doc 07 M10 is
+**analytics-registry.v5**, definition **M10.v1**. Plan doc 07 M10 is
 cache-read input tokens / eligible total input tokens. The exact unreduced
 ratio `"numerator/denominator"` has integer token `numerator` and `denominator`,
 with `cache_write_tokens` shown separately. It makes no monetary savings claim.

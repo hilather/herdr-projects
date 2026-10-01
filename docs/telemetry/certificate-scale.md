@@ -1530,7 +1530,7 @@ and CLI cohort coverage.
 ### 4.15 DG2: maintained M10 cache-read share (100k only)
 
 Branch `telemetry/dg2-m10`, accounting stream **16**, registry
-**analytics-registry.v4**. M10.v1 now reads accepted cache-read/input token
+**analytics-registry.v5**. M10.v1 now reads accepted cache-read/input token
 sums from maintained session aggregates. This extends the P2 read path
 addressing L3; it does not close L3 or certify 1M. **Pending the steward's
 serial 1M certification.** No 1M run was performed.
