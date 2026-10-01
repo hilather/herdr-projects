@@ -106,6 +106,7 @@ const MAPPINGS: &[(&str, &str, &str, &[&str])] = &[
     ),
     ("muse", "model_call", "usage", &["gen_ai.request.model", "gen_ai.provider.name", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "tokens.cached", "duration_ms"]),
     ("muse", "tbh.approval_review.token_usage", "usage", &["token_type"]),
+    ("grok", "grok_code.api_request", "usage", &["model", "input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens", "cache_creation_tokens", "cost_usd_micros", "duration_ms", "turn_number", "stop_reason"]),
     ("grok", "grok_code.token.usage", "usage", &["type", "model"]),
     ("grok", "grok_code.cost.usage", "usage", &["model"]),
     ("grok", "grok_code.session.count", "usage", &[]),
@@ -119,7 +120,7 @@ pub fn capabilities() -> Vec<Value> {
     for harness in ["claude-code", "gemini-cli", "grok", "muse", "codex"] {
         let mut fields = Vec::new();
         for (_, name, _, attrs) in MAPPINGS.iter().filter(|m| m.0 == harness) {
-            for field in attrs.iter().copied().chain(if name.ends_with(".usage") || name.ends_with("token_usage") || harness == "grok" {
+            for field in attrs.iter().copied().chain(if name.ends_with(".usage") || name.ends_with("token_usage") || (harness == "grok" && *name != "grok_code.api_request") {
                 vec![
                     "value",
                     "timeUnixNano",
@@ -300,7 +301,13 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
         let ra = attributes(resource.get("resource").unwrap_or(&json!({})))?;
         let service = ra.get("service.name").and_then(Value::as_str).unwrap_or("");
         let harness = if service == "grok-cli" { "grok" } else if service == "tbh" { "muse" } else { service };
-        let cli_version = ra.get("service.version").and_then(Value::as_str);
+        let service_version = ra.get("service.version").and_then(Value::as_str);
+        let cli_version = if harness == "grok" {
+            // A present client version is authoritative, including an unknown version.
+            ra.get("client.version").map(|v| v.as_str()).unwrap_or_else(|| {
+                service_version.map(|v| v.split_whitespace().next().unwrap_or(""))
+            })
+        } else { service_version };
         let known = matches!(service, "claude-code" | "gemini-cli" | "grok-cli" | "tbh");
         let adapter = if known {
             format!("otlp:{harness}")
@@ -349,7 +356,7 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                 }
                 let mapping = MAPPINGS
                     .iter()
-                    .find(|m| !unsupported && known && m.0 == harness && m.1 == name && metrics == (name.ends_with(".usage") || name.ends_with("token_usage") || m.0 == "grok")
+                    .find(|m| !unsupported && known && m.0 == harness && m.1 == name && metrics == (name.ends_with(".usage") || name.ends_with("token_usage") || (m.0 == "grok" && m.1 != "grok_code.api_request"))
                         && (harness != "grok" || cli_version == Some("1.0.46"))
                         && (harness != "muse" || cli_version == Some("1.4.0-R4161.1")));
                 let points = if unsupported {
@@ -398,6 +405,14 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                         }
                     }
                     if harness == "grok" {
+                        if cli_version == Some("1.0.46") {
+                            // Only the reviewed build-string shape may leave the exporter.
+                            if let Some(build) = service_version.filter(|v| {
+                                v.starts_with("1.0.46 (") && v.ends_with(')')
+                                    && v[8..v.len()-1].chars().all(|c| c.is_ascii_hexdigit())
+                                    && v.len() <= 80
+                            }) { payload["service_build"] = json!(build); }
+                        }
                         payload["cli_version"] = if cli_version == Some("1.0.46") { json!("1.0.46") } else { Value::Null };
                         if cli_version != Some("1.0.46") {
                             payload["mapping_certified"] = json!("none");
@@ -410,7 +425,6 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                             payload["native_name"] = name;
                         }
                     }
-                    if conflict { payload["reason"] = json!("cross_attempt_quarantined"); }
                     let mut allowed = BTreeMap::new();
                     if let Some((_, native, kind, fields)) = mapping {
                         payload["native_name"] = json!(native);
@@ -418,7 +432,7 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                         for field in *fields {
                             if let Some(raw) = attrs.get(*field) {
                                 let safe = match *field {
-                                    "model" | "tool_name" | "function_name" | "error_category" | "outcome" | "gen_ai.request.model" | "gen_ai.provider.name" => identifier(raw),
+                                    "stop_reason" | "model" | "tool_name" | "function_name" | "error_category" | "outcome" | "gen_ai.request.model" | "gen_ai.provider.name" => identifier(raw),
                                     "token_type" => raw.as_str().filter(|s| matches!(*s, "total" | "input" | "cached_input" | "output")).map(|s| json!(s)),
                                     "type" => raw
                                         .as_str()
@@ -453,6 +467,41 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                             }
                         }
                         payload["attributes"] = json!(allowed);
+                        if harness == "grok" {
+                            if metrics {
+                                if *kind == "usage" {
+                                    // Reconciliation observations never count as API usage.
+                                    payload["kind"] = json!("unmapped");
+                                    payload["reason"] = json!("usage_reconciliation_only");
+                                }
+                            } else {
+                                let session = attrs.get("session.id").and_then(Value::as_str).filter(|s| !s.is_empty());
+                                let sequence = attrs.get("event.sequence").and_then(integer).filter(|n| *n >= 0);
+                                let prompt = attrs.get("prompt.id").and_then(Value::as_str).filter(|s| !s.is_empty());
+                                let turn = attrs.get("turn_number").and_then(integer).filter(|n| *n >= 0);
+                                let key = session.zip(sequence).map(|(s, n)| json!(["session_sequence", s, n, prompt, turn]))
+                                    .or_else(|| prompt.zip(turn).map(|(p, n)| json!(["prompt_turn", p, n])));
+                                if let Some(key) = key {
+                                    payload["usage_source_key"] = json!(format!("{:x}", Sha256::digest(serde_json::to_vec(&key)?)));
+                                    payload["usage_authority"] = json!("api_request");
+                                    let input = payload["attributes"]["input_tokens"].as_u64().context("invalid Grok input")?;
+                                    let output = payload["attributes"]["output_tokens"].as_u64().context("invalid Grok output")?;
+                                    let cached = payload["attributes"]["cache_read_tokens"].as_u64().context("invalid Grok cache")?;
+                                    let creation = payload["attributes"]["cache_creation_tokens"].as_u64().context("invalid Grok cache creation")?;
+                                    let reasoning = payload["attributes"]["reasoning_tokens"].as_u64().context("invalid Grok reasoning")?;
+                                    ensure!(payload["attributes"]["cost_usd_micros"].as_u64().is_some(), "invalid Grok cost");
+                                    ensure!(cached.checked_add(creation).is_some_and(|n| n <= input), "Grok cache exceeds input");
+                                    ensure!(reasoning <= output, "Grok reasoning exceeds output");
+                                    payload["attributes"]["cached_input_tokens"] = json!(cached);
+                                    payload["attributes"]["cache_write_input_tokens"] = payload["attributes"]["cache_creation_tokens"].clone();
+                                    payload["attributes"]["reasoning_output_tokens"] = payload["attributes"]["reasoning_tokens"].clone();
+                                    payload["attributes"]["total_tokens"] = json!(input.checked_add(output).context("Grok token overflow")?);
+                                } else {
+                                    payload["kind"] = json!("unmapped");
+                                    payload["reason"] = json!("missing_usage_identity");
+                                }
+                            }
+                        }
                         if metrics {
                             if entry.get("histogram").is_some() {
                                 let count = point.get("count").and_then(|n| n.as_u64().or_else(|| n.as_str()?.parse::<u64>().ok())).context("invalid histogram count")?;
@@ -500,6 +549,7 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                         .collect();
                     payload["unmapped_attribute_keys"] = json!(keys);
                     payload["unmapped_resource_keys"] = json!(resource_keys);
+                    if conflict { payload["reason"] = json!("cross_attempt_quarantined"); }
                     records.push(payload);
                 }
             }
@@ -512,7 +562,11 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
     let mut written = 0;
     for record in records {
         let text = serde_json::to_string(&record)?;
-        let identity = format!("sha256:{:x}", Sha256::digest(text.as_bytes()));
+        let identity = if record["usage_authority"] == "api_request" {
+            format!("grok-api:{:x}", Sha256::digest(serde_json::to_vec(&json!([
+                record["attempt_id"], record["binding"], record["usage_source_key"]
+            ]))?))
+        } else { format!("sha256:{:x}", Sha256::digest(text.as_bytes())) };
         written += tx.execute("INSERT OR IGNORE INTO otlp_records(identity,adapter,attempt_id,binding,kind,source_trust,certified,record,observed_unix_ms) VALUES(?1,?2,?3,?4,?5,'collector_observed','fixture',?6,?7)",
             rusqlite::params![identity,record["adapter"].as_str(),record["attempt_id"].as_str(),record["binding"].as_str(),record["kind"].as_str(),text,now])?;
     }

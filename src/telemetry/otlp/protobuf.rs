@@ -137,7 +137,12 @@ fn decode(
             Message(child) => decode(raw, child, depth + 1, budget, discard || name == "body")?,
             String => {
                 let text = std::str::from_utf8(raw).context("invalid UTF-8")?;
-                if discard { Value::Null } else { json!(text) }
+                // Some exporters put the event name in the string body rather
+                // than eventName. Preserve only this reviewed literal; never
+                // retain arbitrary log text or nested body strings.
+                if !discard || (message == "any" && name == "stringValue" && text == "grok_code.api_request") {
+                    json!(text)
+                } else { Value::Null }
             }
             Int => json!((numeric as i64).to_string()),
             Bool => {
@@ -173,7 +178,9 @@ fn decode(
             ensure!(
                 out.insert(
                     name.into(),
-                    if name == "body" { Value::Null } else { value }
+                    if name == "body" && value["stringValue"] != "grok_code.api_request" {
+                        Value::Null
+                    } else { value }
                 )
                 .is_none(),
                 "duplicate protobuf field"

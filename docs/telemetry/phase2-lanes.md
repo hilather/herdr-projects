@@ -437,9 +437,15 @@ Cards (gaps that stop those questions being answered):
   - **Done (DG4e): Grok OTLP mapping.** The owner uses it (first wave). Identified 2026-10-01: xAI's
     official Grok Build CLI (`@xai-official/grok` 1.0.46 alpha, a native binary in
     an npm package). `otlp:grok` is fixture-only for 1.0.46, with exact
-    resource attempt binding and metadata-only counters. Native source is none:
+    resource or scoped-token attempt binding and metadata-only API usage.
+    LC4 accepts `client.version=1.0.46` with the appended service build hash;
+    API-request logs dedupe by session/sequence (or prompt/turn), while metrics
+    remain reconciliation diagnostics. Cache is a subset of full API input;
+    headless stdout input is uncached and normalized by adding cache buckets.
+    Native source is none:
     local paths are evident but the usage-file schema is not established.
-    Export requires protobuf/gRPC conversion and injected binding; see
+    DG4h accepts HTTP/protobuf directly with per-attempt bearer tokens;
+    gRPC remains unsupported. Live certification awaits the steward rerun; see
     contracts-collection.md DG4e.
   - **Done (DG4g): Muse Code 1.4.0-R4161.1 installed-format review.**
     `otlp:muse` fixture-only model-call logs and approval-review token counters;

@@ -830,7 +830,7 @@ fn mixed_unsupported_metric_types_preserve_usage_and_match_json() {
         rows.as_array()
             .unwrap()
             .iter()
-            .filter(|r| r["native_name"] == "grok_code.token.usage" && r["kind"] != "unmapped")
+            .filter(|r| r["native_name"] == "grok_code.token.usage" && r["reason"] == "usage_reconciliation_only")
             .count(),
         usage_count
     );
@@ -1341,4 +1341,166 @@ fn http_protobuf_attempt_token_binding_auth_and_project_token_unchanged() {
         10
     );
     privacy_scan(&f, &[attempt_token, "GROK_SECRET_CONTENT"]);
+}
+
+// Real 1.0.46 capture structure, with synthetic identity values and timestamps.
+// Histogram bucket contents were not captured and remain keys-only diagnostics.
+#[test]
+fn grok_live_shape_protobuf_two_turns_uses_api_calls_without_pii_or_double_count() {
+    for metrics_first in [false, true] {
+        let f = Fixture::reserved();
+        let minted = otlp::mint_attempt_token(&f.project, &f.attempt, 600).unwrap();
+        let token = minted["token"].as_str().unwrap();
+        for turn in 1..=2 {
+            for metrics in if metrics_first { [true, false] } else { [false, true] } {
+                let signal = if metrics { "metrics" } else { "logs" };
+                let mut root: Value = serde_json::from_slice(&fs::read(format!(
+                    "{}/tests/fixtures/telemetry/grok-1.0.46/turn-{turn}-{signal}.json",
+                    env!("CARGO_MANIFEST_DIR")
+                )).unwrap()).unwrap();
+                if metrics_first && !metrics {
+                    for log in root["resourceLogs"][0]["scopeLogs"][0]["logRecords"].as_array_mut().unwrap() {
+                        log["eventName"] = log["body"]["stringValue"].clone();
+                        log.as_object_mut().unwrap().remove("body");
+                    }
+                }
+                let endpoint = if metrics { "/v1/metrics" } else { "/v1/logs" };
+                let bytes = pb_request(&root, metrics);
+                assert!(otlp::ingest_attempt(&f.project, endpoint, &bytes, "application/x-protobuf", token).unwrap() > 0);
+                assert_eq!(otlp::ingest_attempt(&f.project, endpoint, &bytes, "application/x-protobuf", token).unwrap(), 0);
+                if !metrics {
+                    // Replay the same source event with a changed exporter timestamp.
+                    let mut replay = root.clone();
+                    for log in replay["resourceLogs"][0]["scopeLogs"][0]["logRecords"].as_array_mut().unwrap() {
+                        log["timeUnixNano"] = json!("9999999999");
+                    }
+                    otlp::ingest_attempt(&f.project, endpoint, &pb_request(&replay, false), "application/x-protobuf", token).unwrap();
+                }
+            }
+        }
+        let rows = f.cli_args(&["otlp", "records"]).0;
+        let rows = rows.as_array().unwrap();
+        assert!(rows.iter().all(|r| r["cli_version"] == "1.0.46" && r["binding"] == "exact" && r["attempt_id"] == f.attempt));
+        assert!(rows.iter().all(|r| r["service_build"] == "1.0.46 (2765805b9442)"));
+        let mut usage: Vec<_> = rows.iter().filter(|r| r["kind"] == "usage").collect();
+        usage.sort_by_key(|r| r["attributes"]["turn_number"].as_u64().unwrap());
+        assert_eq!(usage.len(), 2);
+        for (row, input, cache, duration, cost) in [
+            (usage[0], 15426, 1280, 6377, 9778),
+            (usage[1], 15468, 5120, 1921, 7587),
+        ] {
+            let a = &row["attributes"];
+            assert_eq!(row["usage_authority"], "api_request");
+            assert_eq!(a["model"], "grok-4.5");
+            assert_eq!(a["input_tokens"], input);
+            assert_eq!(a["cached_input_tokens"], cache);
+            assert_eq!(a["cache_write_input_tokens"], 0);
+            assert_eq!(a["output_tokens"], 14);
+            assert_eq!(a["reasoning_output_tokens"], 13);
+            assert_eq!(a["total_tokens"], input + 14);
+            assert_eq!(a["duration_ms"], duration);
+            assert_eq!(a["cost_usd_micros"], cost);
+            assert_eq!(a["stop_reason"], "stop");
+        }
+        for (field, total) in [("input_tokens", 30894), ("cached_input_tokens", 6400),
+            ("output_tokens", 28), ("reasoning_output_tokens", 26), ("total_tokens", 30922), ("cost_usd_micros", 17365)] {
+            assert_eq!(usage.iter().map(|r| r["attributes"][field].as_u64().unwrap()).sum::<u64>(), total);
+        }
+        let metrics: Vec<_> = rows.iter().filter(|r| r["reason"] == "usage_reconciliation_only").collect();
+        assert_eq!(metrics.iter().filter(|r| r["native_name"] == "grok_code.token.usage").count(), 8);
+        assert_eq!(metrics.iter().filter(|r| r["attributes"]["type"] == "input").map(|r| r["value"].as_u64().unwrap()).sum::<u64>(), 30894);
+        assert!((metrics.iter().filter(|r| r["native_name"] == "grok_code.cost.usage").map(|r| r["value"].as_f64().unwrap()).sum::<f64>() - 0.01736584).abs() < 1e-10);
+        for row in rows {
+            for key in ["user.email", "user.id", "team.id", "client_identifier", "prompt_length", "response_length"] {
+                assert!(row["attributes"].get(key).is_none());
+            }
+        }
+        privacy_scan(&f, &["lc4-planted-secret@example.invalid"]);
+    }
+}
+
+#[test]
+fn grok_build_version_fallback_and_request_identity_are_fail_closed() {
+    let f = Fixture::reserved();
+    let minted = otlp::mint_attempt_token(&f.project, &f.attempt, 600).unwrap();
+    let token = minted["token"].as_str().unwrap();
+    let original: Value = serde_json::from_slice(include_bytes!("fixtures/telemetry/grok-1.0.46/turn-1-logs.json")).unwrap();
+    let mut root = original.clone();
+    root["resourceLogs"][0]["resource"]["attributes"].as_array_mut().unwrap().retain(|a| a["key"] != "client.version");
+    otlp::ingest_attempt(&f.project, "/v1/logs", &pb_request(&root, false), "application/x-protobuf", token).unwrap();
+    assert_eq!(otlp::records(&f.project).unwrap().as_array().unwrap().iter().filter(|r| r["kind"] == "usage").count(), 1);
+    for attr in root["resourceLogs"][0]["resource"]["attributes"].as_array_mut().unwrap() {
+        if attr["key"] == "service.version" { attr["value"]["stringValue"] = json!("1.0.47 (2765805b9442)"); }
+    }
+    otlp::ingest_attempt(&f.project, "/v1/logs", &pb_request(&root, false), "application/x-protobuf", token).unwrap();
+    root = original.clone();
+    for attr in root["resourceLogs"][0]["resource"]["attributes"].as_array_mut().unwrap() {
+        if attr["key"] == "client.version" { attr["value"]["stringValue"] = json!("1.0.47"); }
+    }
+    otlp::ingest_attempt(&f.project, "/v1/logs", &pb_request(&root, false), "application/x-protobuf", token).unwrap();
+    root = original;
+    for log in root["resourceLogs"][0]["scopeLogs"][0]["logRecords"].as_array_mut().unwrap() {
+        log["attributes"].as_array_mut().unwrap().retain(|a| !["session.id", "event.sequence", "prompt.id"].contains(&a["key"].as_str().unwrap()));
+    }
+    otlp::ingest_attempt(&f.project, "/v1/logs", &pb_request(&root, false), "application/x-protobuf", token).unwrap();
+    let records = otlp::records(&f.project).unwrap();
+    let rows = records.as_array().unwrap();
+    assert_eq!(rows.iter().filter(|r| r["kind"] == "usage").count(), 1);
+    assert!(rows.iter().any(|r| r["reason"] == "cli_version_uncertified"));
+    assert!(rows.iter().any(|r| r["reason"] == "missing_usage_identity" && r["kind"] == "unmapped"));
+    privacy_scan(&f, &["lc4-planted-secret@example.invalid"]);
+}
+
+#[test]
+fn grok_prompt_turn_fallback_retains_cache_creation_and_rejects_invalid_usage_atomically() {
+    let f = Fixture::reserved();
+    let minted = otlp::mint_attempt_token(&f.project, &f.attempt, 600).unwrap();
+    let token = minted["token"].as_str().unwrap();
+    let mut root: Value = serde_json::from_slice(include_bytes!("fixtures/telemetry/grok-1.0.46/turn-1-logs.json")).unwrap();
+    let logs = root["resourceLogs"][0]["scopeLogs"][0]["logRecords"].as_array_mut().unwrap();
+    logs.retain(|r| r["body"]["stringValue"] == "grok_code.api_request");
+    let attrs = logs[0]["attributes"].as_array_mut().unwrap();
+    attrs.retain(|a| !["session.id", "event.sequence"].contains(&a["key"].as_str().unwrap()));
+    for attr in attrs {
+        if attr["key"] == "cache_creation_tokens" { attr["value"]["intValue"] = json!("5"); }
+    }
+    let bytes = pb_request(&root, false);
+    assert_eq!(otlp::ingest_attempt(&f.project, "/v1/logs", &bytes, "application/x-protobuf", token).unwrap(), 1);
+    assert_eq!(otlp::ingest_attempt(&f.project, "/v1/logs", &bytes, "application/x-protobuf", token).unwrap(), 0);
+    let before = f.cli_args(&["otlp", "records"]).0;
+    assert_eq!(before[0]["kind"], "usage");
+    assert_eq!(before[0]["attributes"]["input_tokens"], 15426);
+    assert_eq!(before[0]["attributes"]["cache_write_input_tokens"], 5);
+    assert_eq!(before[0]["attributes"]["total_tokens"], 15440);
+    for attr in root["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["attributes"].as_array_mut().unwrap() {
+        if attr["key"] == "cache_read_tokens" { attr["value"]["intValue"] = json!("15426"); }
+    }
+    assert!(otlp::ingest_attempt(&f.project, "/v1/logs", &pb_request(&root, false), "application/x-protobuf", token).is_err());
+    assert_eq!(otlp::records(&f.project).unwrap(), before);
+    privacy_scan(&f, &["lc4-planted-secret@example.invalid"]);
+}
+
+#[test]
+fn grok_continuation_sequence_restart_does_not_merge_distinct_api_calls() {
+    let f = Fixture::reserved();
+    let minted = otlp::mint_attempt_token(&f.project, &f.attempt, 600).unwrap();
+    let token = minted["token"].as_str().unwrap();
+    let mut root: Value = serde_json::from_slice(include_bytes!("fixtures/telemetry/grok-1.0.46/turn-1-logs.json")).unwrap();
+    let logs = root["resourceLogs"][0]["scopeLogs"][0]["logRecords"].as_array_mut().unwrap();
+    logs.retain(|r| r["body"]["stringValue"] == "grok_code.api_request");
+    assert_eq!(otlp::ingest_attempt(&f.project, "/v1/logs", &pb_request(&root, false), "application/x-protobuf", token).unwrap(), 1);
+    // A resumed headless process restarts its event sequence. Prompt/turn
+    // context keeps an equally numbered call in the same session distinct.
+    for attr in root["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["attributes"].as_array_mut().unwrap() {
+        if attr["key"] == "turn_number" { attr["value"]["intValue"] = json!("1"); }
+        if attr["key"] == "prompt.id" { attr["value"]["stringValue"] = json!("resumed-prompt-fixture"); }
+    }
+    let bytes = pb_request(&root, false);
+    assert_eq!(otlp::ingest_attempt(&f.project, "/v1/logs", &bytes, "application/x-protobuf", token).unwrap(), 1);
+    assert_eq!(otlp::ingest_attempt(&f.project, "/v1/logs", &bytes, "application/x-protobuf", token).unwrap(), 0);
+    let records = f.cli_args(&["otlp", "records"]).0;
+    assert_eq!(records.as_array().unwrap().len(), 2);
+    assert!(records.as_array().unwrap().iter().all(|r| r["kind"] == "usage"));
+    assert_eq!(records.as_array().unwrap().iter().map(|r| r["attributes"]["input_tokens"].as_u64().unwrap()).sum::<u64>(), 30852);
+    privacy_scan(&f, &["lc4-planted-secret@example.invalid"]);
 }

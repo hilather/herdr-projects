@@ -157,7 +157,7 @@ fn counters(v: &Value) -> Value {
         ("cached_input_tokens", "cache_read_input_tokens"),
         ("cache_write_input_tokens", "cache_creation_input_tokens"),
         ("output_tokens", "output_tokens"),
-        ("reasoning_output_tokens", "reasoning_output_tokens"),
+        ("reasoning_output_tokens", "reasoning_tokens"),
         ("total_tokens", "total_tokens"),
     ];
     Value::Object(
@@ -186,7 +186,7 @@ fn own_stdout(bytes: &[u8]) -> Vec<Value> {
         .filter_map(|v| {
             let source = v.get("usage").or_else(|| v.pointer("/payload/thread_token_usage")).unwrap_or(&Value::Null);
             let usage = counters(source);
-            let unknown: Vec<_> = source.as_object().into_iter().flat_map(|o| o.keys()).filter(|k| !COUNTERS.contains(&k.as_str()) && !["cache_read_input_tokens", "cache_creation_input_tokens"].contains(&k.as_str())).cloned().collect();
+            let unknown: Vec<_> = source.as_object().into_iter().flat_map(|o| o.keys()).filter(|k| !COUNTERS.contains(&k.as_str()) && !["cache_read_input_tokens", "cache_creation_input_tokens", "reasoning_tokens"].contains(&k.as_str())).cloned().collect();
             let model = v.get("model").and_then(Value::as_str).or_else(|| {
                 // A multi-model result has no single authoritative model.
                 v.get("modelUsage").and_then(Value::as_object)
@@ -403,6 +403,9 @@ fn live(kind: &str) {
                 .into_iter()
                 .map(|s| s.replace("{prompt}", &prompt)),
         );
+        if kind == "grok" && !template.contains("--output-format") {
+            c.args(["--output-format", "json"]);
+        }
         if let Some(endpoint) = &endpoint {
             c.env(
                 "OTEL_EXPORTER_OTLP_HEADERS",
@@ -425,11 +428,11 @@ fn live(kind: &str) {
         own.extend(own_stdout(&run(c, f.tmp.path(), &format!("turn-{n}"))));
     }
     drop(receiver);
-    let file_usage = own_files(kind, &f.home);
+    let file_usage = if kind == "grok" { Vec::new() } else { own_files(kind, &f.home) };
     if !file_usage.is_empty() {
         own = file_usage;
     }
-    if kind == "claude" {
+    if matches!(kind, "claude" | "grok") {
         for record in &mut own {
             record["reported_counters"] = record["counters"].clone();
             let c = &mut record["counters"];
@@ -450,7 +453,7 @@ fn live(kind: &str) {
     let attempts = f.cli_args(&["attempts", "--json"]).0;
     let entries = f.cli_args(&["accounting", "entries"]).0;
     let counted = support::telemetry::accepted_delta_entries(&entries);
-    let records: Vec<Value> = counted.iter().map(|e| counters(&e["native"])).collect();
+    let mut records: Vec<Value> = counted.iter().map(|e| counters(&e["native"])).collect();
     let mut totals = BTreeMap::<String, u64>::new();
     for entry in counted {
         let record = counters(&entry["native"]);
@@ -460,6 +463,44 @@ fn live(kind: &str) {
             }
         }
     }
+    let otlp = f.cli_args(&["otlp", "records"]).0;
+    if kind == "grok" {
+        totals.clear();
+        records = otlp.as_array().into_iter().flatten()
+            .filter(|r| r["kind"] == "usage" && r["usage_authority"] == "api_request"
+                && r["attempt_id"] == f.attempt && r["binding"] == "exact")
+            .map(|r| counters(&r["attributes"])).collect();
+        for record in &records {
+            for key in COUNTERS {
+                if let Some(n) = record[key].as_u64() {
+                    *totals.entry(key.into()).or_default() += n;
+                }
+            }
+        }
+    }
+    let mut metric_totals = BTreeMap::<String, u64>::new();
+    if kind == "grok" {
+        for record in otlp.as_array().into_iter().flatten().filter(|r|
+            r["reason"] == "usage_reconciliation_only" && r["attempt_id"] == f.attempt
+                && r["binding"] == "exact" && r["native_name"] == "grok_code.token.usage") {
+            // Only DELTA exports can be summed across the two turns.
+            if record["aggregationTemporality"] != 1 { continue; }
+            let key = match record["attributes"]["type"].as_str() {
+                Some("input") => "input_tokens",
+                Some("cache_read") => "cached_input_tokens",
+                Some("cache_creation") => "cache_write_input_tokens",
+                Some("output") => "output_tokens",
+                Some("reasoning") => "reasoning_output_tokens",
+                _ => continue,
+            };
+            if let Some(n) = record["value"].as_u64() {
+                *metric_totals.entry(key.into()).or_default() += n;
+            }
+        }
+    }
+    let metric_differences: BTreeMap<_, _> = metric_totals.iter().map(|(key, n)| (
+        key.clone(), i128::from(*n) - i128::from(*totals.get(key).unwrap_or(&0))
+    )).collect();
     let mut reported = BTreeMap::<String, u64>::new();
     for record in &own {
         for key in COUNTERS {
@@ -487,7 +528,6 @@ fn live(kind: &str) {
                 .count();
         }
     }
-    let otlp = f.cli_args(&["otlp", "records"]).0;
     let bindings = f.cli_args(&["collectors", "bindings"]).0;
     // Only numeric counters and declared diagnostic keys leave scratch.
     let mut keys = Vec::new();
@@ -558,10 +598,10 @@ fn live(kind: &str) {
             a["attempt_id"] == f.attempt && a["usage"]["records"].as_u64().unwrap_or(0) > 0
         });
     let report = json!({"harness":kind,"version":version,"turns":if std::env::var_os("HERDR_LIVE_RESUME_ARGS").is_some(){2}else{1},
-        "usage_records":records,"otlp_usage_records":otlp_counts,"ledger_totals":totals,"harness_usage":if own.is_empty(){json!("not_reported")}else{json!(own)},
-        "differences":differences,"unmapped_keys":keys,"binding_outcome":if quarantined{"quarantined"}else if bound{"bound"}else{"unbound"},
+        "usage_records":records,"otlp_usage_records":otlp_counts,"ledger_totals":if kind == "grok" {json!({})} else {json!(totals)},"usage_totals":totals,"harness_usage":if own.is_empty(){json!("not_reported")}else{json!(own)},
+        "differences":differences,"metric_reconciliation":{"totals":metric_totals,"differences":metric_differences},"unmapped_keys":keys,"binding_outcome":if quarantined{"quarantined"}else if bound{"bound"}else{"unbound"},
         "privacy":{"marker":MARKER,"sidecar_hits":hits},"attempt_query_observed":attempts["attempts"].as_array().is_some(),
-        "binding_query_observed":!bindings.is_null(),"certification_changed":false,"evidence_state":if bound && !own.is_empty() && differences.values().all(|v| v == &json!(0)) && hits == 0 {"review_required"} else {"incomplete"}});
+        "binding_query_observed":!bindings.is_null(),"certification_changed":false,"evidence_state":if bound && !own.is_empty() && (kind != "grok" || !records.is_empty()) && metric_differences.values().all(|v| *v == 0) && differences.values().all(|v| v == &json!(0)) && hits == 0 {"review_required"} else {"incomplete"}});
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = fs::OpenOptions::new()

@@ -1836,7 +1836,10 @@ This mapping is fixture-certified; live emission remains unverified.
 The reviewed mapping declaration generates version-aware capabilities:
 `fixture_versions` and `accepted_versions` are `["1.0.46"]`, and
 `certified_versions` is empty. Resource `service.name` must be `grok-cli`
-and `service.version` must be exactly `1.0.46`. Missing/other versions retain
+and the semver must be exactly `1.0.46`: use `client.version` when present,
+otherwise the leading whitespace-delimited semver of `service.version`.
+The reviewed `1.0.46 (<hex-build>)` full string is diagnostics only.
+Missing/other versions retain
 only unmapped diagnostics with `cli_version_uncertified`; arbitrary version
 values are dropped. The durable stream's `certified=fixture` denotes its
 synthetic sanitizer certificate; these diagnostics explicitly carry
@@ -1844,10 +1847,10 @@ synthetic sanitizer certificate; these diagnostics explicitly carry
 
 | Metric | Stored kind | Allowlisted attributes / unit |
 | --- | --- | --- |
-| `grok_code.token.usage` | usage | `type`: input/output/reasoning/cache_read/cache_creation; `model`; `{token}` |
-| `grok_code.cost.usage` | usage | `model`; numeric value in USD |
-| `grok_code.session.count` | usage | no attributes; `{session}` |
-| `grok_code.turn.count` | usage | `model`, `outcome`: completed/cancelled/error; `{turn}` |
+| `grok_code.token.usage` | reconciliation diagnostic | `type`: input/output/reasoning/cache_read/cache_creation; `model`; `{token}` |
+| `grok_code.cost.usage` | reconciliation diagnostic | `model`; numeric value in USD |
+| `grok_code.session.count` | reconciliation diagnostic | no attributes; `{session}` |
+| `grok_code.turn.count` | reconciliation diagnostic | `model`, `outcome`: completed/cancelled/error; `{turn}` |
 | `grok_code.tool.usage` | tool | `tool_name`, reported excerpt `outcome`; `{call}` |
 | `grok_code.error.count` | tool | `error_category`, `model`; `{error}` |
 
@@ -1856,9 +1859,11 @@ cumulative temporality, and reviewed units. They are independent reported
 observations, not additions to accounting totals or estimated cost. Unknown
 token categories stay unmapped; unknown attribute/resource keys are retained
 only as keys. Model/tool/error/outcome identifiers use bounded sanitized excerpts.
-Prompts, responses, arguments, outputs, commands, file contents and identity
-values are never stored or hashed. Exact resource `herdr.attempt_id` is the
-only binding authority: no session-id, cwd, home, time or model inference.
+Prompts, responses, arguments, outputs, commands, file contents and user/team
+identity values are never stored or hashed. Session/prompt identifiers are
+used only in a one-way request dedupe digest, never for binding. Exact resource
+`herdr.attempt_id` or a scoped DG4h bearer token is the binding authority:
+no session-id, cwd, home, time or model inference.
 Missing binding stays unbound; unknown attempt values are dropped.
 
 ### Native source, retention and backup
@@ -1872,7 +1877,7 @@ native collection from those fragments would guess persisted fields. No
 execution-home traversal or operator-home fallback is added.
 
 No schema change or new table is needed. Sanitized rows share existing
-`otlp_records` and stream migration version 0002. DG4a digest dedupe, atomic
+`otlp_records` and stream migration version 0003. DG4a digest dedupe, atomic
 writes and resource binding remain unchanged. Retention class
 `sidecar.otlp` remains source-of-truth **retain**; full sidecar backups include
 these rows and stream version, with exporter tokens external to backups.
@@ -1889,6 +1894,91 @@ fixture-only capabilities and zero secret hits in rows and SQLite/WAL/SHM.
 The existing Claude/Gemini assertions, transport tests and retention/backup
 workflow run alongside it. Certification requires every non-Codex adapter to
 have no live fields and explicitly requires `otlp:grok` to be advertised.
+
+### LC4: real 1.0.46 export structure (fixture certification only)
+
+The steward supplied `tests/fixtures/telemetry/grok-1.0.46/live-two-turn-otlp-structure.txt`
+from an owner-approved two-turn run. No agent CLI was run for LC4 and no
+owner agent data was accessed. Resource versions are `client.version=1.0.46`
+and `service.version=1.0.46 (2765805b9442)`. The exact semver gate remains
+fixture-certified; the certification registry is not promoted to live.
+
+`grok_code.api_request` logs are the single authoritative usage source.
+The event name may be the protobuf `eventName` or the exact reviewed string
+body `grok_code.api_request`; every other body is discarded.
+Allowlisted fields are model, input/output/reasoning/cache-read/cache-creation
+counts, integer `cost_usd_micros`, duration, stop reason and turn number.
+Canonical counter aliases are also stored for the live comparison. Replay
+identity is scoped to attempt and binding, then a digest of `(session.id,
+event.sequence)` plus available prompt/turn context (sequences restart on
+headless continuation), falling back to `(prompt.id, turn_number)`. Re-exporting
+with different timestamps cannot count the request twice. Missing both keys
+is `missing_usage_identity`, with no authoritative usage. These identifiers
+are not binding authorities. No user email/id, team id or client identifier
+is stored or hashed. Unknown events remain keys-only; prompt/response lengths
+are not allowlisted.
+
+Token/cost/session/turn metrics are sanitized reconciliation observations,
+stored with `kind=unmapped` and `reason=usage_reconciliation_only`, not usage
+records. There is deliberately no automatic metric fallback: mixing sources
+across separate HTTP exports cannot establish per-call non-overlap. They do
+not contribute to accounting totals. Existing tool/error mappings remain tool
+observations. Other histograms remain keys-only diagnostics.
+
+Normalization: API `input_tokens` is full prompt input, including cached
+input; cache-read and cache-creation are subsets, not additional input.
+Reasoning is a subset of output. The installed binary's embedded Output
+Formats / Token field policy explicitly says only the headless projector
+subtracts cache: stdout `usage.input_tokens` is **uncached only**, and stdout
+`total_tokens = input_tokens + cache_read_input_tokens + cache_creation_input_tokens + output_tokens`.
+Its example 7210 input + 41000 cache + 1893 output = 50103 total confirms the
+stdout rule. The harness adds stdout cache buckets back into input, retains
+reasoning separately, and reads model from the single `modelUsage` key when
+there is no top-level model. It requests `--output-format json` and uses
+stdout rather than a Grok home-file projection. The live report compares
+only bound authoritative API rows against stdout, reports their `usage_totals`
+separately from the accounting ledger, and cross-checks DELTA token metrics
+through `metric_reconciliation` without counting them.
+
+Expected API totals for the supplied two turns: full input **30,894**, cache
+read **6,400**, cache creation **0**, output **28**, reasoning **26**, total
+**30,922**, reported cost **17,365 micro-USD**. Metric cost totals **0.01736584
+USD**; its sub-micro precision is retained only for reconciliation, never
+added to the integer log cost. Public scoped-token protobuf ingest and CLI
+record queries exercise both export orders, retries, changed replay timestamps,
+version precedence/fallback and planted email secrets with SQLite/WAL/SHM scans.
+Fixture histogram point cardinalities match the capture; bucket/count values
+were not supplied, so deterministic zero placeholders test keys-only handling.
+Existing `sidecar.otlp` retention/backup classification is unchanged; no table
+or schema change is introduced. Live certification remains the steward's rerun.
+
+### LC4 sandbox validation (2026-10-01)
+
+All **21** `tests/telemetry*.rs` suites ran with `TMPDIR=$PWD/target/tmp` and
+`cargo test --locked --offline -j 3 --features state-store`. Final outcomes,
+including the final OTLP/live rerun and serial scale rerun: **227 passed,
+7 socket-only failures, 17 ignored**. All 15 non-socket OTLP tests passed;
+the four owner-gated live tests stayed ignored. Clippy ran with
+`cargo clippy --locked --offline -j 3 --features state-store --all-targets`:
+exit 0, no warnings in changed lines; existing warnings elsewhere remain.
+No live agent CLI or owner data directory was accessed, and certification
+was not promoted.
+
+Socket-only failures (`Operation not permitted`, no workaround):
+
+- `telemetry::attempts_show_attention_summary`
+- `telemetry_accounting::attention_intervals_union_and_censor`
+- `telemetry_health::recommendations_and_notices_change_no_canonical_state_and_no_dispatch`
+- `telemetry_otlp::http_auth_limits_malformed_and_replay`
+- `telemetry_otlp::http_protobuf_attempt_token_binding_auth_and_project_token_unchanged`
+- `telemetry_otlp::http_request_rate_is_bounded`
+- `telemetry_workspace::thread_start_records_the_dispatch_reason_and_the_sidebar_suffix`
+
+The first broad run additionally failed `telemetry_scale::scale_gates_hold_under_load`
+(database lock contention) and
+`telemetry_scale::ticker_collects_recorded_sources_before_observing_a_new_sidecar`
+(missing fixture files). Both passed when the full scale suite was rerun
+with `-- --test-threads 1` after the other verification finished.
 
 ### DG4e sandbox validation
 
@@ -2201,6 +2291,10 @@ Accounting entries expose cumulative entries alongside deltas. Live reports
 must select delta basis before counting records or summing accepted counters.
 
 ## DG4h: OTLP/HTTP protobuf and per-attempt credentials
+
+LC4 additionally accepts Grok’s full build resource string through its exact
+client-semver gate and scoped-token protobuf fixtures, with request-authoritative
+usage and metrics-only reconciliation as specified in DG4e.
 
 DG4h replaces LC0's external protobuf-to-JSON bridge with direct product
 receiver ingestion. No crates or agent executions are added. Both JSON and

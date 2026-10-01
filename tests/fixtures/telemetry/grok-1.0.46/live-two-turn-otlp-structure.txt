@@ -1,0 +1,36 @@
+== 001_v1_logs.x-protobuf
+  log event grok_code.session_start {'event.sequence': 0, 'session.id': '<str>', 'model': "'grok-4.5'", 'permission_mode': "'always_approve'", 'mcp_server_count': 0, 'plugin_count': 0, 'skill_count': 22, 'hook_count': 1, 'memory_enabled': False, 'is_git_repo': True, 'client_identifier': '<str>', 'user.id': '<str>', 'user.email': '<str>', 'team.id': '<str>'}
+  log event grok_code.user_prompt {'event.sequence': 1, 'session.id': '<str>', 'turn_number': 0, 'prompt.id': '<str>', 'prompt_length': 57, 'model': "'grok-4.5'", 'screen_mode': '<str>', 'user.id': '<str>', 'user.email': '<str>', 'team.id': '<str>'}
+== 002_v1_logs.x-protobuf
+  log event grok_code.api_request {'event.sequence': 2, 'session.id': '<str>', 'turn_number': 0, 'prompt.id': '<str>', 'model': "'grok-4.5'", 'duration_ms': 6377, 'stop_reason': "'stop'", 'input_tokens': 15426, 'output_tokens': 14, 'reasoning_tokens': 13, 'cache_read_tokens': 1280, 'cache_creation_tokens': 0, 'cost_usd_micros': 9778, 'user.id': '<str>', 'user.email': '<str>', 'team.id': '<str>'}
+  log event grok_code.turn_completed {'event.sequence': 3, 'turn_number': 0, 'prompt.id': '<str>', 'outcome': "'completed'", 'duration_ms': 6639, 'tool_call_count': 0, 'model': "'grok-4.5'", 'session.id': '<str>', 'user.id': '<str>', 'user.email': '<str>', 'team.id': '<str>'}
+  log event grok_code.assistant_response {'event.sequence': 4, 'session.id': '<str>', 'turn_number': 0, 'prompt.id': '<str>', 'response_length': 2, 'user.id': '<str>', 'user.email': '<str>', 'team.id': '<str>'}
+  log event grok_code.session_end {'event.sequence': 5, 'session.id': '<str>', 'turn_number': 0, 'prompt.id': '<str>', 'duration_secs': 9, 'turn_count': 1, 'tool_call_count': 0, 'compaction_count': 0, 'model': "'grok-4.5'", 'user.id': '<str>', 'user.email': '<str>', 'team.id': '<str>'}
+== 003_v1_metrics.x-protobuf
+ resource {'service.name': "'grok-cli'", 'app.entrypoint': "'headless'", 'grok_code.schema.version': "'v1'", 'service.version': "'1.0.46 (2765805b9442)'", 'client.version': "'1.0.46'"}
+  metric grok_code.session.count sum temporality=[1] points=1 [({'session.id': '<str>', 'user.id': '<str>', 'user.email': '<str>', 'team.id': '<str>'}, 1)]
+  metric grok_code.token.usage sum temporality=[1] points=4 [({'model': "'grok-4.5'", 'session.id': '<str>', 'team.id': '<str>', 'type': "'input'", 'user.email': '<str>', 'user.id': '<str>'}, 15426), ({'model': "'grok-4.5'", 'session.id': '<str>', 'team.id': '<str>', 'type': "'cache_read'", 'user.email': '<str>', 'user.id': '<str>'}, 1280), ({'session.id': '<str>', 'user.id': '<str>', 'user.email': '<str>', 'team.id': '<str>', 'type': "'reasoning'", 'model': "'grok-4.5'"}, 13), ({'model': "'grok-4.5'", 'session.id': '<str>', 'team.id': '<str>', 'type': "'output'", 'user.email': '<str>', 'user.id': '<str>'}, 14)]
+  metric grok_code.cost.usage sum temporality=[1] points=1 [({'session.id': '<str>', 'user.id': '<str>', 'user.email': '<str>', 'team.id': '<str>', 'model': "'grok-4.5'"}, 0.0097784)]
+  metric grok_code.turn.count sum temporality=[1] points=1 [({'session.id': '<str>', 'user.id': '<str>', 'user.email': '<str>', 'team.id': '<str>', 'outcome': "'completed'", 'model': "'grok-4.5'"}, 1)]
+  metric grok_code.turn.ttft histogram temporality=[1] points=1 
+  metric grok_code.turn.ttfm histogram temporality=[1] points=1 
+  metric grok_code.startup.total histogram temporality=[1] points=1 
+  metric grok_code.startup.subtimer_duration histogram temporality=[1] points=40 
+== 004_v1_logs.x-protobuf
+  log event grok_code.session_start {'event.sequence': 0, 'session.id': '<str>', 'model': "'grok-4.5'", 'permission_mode': "'always_approve'", 'mcp_server_count': 0, 'plugin_count': 0, 'skill_count': 22, 'hook_count': 1, 'memory_enabled': False, 'is_git_repo': True, 'client_identifier': '<str>', 'user.id': '<str>', 'user.email': '<str>', 'team.id': '<str>'}
+  log event grok_code.model_switched {'event.sequence': 1, 'session.id': '<str>', 'from_model': "'grok-4.5'", 'to_model': "'grok-4.5'", 'success': True, 'user.id': '<str>', 'user.email': '<str>', 'team.id': '<str>'}
+== 005_v1_logs.x-protobuf
+  log event grok_code.user_prompt {'event.sequence': 2, 'session.id': '<str>', 'turn_number': 1, 'prompt.id': '<str>', 'prompt_length': 57, 'model': "'grok-4.5'", 'screen_mode': '<str>', 'user.id': '<str>', 'user.email': '<str>', 'team.id': '<str>'}
+  log event grok_code.api_request {'event.sequence': 3, 'session.id': '<str>', 'turn_number': 1, 'prompt.id': '<str>', 'model': "'grok-4.5'", 'duration_ms': 1921, 'stop_reason': "'stop'", 'input_tokens': 15468, 'output_tokens': 14, 'reasoning_tokens': 13, 'cache_read_tokens': 5120, 'cache_creation_tokens': 0, 'cost_usd_micros': 7587, 'user.id': '<str>', 'user.email': '<str>', 'team.id': '<str>'}
+  log event grok_code.turn_completed {'event.sequence': 4, 'turn_number': 1, 'prompt.id': '<str>', 'outcome': "'completed'", 'duration_ms': 2276, 'tool_call_count': 0, 'model': "'grok-4.5'", 'session.id': '<str>', 'user.id': '<str>', 'user.email': '<str>', 'team.id': '<str>'}
+  log event grok_code.assistant_response {'event.sequence': 5, 'session.id': '<str>', 'turn_number': 1, 'prompt.id': '<str>', 'response_length': 2, 'user.id': '<str>', 'user.email': '<str>', 'team.id': '<str>'}
+  log event grok_code.session_end {'event.sequence': 6, 'session.id': '<str>', 'turn_number': 1, 'prompt.id': '<str>', 'duration_secs': 7, 'turn_count': 2, 'tool_call_count': 0, 'compaction_count': 0, 'model': "'grok-4.5'", 'user.id': '<str>', 'user.email': '<str>', 'team.id': '<str>'}
+== 006_v1_metrics.x-protobuf
+ resource {'app.entrypoint': "'headless'", 'service.version': "'1.0.46 (2765805b9442)'", 'client.version': "'1.0.46'", 'grok_code.schema.version': "'v1'", 'service.name': "'grok-cli'"}
+  metric grok_code.token.usage sum temporality=[1] points=4 [({'session.id': '<str>', 'user.id': '<str>', 'user.email': '<str>', 'team.id': '<str>', 'type': "'input'", 'model': "'grok-4.5'"}, 15468), ({'model': "'grok-4.5'", 'session.id': '<str>', 'team.id': '<str>', 'type': "'cache_read'", 'user.email': '<str>', 'user.id': '<str>'}, 5120), ({'model': "'grok-4.5'", 'session.id': '<str>', 'team.id': '<str>', 'type': "'reasoning'", 'user.email': '<str>', 'user.id': '<str>'}, 13), ({'session.id': '<str>', 'user.id': '<str>', 'user.email': '<str>', 'team.id': '<str>', 'type': "'output'", 'model': "'grok-4.5'"}, 14)]
+  metric grok_code.cost.usage sum temporality=[1] points=1 [({'session.id': '<str>', 'user.id': '<str>', 'user.email': '<str>', 'team.id': '<str>', 'model': "'grok-4.5'"}, 0.00758744)]
+  metric grok_code.turn.count sum temporality=[1] points=1 [({'session.id': '<str>', 'user.id': '<str>', 'user.email': '<str>', 'team.id': '<str>', 'outcome': "'completed'", 'model': "'grok-4.5'"}, 1)]
+  metric grok_code.turn.ttft histogram temporality=[1] points=1 
+  metric grok_code.turn.ttfm histogram temporality=[1] points=1 
+  metric grok_code.startup.total histogram temporality=[1] points=1 
+  metric grok_code.startup.subtimer_duration histogram temporality=[1] points=38 

@@ -1,0 +1,576 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "grok-cli"
+            }
+          },
+          {
+            "key": "service.version",
+            "value": {
+              "stringValue": "1.0.46 (2765805b9442)"
+            }
+          },
+          {
+            "key": "client.version",
+            "value": {
+              "stringValue": "1.0.46"
+            }
+          },
+          {
+            "key": "app.entrypoint",
+            "value": {
+              "stringValue": "headless"
+            }
+          },
+          {
+            "key": "grok_code.schema.version",
+            "value": {
+              "stringValue": "v1"
+            }
+          }
+        ]
+      },
+      "scopeLogs": [
+        {
+          "logRecords": [
+            {
+              "body": {
+                "stringValue": "grok_code.session_start"
+              },
+              "timeUnixNano": "2000000000",
+              "attributes": [
+                {
+                  "key": "event.sequence",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "session.id",
+                  "value": {
+                    "stringValue": "session-fixture"
+                  }
+                },
+                {
+                  "key": "model",
+                  "value": {
+                    "stringValue": "grok-4.5"
+                  }
+                },
+                {
+                  "key": "permission_mode",
+                  "value": {
+                    "stringValue": "always_approve"
+                  }
+                },
+                {
+                  "key": "mcp_server_count",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "plugin_count",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "skill_count",
+                  "value": {
+                    "intValue": "22"
+                  }
+                },
+                {
+                  "key": "hook_count",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "memory_enabled",
+                  "value": {
+                    "boolValue": false
+                  }
+                },
+                {
+                  "key": "is_git_repo",
+                  "value": {
+                    "boolValue": true
+                  }
+                },
+                {
+                  "key": "client_identifier",
+                  "value": {
+                    "stringValue": "lc4-planted-secret@example.invalid"
+                  }
+                },
+                {
+                  "key": "user.id",
+                  "value": {
+                    "stringValue": "lc4-planted-secret@example.invalid"
+                  }
+                },
+                {
+                  "key": "user.email",
+                  "value": {
+                    "stringValue": "lc4-planted-secret@example.invalid"
+                  }
+                },
+                {
+                  "key": "team.id",
+                  "value": {
+                    "stringValue": "lc4-planted-secret@example.invalid"
+                  }
+                }
+              ]
+            },
+            {
+              "body": {
+                "stringValue": "grok_code.model_switched"
+              },
+              "timeUnixNano": "2000000001",
+              "attributes": [
+                {
+                  "key": "event.sequence",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "session.id",
+                  "value": {
+                    "stringValue": "session-fixture"
+                  }
+                },
+                {
+                  "key": "from_model",
+                  "value": {
+                    "stringValue": "grok-4.5"
+                  }
+                },
+                {
+                  "key": "to_model",
+                  "value": {
+                    "stringValue": "grok-4.5"
+                  }
+                },
+                {
+                  "key": "success",
+                  "value": {
+                    "boolValue": true
+                  }
+                },
+                {
+                  "key": "user.id",
+                  "value": {
+                    "stringValue": "lc4-planted-secret@example.invalid"
+                  }
+                },
+                {
+                  "key": "user.email",
+                  "value": {
+                    "stringValue": "lc4-planted-secret@example.invalid"
+                  }
+                },
+                {
+                  "key": "team.id",
+                  "value": {
+                    "stringValue": "lc4-planted-secret@example.invalid"
+                  }
+                }
+              ]
+            },
+            {
+              "body": {
+                "stringValue": "grok_code.user_prompt"
+              },
+              "timeUnixNano": "2000000002",
+              "attributes": [
+                {
+                  "key": "event.sequence",
+                  "value": {
+                    "intValue": "2"
+                  }
+                },
+                {
+                  "key": "session.id",
+                  "value": {
+                    "stringValue": "session-fixture"
+                  }
+                },
+                {
+                  "key": "turn_number",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "prompt.id",
+                  "value": {
+                    "stringValue": "prompt-fixture"
+                  }
+                },
+                {
+                  "key": "prompt_length",
+                  "value": {
+                    "intValue": "57"
+                  }
+                },
+                {
+                  "key": "model",
+                  "value": {
+                    "stringValue": "grok-4.5"
+                  }
+                },
+                {
+                  "key": "screen_mode",
+                  "value": {
+                    "stringValue": "lc4-planted-secret@example.invalid"
+                  }
+                },
+                {
+                  "key": "user.id",
+                  "value": {
+                    "stringValue": "lc4-planted-secret@example.invalid"
+                  }
+                },
+                {
+                  "key": "user.email",
+                  "value": {
+                    "stringValue": "lc4-planted-secret@example.invalid"
+                  }
+                },
+                {
+                  "key": "team.id",
+                  "value": {
+                    "stringValue": "lc4-planted-secret@example.invalid"
+                  }
+                }
+              ]
+            },
+            {
+              "body": {
+                "stringValue": "grok_code.api_request"
+              },
+              "timeUnixNano": "2000000003",
+              "attributes": [
+                {
+                  "key": "event.sequence",
+                  "value": {
+                    "intValue": "3"
+                  }
+                },
+                {
+                  "key": "session.id",
+                  "value": {
+                    "stringValue": "session-fixture"
+                  }
+                },
+                {
+                  "key": "turn_number",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "prompt.id",
+                  "value": {
+                    "stringValue": "prompt-fixture"
+                  }
+                },
+                {
+                  "key": "model",
+                  "value": {
+                    "stringValue": "grok-4.5"
+                  }
+                },
+                {
+                  "key": "duration_ms",
+                  "value": {
+                    "intValue": "1921"
+                  }
+                },
+                {
+                  "key": "stop_reason",
+                  "value": {
+                    "stringValue": "stop"
+                  }
+                },
+                {
+                  "key": "input_tokens",
+                  "value": {
+                    "intValue": "15468"
+                  }
+                },
+                {
+                  "key": "output_tokens",
+                  "value": {
+                    "intValue": "14"
+                  }
+                },
+                {
+                  "key": "reasoning_tokens",
+                  "value": {
+                    "intValue": "13"
+                  }
+                },
+                {
+                  "key": "cache_read_tokens",
+                  "value": {
+                    "intValue": "5120"
+                  }
+                },
+                {
+                  "key": "cache_creation_tokens",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "cost_usd_micros",
+                  "value": {
+                    "intValue": "7587"
+                  }
+                },
+                {
+                  "key": "user.id",
+                  "value": {
+                    "stringValue": "lc4-planted-secret@example.invalid"
+                  }
+                },
+                {
+                  "key": "user.email",
+                  "value": {
+                    "stringValue": "lc4-planted-secret@example.invalid"
+                  }
+                },
+                {
+                  "key": "team.id",
+                  "value": {
+                    "stringValue": "lc4-planted-secret@example.invalid"
+                  }
+                }
+              ]
+            },
+            {
+              "body": {
+                "stringValue": "grok_code.turn_completed"
+              },
+              "timeUnixNano": "2000000004",
+              "attributes": [
+                {
+                  "key": "event.sequence",
+                  "value": {
+                    "intValue": "4"
+                  }
+                },
+                {
+                  "key": "turn_number",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "prompt.id",
+                  "value": {
+                    "stringValue": "prompt-fixture"
+                  }
+                },
+                {
+                  "key": "outcome",
+                  "value": {
+                    "stringValue": "completed"
+                  }
+                },
+                {
+                  "key": "duration_ms",
+                  "value": {
+                    "intValue": "2276"
+                  }
+                },
+                {
+                  "key": "tool_call_count",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "model",
+                  "value": {
+                    "stringValue": "grok-4.5"
+                  }
+                },
+                {
+                  "key": "session.id",
+                  "value": {
+                    "stringValue": "session-fixture"
+                  }
+                },
+                {
+                  "key": "user.id",
+                  "value": {
+                    "stringValue": "lc4-planted-secret@example.invalid"
+                  }
+                },
+                {
+                  "key": "user.email",
+                  "value": {
+                    "stringValue": "lc4-planted-secret@example.invalid"
+                  }
+                },
+                {
+                  "key": "team.id",
+                  "value": {
+                    "stringValue": "lc4-planted-secret@example.invalid"
+                  }
+                }
+              ]
+            },
+            {
+              "body": {
+                "stringValue": "grok_code.assistant_response"
+              },
+              "timeUnixNano": "2000000005",
+              "attributes": [
+                {
+                  "key": "event.sequence",
+                  "value": {
+                    "intValue": "5"
+                  }
+                },
+                {
+                  "key": "session.id",
+                  "value": {
+                    "stringValue": "session-fixture"
+                  }
+                },
+                {
+                  "key": "turn_number",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "prompt.id",
+                  "value": {
+                    "stringValue": "prompt-fixture"
+                  }
+                },
+                {
+                  "key": "response_length",
+                  "value": {
+                    "intValue": "2"
+                  }
+                },
+                {
+                  "key": "user.id",
+                  "value": {
+                    "stringValue": "lc4-planted-secret@example.invalid"
+                  }
+                },
+                {
+                  "key": "user.email",
+                  "value": {
+                    "stringValue": "lc4-planted-secret@example.invalid"
+                  }
+                },
+                {
+                  "key": "team.id",
+                  "value": {
+                    "stringValue": "lc4-planted-secret@example.invalid"
+                  }
+                }
+              ]
+            },
+            {
+              "body": {
+                "stringValue": "grok_code.session_end"
+              },
+              "timeUnixNano": "2000000006",
+              "attributes": [
+                {
+                  "key": "event.sequence",
+                  "value": {
+                    "intValue": "6"
+                  }
+                },
+                {
+                  "key": "session.id",
+                  "value": {
+                    "stringValue": "session-fixture"
+                  }
+                },
+                {
+                  "key": "turn_number",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "prompt.id",
+                  "value": {
+                    "stringValue": "prompt-fixture"
+                  }
+                },
+                {
+                  "key": "duration_secs",
+                  "value": {
+                    "intValue": "7"
+                  }
+                },
+                {
+                  "key": "turn_count",
+                  "value": {
+                    "intValue": "2"
+                  }
+                },
+                {
+                  "key": "tool_call_count",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "compaction_count",
+                  "value": {
+                    "intValue": "0"
+                  }
+                },
+                {
+                  "key": "model",
+                  "value": {
+                    "stringValue": "grok-4.5"
+                  }
+                },
+                {
+                  "key": "user.id",
+                  "value": {
+                    "stringValue": "lc4-planted-secret@example.invalid"
+                  }
+                },
+                {
+                  "key": "user.email",
+                  "value": {
+                    "stringValue": "lc4-planted-secret@example.invalid"
+                  }
+                },
+                {
+                  "key": "team.id",
+                  "value": {
+                    "stringValue": "lc4-planted-secret@example.invalid"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

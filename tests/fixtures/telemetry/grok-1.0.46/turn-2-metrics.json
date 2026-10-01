@@ -1,0 +1,566 @@
+{
+  "resourceMetrics": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "grok-cli"
+            }
+          },
+          {
+            "key": "service.version",
+            "value": {
+              "stringValue": "1.0.46 (2765805b9442)"
+            }
+          },
+          {
+            "key": "client.version",
+            "value": {
+              "stringValue": "1.0.46"
+            }
+          },
+          {
+            "key": "app.entrypoint",
+            "value": {
+              "stringValue": "headless"
+            }
+          },
+          {
+            "key": "grok_code.schema.version",
+            "value": {
+              "stringValue": "v1"
+            }
+          }
+        ]
+      },
+      "scopeMetrics": [
+        {
+          "metrics": [
+            {
+              "name": "grok_code.token.usage",
+              "unit": "{token}",
+              "sum": {
+                "aggregationTemporality": 1,
+                "dataPoints": [
+                  {
+                    "attributes": [
+                      {
+                        "key": "session.id",
+                        "value": {
+                          "stringValue": "session-fixture"
+                        }
+                      },
+                      {
+                        "key": "user.id",
+                        "value": {
+                          "stringValue": "lc4-planted-secret@example.invalid"
+                        }
+                      },
+                      {
+                        "key": "user.email",
+                        "value": {
+                          "stringValue": "lc4-planted-secret@example.invalid"
+                        }
+                      },
+                      {
+                        "key": "team.id",
+                        "value": {
+                          "stringValue": "lc4-planted-secret@example.invalid"
+                        }
+                      },
+                      {
+                        "key": "type",
+                        "value": {
+                          "stringValue": "input"
+                        }
+                      },
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "grok-4.5"
+                        }
+                      }
+                    ],
+                    "asInt": "15468",
+                    "startTimeUnixNano": "2000000000",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "grok-4.5"
+                        }
+                      },
+                      {
+                        "key": "session.id",
+                        "value": {
+                          "stringValue": "session-fixture"
+                        }
+                      },
+                      {
+                        "key": "team.id",
+                        "value": {
+                          "stringValue": "lc4-planted-secret@example.invalid"
+                        }
+                      },
+                      {
+                        "key": "type",
+                        "value": {
+                          "stringValue": "cache_read"
+                        }
+                      },
+                      {
+                        "key": "user.email",
+                        "value": {
+                          "stringValue": "lc4-planted-secret@example.invalid"
+                        }
+                      },
+                      {
+                        "key": "user.id",
+                        "value": {
+                          "stringValue": "lc4-planted-secret@example.invalid"
+                        }
+                      }
+                    ],
+                    "asInt": "5120",
+                    "startTimeUnixNano": "2000000000",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "grok-4.5"
+                        }
+                      },
+                      {
+                        "key": "session.id",
+                        "value": {
+                          "stringValue": "session-fixture"
+                        }
+                      },
+                      {
+                        "key": "team.id",
+                        "value": {
+                          "stringValue": "lc4-planted-secret@example.invalid"
+                        }
+                      },
+                      {
+                        "key": "type",
+                        "value": {
+                          "stringValue": "reasoning"
+                        }
+                      },
+                      {
+                        "key": "user.email",
+                        "value": {
+                          "stringValue": "lc4-planted-secret@example.invalid"
+                        }
+                      },
+                      {
+                        "key": "user.id",
+                        "value": {
+                          "stringValue": "lc4-planted-secret@example.invalid"
+                        }
+                      }
+                    ],
+                    "asInt": "13",
+                    "startTimeUnixNano": "2000000000",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [
+                      {
+                        "key": "session.id",
+                        "value": {
+                          "stringValue": "session-fixture"
+                        }
+                      },
+                      {
+                        "key": "user.id",
+                        "value": {
+                          "stringValue": "lc4-planted-secret@example.invalid"
+                        }
+                      },
+                      {
+                        "key": "user.email",
+                        "value": {
+                          "stringValue": "lc4-planted-secret@example.invalid"
+                        }
+                      },
+                      {
+                        "key": "team.id",
+                        "value": {
+                          "stringValue": "lc4-planted-secret@example.invalid"
+                        }
+                      },
+                      {
+                        "key": "type",
+                        "value": {
+                          "stringValue": "output"
+                        }
+                      },
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "grok-4.5"
+                        }
+                      }
+                    ],
+                    "asInt": "14",
+                    "startTimeUnixNano": "2000000000",
+                    "timeUnixNano": "2000000100"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "grok_code.cost.usage",
+              "unit": "USD",
+              "sum": {
+                "aggregationTemporality": 1,
+                "dataPoints": [
+                  {
+                    "attributes": [
+                      {
+                        "key": "session.id",
+                        "value": {
+                          "stringValue": "session-fixture"
+                        }
+                      },
+                      {
+                        "key": "user.id",
+                        "value": {
+                          "stringValue": "lc4-planted-secret@example.invalid"
+                        }
+                      },
+                      {
+                        "key": "user.email",
+                        "value": {
+                          "stringValue": "lc4-planted-secret@example.invalid"
+                        }
+                      },
+                      {
+                        "key": "team.id",
+                        "value": {
+                          "stringValue": "lc4-planted-secret@example.invalid"
+                        }
+                      },
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "grok-4.5"
+                        }
+                      }
+                    ],
+                    "asDouble": 0.00758744,
+                    "startTimeUnixNano": "2000000000",
+                    "timeUnixNano": "2000000100"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "grok_code.turn.count",
+              "unit": "",
+              "sum": {
+                "aggregationTemporality": 1,
+                "dataPoints": [
+                  {
+                    "attributes": [
+                      {
+                        "key": "session.id",
+                        "value": {
+                          "stringValue": "session-fixture"
+                        }
+                      },
+                      {
+                        "key": "user.id",
+                        "value": {
+                          "stringValue": "lc4-planted-secret@example.invalid"
+                        }
+                      },
+                      {
+                        "key": "user.email",
+                        "value": {
+                          "stringValue": "lc4-planted-secret@example.invalid"
+                        }
+                      },
+                      {
+                        "key": "team.id",
+                        "value": {
+                          "stringValue": "lc4-planted-secret@example.invalid"
+                        }
+                      },
+                      {
+                        "key": "outcome",
+                        "value": {
+                          "stringValue": "completed"
+                        }
+                      },
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "grok-4.5"
+                        }
+                      }
+                    ],
+                    "asInt": "1",
+                    "startTimeUnixNano": "2000000000",
+                    "timeUnixNano": "2000000100"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "grok_code.turn.ttft",
+              "unit": "",
+              "histogram": {
+                "aggregationTemporality": 1,
+                "dataPoints": [
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "grok_code.turn.ttfm",
+              "unit": "",
+              "histogram": {
+                "aggregationTemporality": 1,
+                "dataPoints": [
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "grok_code.startup.total",
+              "unit": "",
+              "histogram": {
+                "aggregationTemporality": 1,
+                "dataPoints": [
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "grok_code.startup.subtimer_duration",
+              "unit": "",
+              "histogram": {
+                "aggregationTemporality": 1,
+                "dataPoints": [
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  },
+                  {
+                    "attributes": [],
+                    "count": "0",
+                    "timeUnixNano": "2000000100"
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
