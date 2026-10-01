@@ -2701,8 +2701,11 @@ unbound, unknown is dropped. gRPC is not used by Devin.
 ### Ledger (accounting 0020)
 
 `api_request` is Devin's usage authority (DG4j `declare_usage` path), deduped
-by `(session.id, event.sequence)` (falling back to `request_id`) through a
-one-way digest, so a replay is one entry. Normalization is explicit
+by `request_id` (unique per API call; falling back to
+`(session.id, prompt.id, event.sequence)` only when absent) through a one-way
+digest, so a replay is one entry. `event.sequence` restarts at 0 in every Devin
+process, so a resumed session (`-c -p`) must not be keyed on it alone. Grok's key
+already includes `prompt.id` and `turn_number`, so its resume does not collide. Normalization is explicit
 `otlp-devin-exclusive-v1`: normalized input = `input_tokens` + `cache_read_tokens`
 + `cache_creation_tokens`; cached = `cache_read_tokens`; cache write =
 `cache_creation_tokens`; total = input + output. The record keeps the raw value

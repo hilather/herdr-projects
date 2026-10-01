@@ -520,8 +520,11 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                                 let session = attrs.get("session.id").and_then(Value::as_str).filter(|s| !s.is_empty());
                                 let sequence = attrs.get("event.sequence").and_then(integer).filter(|n| *n >= 0);
                                 let request = payload["attributes"]["request_id"].as_str().map(str::to_owned);
-                                let key = session.zip(sequence).map(|(s, n)| json!(["session_sequence", s, n]))
-                                    .or_else(|| request.map(|r| json!(["request_id", r])));
+                                let prompt = attrs.get("prompt.id").and_then(Value::as_str).filter(|s| !s.is_empty());
+                                // `event.sequence` restarts at 0 in every Devin process, so a resumed
+                                // session reuses it; `request_id` is the per-API-call identity.
+                                let key = request.filter(|r| !r.is_empty()).map(|r| json!(["request_id", r]))
+                                    .or_else(|| session.zip(sequence).map(|(s, n)| json!(["session_prompt_sequence", s, prompt, n])));
                                 let counters = (|| {
                                     let a = &payload["attributes"];
                                     let (input, read, write) = (a["input_tokens"].as_u64()?, a["cache_read_tokens"].as_u64()?, a["cache_creation_tokens"].as_u64()?);

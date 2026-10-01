@@ -700,9 +700,8 @@ fn devin_api_request_reaches_the_ledger_with_exclusive_normalization() {
     let f = Fixture::reserved();
     otlp::ingest(&f.project, "/v1/logs", &payload(&f, "devin-logs")).unwrap();
     otlp::ingest(&f.project, "/v1/metrics", &payload(&f, "devin-metrics")).unwrap();
-    // A replay with a fresh request id but the same (session, sequence) is the same request.
-    let replay = String::from_utf8(payload(&f, "devin-logs")).unwrap().replace("req-synthetic-1", "req-synthetic-2");
-    otlp::ingest(&f.project, "/v1/logs", replay.as_bytes()).unwrap();
+    // A true replay (same request id) is the same request.
+    otlp::ingest(&f.project, "/v1/logs", &payload(&f, "devin-logs")).unwrap();
     f.cli_args(&["accounting", "sync"]);
     let entries = f.cli_args(&["accounting", "entries"]).0;
     let counted = support::telemetry::accepted_delta_entries(&entries);
@@ -712,6 +711,20 @@ fn devin_api_request_reaches_the_ledger_with_exclusive_normalization() {
     assert_eq!(e["normalized"], json!({"input_tokens":11869,"cache_read_tokens":5984,"cache_write_tokens":0,"new_input_tokens":5885,"output_tokens":40,"reasoning_tokens":0,"total_tokens":11909}));
     // The metric never adds a second entry, and no identity or content reaches the ledger.
     assert!(!entries.to_string().contains("DEVIN_SECRET"));
+}
+
+#[test]
+fn devin_resumed_process_with_restarted_sequence_counts_each_request() {
+    let f = Fixture::reserved();
+    otlp::ingest(&f.project, "/v1/logs", &payload(&f, "devin-logs")).unwrap();
+    // `-c -p` resumes the same session in a new process: identical (session.id,
+    // event.sequence), different request_id.
+    let resumed = String::from_utf8(payload(&f, "devin-logs")).unwrap().replace("req-synthetic-1", "req-synthetic-2");
+    otlp::ingest(&f.project, "/v1/logs", resumed.as_bytes()).unwrap();
+    otlp::ingest(&f.project, "/v1/logs", resumed.as_bytes()).unwrap();
+    f.cli_args(&["accounting", "sync"]);
+    let entries = f.cli_args(&["accounting", "entries"]).0;
+    assert_eq!(support::telemetry::accepted_delta_entries(&entries).len(), 2, "{entries}");
 }
 
 #[test]
