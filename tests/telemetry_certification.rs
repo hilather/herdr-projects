@@ -910,8 +910,9 @@ fn candidate_group_cost_includes_every_arm() {
 /// the ledger assumes, and certified live, or its limitation is declared.
 /// Codex is the only live-certified collector. Since the 2026-09-30 owner
 /// decision (harness coverage, phase2-lanes.md DG4) the OTLP receiver adds
-/// `otlp:<harness>` adapters, but those are fixture-certified at most, so no
-/// other adapter may claim a `live` field. An uncertified Codex version is
+/// `otlp:<harness>` adapters and DG4b the native `claude-code` adapter, but
+/// those are fixture-certified at most, so no other adapter may claim a
+/// `live` field. An uncertified Codex version is
 /// never summed.
 #[test]
 fn accounting_fields_match_the_adapter_certificate() {
@@ -920,7 +921,7 @@ fn accounting_fields_match_the_adapter_certificate() {
     let adapters = capabilities["adapters"].as_array().unwrap();
     let names: Vec<&str> = adapters.iter().map(|a| a["adapter"].as_str().unwrap()).collect();
     assert_eq!(names[0], "codex", "{names:?}");
-    assert!(names[1..].iter().all(|n| n.starts_with("otlp:")), "only OTLP adapters besides Codex: {names:?}");
+    assert!(names[1..].iter().all(|n| *n == "claude-code" || n.starts_with("otlp:")), "only the fixture adapters besides Codex: {names:?}");
     for other in &adapters[1..] {
         let live: Vec<&Value> = other["fields"].as_array().into_iter().flatten().filter(|f| f["certified"] == "live").collect();
         assert!(live.is_empty(), "{} must not claim live-certified fields: {live:?}", other["adapter"]);
