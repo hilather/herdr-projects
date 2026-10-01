@@ -19,7 +19,8 @@ pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/in
     include_str!("../../../migrations/telemetry/ingest/0009_turn_terminations.sql"),
     include_str!("../../../migrations/telemetry/ingest/0010_claude_code.sql"),
     include_str!("../../../migrations/telemetry/ingest/0011_opencode.sql"),
-    include_str!("../../../migrations/telemetry/ingest/0012_compact_envelopes.sql")];
+    include_str!("../../../migrations/telemetry/ingest/0012_compact_envelopes.sql"),
+    include_str!("../../../migrations/telemetry/ingest/0013_muse.sql")];
 
 /// `herdr-projects telemetry <slug> collectors ...`
 #[derive(clap::Subcommand)]
@@ -328,10 +329,9 @@ fn capabilities(project: &Path) -> Result<Value> {
         }
     }
     let mut adapters = super::otlp::capabilities();
-    // Reviewed Cursor and Muse native surfaces lack a stable usage projection;
+    // Reviewed Cursor native surfaces lack a stable usage projection;
     // Cursor also lacks a reviewed logs/metrics exporter.
     for (adapter, reason) in [
-        ("muse", "local_usage_schema_not_established"),
         ("cursor-agent", "stable_local_usage_format_not_evident"),
         ("otlp:cursor-agent", "protobuf_traces_only_no_usable_logs_or_metrics"),
     ] {
@@ -340,14 +340,12 @@ fn capabilities(project: &Path) -> Result<Value> {
             .map(|field| json!({"kind":"usage","field":field,"available":false,
                 "basis":"unavailable","certified":"none","caveat":null,"reason":reason}))
             .collect();
-        let mut capability = json!({"adapter":adapter,"interface":"none","certified_versions":[],
+        let capability = json!({"adapter":adapter,"interface":"none","certified_versions":[],
             "uncertified_version":reason,"fields":fields});
-        if adapter == "muse" {
-            capability["reviewed_versions"] = json!(["1.4.0-R4161.1"]);
-        }
         adapters.push(capability);
     }
     adapters.push(super::gemini::capabilities());
+    adapters.insert(0, super::codex::muse::capabilities());
     adapters.insert(0, super::codex::claude::capabilities());
     adapters.insert(0, super::codex::opencode::capabilities());
     adapters.insert(0, json!({"adapter": "codex", "interface": "rollout_jsonl", "certified_versions": super::codex::CERTIFIED,

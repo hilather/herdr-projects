@@ -696,3 +696,11 @@ LC1 certifies Codex 0.159.2 alongside 0.154.0 without a schema change. See
 reconciliation) and the installed-version scope in contracts-collection.md.
 The sanitizer excludes world_state and thread_settings_applied snapshots and
 new session metadata; only existing allowlisted counters are retained.
+
+DG4i adds sidecar `ingest` **0013_muse.sql** (`muse_events`, `muse_parents`), a per-native-session
+completion identity table. It is included in session retention, backup and
+restore tombstone filtering. No canonical schema change.
+See [contracts-collection.md DG4i](contracts-collection.md#dg4i--muse-native-sessions-fixture-certification).
+DG4i also adds `accounting` **0018_muse.sql** to admit `muse` ledger sources
+and their inclusive read/write normalization while preserving existing entries
+and dispositions. These projections retain their existing follows-sources class.

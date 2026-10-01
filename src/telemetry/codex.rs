@@ -15,6 +15,8 @@ use super::{ingest, sanitize};
 pub(crate) mod claude;
 #[path = "gemini_native.rs"]
 pub(crate) mod gemini;
+#[path = "muse.rs"]
+pub(crate) mod muse;
 #[path = "opencode.rs"]
 pub(crate) mod opencode;
 
@@ -31,6 +33,7 @@ pub fn certified(version: &str) -> bool {
 
 /// Adapter-qualified versions keep fixture Claude acceptance separate from live Codex certification.
 pub fn accepted_version(version: &str) -> bool {
+    if let Some(v) = version.strip_prefix("muse/") { return muse::FIXTURE_VERSIONS.contains(&v); }
     if let Some(v) = version.strip_prefix("opencode/") { return opencode::FIXTURE_VERSIONS.contains(&v); }
     version.strip_prefix("claude-code/").map_or_else(|| certified(version), |v| claude::FIXTURE_VERSIONS.contains(&v))
 }
@@ -87,7 +90,7 @@ impl CanonicalAttempt {
         self.kind.as_deref() == Some("codex")
     }
 
-    pub fn supported(&self) -> bool { self.codex() || matches!(self.kind.as_deref(), Some("claude" | "gemini" | "opencode")) }
+    pub fn supported(&self) -> bool { self.codex() || matches!(self.kind.as_deref(), Some("claude" | "gemini" | "opencode" | "muse")) }
 
     pub(super) fn gemini_home(&self) -> Option<&str> {
         (self.kind.as_deref() == Some("gemini") && self.version.as_deref() == Some("0.62.0")).then_some(self.home.as_deref()).flatten()
@@ -258,7 +261,7 @@ pub fn collection_configured(project: &Path) -> Result<bool> {
     let db=super::read_only_nowait(&project.join(".state/state.db"))?;
     let table=|name:&str|db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",[name],|r|r.get::<_,bool>(0));
     if table("attempt_inputs")? && db.query_row("SELECT EXISTS(SELECT 1 FROM attempt_inputs
-        WHERE json_extract(payload,'$.inputs.effective_profile.kind') IN ('codex','claude','gemini','opencode')
+        WHERE json_extract(payload,'$.inputs.effective_profile.kind') IN ('codex','claude','gemini','opencode','muse')
         AND json_type(payload,'$.inputs.effective_profile.execution_home')='text')",[],|r|r.get::<_,bool>(0))? {return Ok(true);}
     if table("native_profiles")? {
         return Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM native_profiles
@@ -295,12 +298,14 @@ pub fn collect(project: &Path, budget: Budget, create: bool) -> Result<Option<Co
     terminated_turns(&db, &attempts)?;
     for home in &homes {
         let mut files = Vec::new();
-        if !attempts.iter().any(|a| matches!(a.kind.as_deref(), Some("claude" | "gemini" | "opencode")) && a.home.as_ref() == Some(home)) || attempts.iter().any(|a| a.codex() && a.home.as_ref() == Some(home)) {
+        if !attempts.iter().any(|a| matches!(a.kind.as_deref(), Some("claude" | "gemini" | "opencode" | "muse")) && a.home.as_ref() == Some(home)) || attempts.iter().any(|a| a.codex() && a.home.as_ref() == Some(home)) {
             walk(&Path::new(home).join(".codex/sessions"), 0, &mut files);
         }
         if attempts.iter().any(|a| a.kind.as_deref() == Some("claude") && a.home.as_ref() == Some(home)) {
             claude::walk(&Path::new(home).join(".claude/projects"), &mut files);
         }
+        let muse_sources = muse::discover(home, &attempts);
+        files.extend(muse_sources.keys().cloned());
         let native = gemini::discover(home, &attempts, &worktrees);
         files.extend(native.keys().cloned());
         if attempts.iter().any(|a| a.kind.as_deref() == Some("opencode") && a.home.as_ref() == Some(home)) {
@@ -315,7 +320,7 @@ pub fn collect(project: &Path, budget: Budget, create: bool) -> Result<Option<Co
                 break;
             }
             let mut span = (0, 0);
-            let read = match tail(&mut db, &file, &digest(home.as_bytes()), &worktrees, remaining, budget.bytes <= Budget::TICK.bytes, &from_start, &tombstones, &mut done, &mut span, file.starts_with(Path::new(home).join(".claude/projects")), native.get(&file)) {
+            let read = match tail(&mut db, &file, &digest(home.as_bytes()), &worktrees, remaining, budget.bytes <= Budget::TICK.bytes, &from_start, &tombstones, &mut done, &mut span, file.starts_with(Path::new(home).join(".claude/projects")), native.get(&file), muse_sources.get(&file)) {
                 Ok(read) => read,
                 // The pass rolled back: its range is a coverage gap and later
                 // sources wait for the next collect (contracts-collection.md A2).
@@ -790,13 +795,13 @@ fn final_event(tx: &Transaction, ledger: &ingest::Ledger, key: &str, cursor: &Cu
 /// pass resumes at the last committed prefix, with the same native identities.
 #[allow(clippy::too_many_arguments)]
 fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance: u64, bounded: bool, reread: &std::collections::BTreeSet<String>,
-    tombstones: &super::maintenance::Tombstones, done: &mut Collected, span: &mut (u64, u64), claude: bool, gemini: Option<&gemini::Source>) -> Result<u64> {
+    tombstones: &super::maintenance::Tombstones, done: &mut Collected, span: &mut (u64, u64), claude: bool, gemini: Option<&gemini::Source>, muse: Option<&muse::Source>) -> Result<u64> {
     let mut observed = None;
     let (mut pulled, files) = (0, done.files);
     let empty = std::collections::BTreeSet::new();
     loop {
         let (read, more) = tail_batch(db, file, home, worktrees, allowance - pulled, bounded,
-            if pulled == 0 { reread } else { &empty }, tombstones, done, span, &mut observed, claude, gemini)?;
+            if pulled == 0 { reread } else { &empty }, tombstones, done, span, &mut observed, claude, gemini, muse)?;
         pulled += read;
         // Public collect counts files, not transaction batches.
         if done.files > files { done.files = files + 1; }
@@ -810,7 +815,7 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
 /// Keeping a line atomic preserves malformed/oversized/partial-line semantics.
 #[allow(clippy::too_many_arguments)]
 fn tail_batch(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance: u64, bounded: bool, reread: &std::collections::BTreeSet<String>,
-    tombstones: &super::maintenance::Tombstones, done: &mut Collected, span: &mut (u64, u64), observed: &mut Option<i64>, claude: bool, gemini: Option<&gemini::Source>) -> Result<(u64, bool)> {
+    tombstones: &super::maintenance::Tombstones, done: &mut Collected, span: &mut (u64, u64), observed: &mut Option<i64>, claude: bool, gemini: Option<&gemini::Source>, muse: Option<&muse::Source>) -> Result<(u64, bool)> {
     let key = digest(file.as_os_str().as_encoded_bytes());
     let Ok(mut handle) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(file) else { return Ok((0, false)) };
     let meta = handle.metadata()?;
@@ -910,6 +915,14 @@ fn tail_batch(db: &mut Connection, file: &Path, home: &str, worktrees: &str, all
         read += n;
         let at = cursor.offset;
         cursor.offset += n;
+        if let Some(source) = muse {
+            if !muse::record_line(&tx, &ledger, at, &line, source, &key, home, worktrees, &mut cursor, now, done)? {
+                ledger.malformed(&tx, at, "record_malformed", n, now)?;
+            }
+            if let Some((session, _, _)) = &cursor.session
+                && tombstones.key(super::maintenance::SESSIONS, &format!("session:{session}")).is_some() { return Ok((0, false)); }
+            continue;
+        }
         if let Some(source) = gemini {
             if !gemini::record_line(&tx, &ledger, at, &line, source, &key, home, worktrees, &mut cursor, now, done)? {
                 ledger.malformed(&tx, at, "record_malformed", n, now)?;
@@ -1421,21 +1434,38 @@ fn terminated_turns(db: &Connection, attempts: &[CanonicalAttempt]) -> Result<()
 /// the attempts looked up by id: per source and one commit each, a large
 /// history made every collect quadratic and fsync-bound (certificate-scale.md §5).
 fn bind(db: &mut Connection, attempts: &[CanonicalAttempt]) -> Result<()> {
+    // Resolve child workspaces again even when their files have not appended:
+    // a missing parent can arrive in a later collection.
+    let inherited_changed: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM muse_parents m
+        JOIN rollout_sources child ON child.path_digest=m.path_digest
+        LEFT JOIN rollout_sources parent ON parent.path_digest=m.parent_path_digest
+            AND parent.home_digest=child.home_digest AND parent.originator='muse' AND parent.session_unix_ms IS NOT NULL
+        WHERE child.originator='muse' AND child.cwd_attempt IS NOT parent.cwd_attempt)", [], |r| r.get(0))?;
+    if inherited_changed {
+        db.execute("UPDATE rollout_sources AS child SET cwd_attempt=(SELECT parent.cwd_attempt FROM muse_parents m
+            JOIN rollout_sources parent ON parent.path_digest=m.parent_path_digest AND parent.home_digest=child.home_digest
+            WHERE m.path_digest=child.path_digest AND parent.originator='muse' AND parent.session_unix_ms IS NOT NULL)
+            WHERE child.originator='muse' AND EXISTS(SELECT 1 FROM muse_parents m WHERE m.path_digest=child.path_digest)
+            AND child.cwd_attempt IS NOT (SELECT parent.cwd_attempt FROM muse_parents m JOIN rollout_sources parent
+                ON parent.path_digest=m.parent_path_digest AND parent.home_digest=child.home_digest
+                WHERE m.path_digest=child.path_digest AND parent.originator='muse' AND parent.session_unix_ms IS NOT NULL)", [])?;
+    }
     let mut by_id = std::collections::BTreeMap::<&str, Vec<&CanonicalAttempt>>::new();
     for a in attempts.iter().filter(|a| a.supported()) { by_id.entry(a.id.as_str()).or_default().push(a); }
-    type Row = (String, String, Option<i64>, Option<String>, String, Option<String>, Option<String>, Option<String>);
+    type Row = (String, String, Option<i64>, Option<String>, String, Option<String>, Option<String>, Option<String>, Option<i64>);
     let decision = |row: &Row| {
-        let (_, home, at, cwd_attempt, _, _, _, originator) = row;
+        let (_, home, at, cwd_attempt, _, _, _, originator, parent_start) = row;
         let rule1 = |h: &Option<String>| h.as_ref().is_some_and(|h| digest(h.as_bytes()) == *home);
         let (mut matches, mut refused) = (Vec::new(), None);
         for a in cwd_attempt.as_deref().and_then(|id| by_id.get(id)).into_iter().flatten().copied() {
-            let source_kind = match originator.as_deref() { Some("claude-code") => "claude", Some("gemini-cli") => "gemini", Some("opencode") => "opencode", _ => "codex" };
+            let source_kind = match originator.as_deref() { Some("claude-code") => "claude", Some("gemini-cli") => "gemini", Some("opencode") => "opencode", Some("muse") => "muse", _ => "codex" };
             if a.kind.as_deref() != Some(source_kind) { continue; }
-            let Some(at) = at.filter(|at| a.decided_unix_ms.is_some_and(|decided| *at >= decided)) else { continue };
+            let Some(at) = at.filter(|at| a.decided_unix_ms.is_some_and(|decided| *at >= decided
+                && parent_start.is_none_or(|parent| parent >= decided))) else { continue };
             match &a.binding {
                 Binding::Predates if rule1(&a.home) => matches.push((a, "predates_binding")),
                 Binding::Active(h) if rule1(h) => matches.push((a, "collector_binding")),
-                Binding::Revoked(h, revoked) if rule1(h) && at < *revoked => matches.push((a, "collector_binding")),
+                Binding::Revoked(h, revoked) if rule1(h) && at < *revoked && parent_start.is_none_or(|parent| parent < *revoked) => matches.push((a, "collector_binding")),
                 Binding::Revoked(h, _) if rule1(h) => refused = refused.or(Some("binding_revoked")),
                 Binding::None => refused = refused.or(Some("no_binding")),
                 _ => {}
@@ -1449,10 +1479,13 @@ fn bind(db: &mut Connection, attempts: &[CanonicalAttempt]) -> Result<()> {
         }
     };
     let sources = |db: &Connection, after: &str| -> Result<Vec<Row>> {
-        Ok(db.prepare("SELECT s.path_digest,s.home_digest,s.session_unix_ms,s.cwd_attempt,s.binding,s.attempt_id,b.basis,s.originator
+        Ok(db.prepare("SELECT s.path_digest,s.home_digest,s.session_unix_ms,s.cwd_attempt,s.binding,s.attempt_id,b.basis,s.originator,
+                (SELECT parent.session_unix_ms FROM muse_parents m JOIN rollout_sources parent
+                    ON parent.path_digest=m.parent_path_digest AND parent.home_digest=s.home_digest
+                    WHERE m.path_digest=s.path_digest AND parent.originator='muse' AND parent.session_unix_ms IS NOT NULL)
             FROM rollout_sources s LEFT JOIN source_bindings b ON b.path_digest=s.path_digest
             WHERE s.path_digest>?1 ORDER BY s.path_digest LIMIT 1000")?
-            .query_map([after], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?.collect::<rusqlite::Result<_>>()?)
+            .query_map([after], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)))?.collect::<rusqlite::Result<_>>()?)
     };
     let mut after = String::new();
     loop {

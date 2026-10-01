@@ -49,7 +49,7 @@ column named in `age_from`).
 
 | Class | Store | Default | Basis | Action |
 | --- | --- | --- | --- | --- |
-| `sidecar.normalized_sessions` | `telemetry.db`, per native session: `claude_messages`, `claude_tool_results`, `opencode_messages`, `opencode_tools`, `codex_*`, `rollout_*`, `collect_offsets`, `codex_tool_sources`, `source_bindings`, `source_observations`, `ingest_quarantine`, `coverage_gaps`, `source_cursors`, `usage_entries`, `usage_dispositions`, `model_segments`, `quota_window_observations`, `session_graph_nodes` | 90 d | derivable from the native rollout (tombstoned: never again) | prune, destructive |
+| `sidecar.normalized_sessions` | `telemetry.db`, per native session: `muse_events`, `muse_parents`, `claude_messages`, `claude_tool_results`, `opencode_messages`, `opencode_tools`, `codex_*`, `rollout_*`, `collect_offsets`, `codex_tool_sources`, `source_bindings`, `source_observations`, `ingest_quarantine`, `coverage_gaps`, `source_cursors`, `usage_entries`, `usage_dispositions`, `model_segments`, `quota_window_observations`, `session_graph_nodes` | 90 d | derivable from the native rollout (tombstoned: never again) | prune, destructive |
 | `sidecar.operating_intervals` | `operating_intervals`, `operating_clock`, `operating_gaps` | no TTL | source of truth (ticker observations) | retain; full sidecar backup |
 | `sidecar.attention_samples` | `attention_samples` | 90 d | source of truth (sampled live, R4) | prune, destructive |
 | `sidecar.health_evaluations` | `health_evaluations` | 90 d | derivable | prune |
@@ -417,6 +417,8 @@ $ herdr-projects telemetry demo backup restore --from <tmp>/backup-2026-09-30
     "fx_tables": 0,
     "gemini_file_cursors": 0,
     "health_evaluations": 0,
+    "muse_events": 0,
+    "muse_parents": 0,
     "opencode_messages": 0,
     "opencode_tools": 0,
     "operating_clock": 0,

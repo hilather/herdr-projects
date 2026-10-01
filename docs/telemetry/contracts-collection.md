@@ -2420,3 +2420,95 @@ failures, 4 ignored**. All eleven non-socket OTLP workflows pass, including
 mixed unsupported instruments. The three failures are the OTLP TCP listener
 tests listed above, each failing with `Operation not permitted`; live tests
 remain steward-only. Clippy completes with no warnings in changed files.
+
+## DG4i — Muse native sessions, fixture certification
+
+Muse `1.4.0-R4161.1` native collection supersedes DG4g's `none` claim
+using the sanitized live two-turn and two-child evidence in
+`tests/fixtures/telemetry/muse-1.4.0/`. Native capability is **fixture**,
+version `muse/1.4.0-R4161.1`; no native live claim or recorded-live registry
+entry changes until the steward reruns reconciliation. `otlp:muse` is unchanged.
+DG4g found `telemetry export DISABLED` in the public build's installed
+evidence. A steward live observation of disabled OTLP export and harness
+confirmation remain pending; the sanitized session corpus alone proves no
+exporter behavior.
+
+Discovery is limited to recorded execution homes of Muse-kind attempts:
+`${XDG_DATA_HOME}/muse/sessions/YYYY/MM/DD/<session>/session.jsonl` and
+`subagent/<child>/session.jsonl`. The recorded clean execution environment
+resolves the default XDG data root to `<execution_home>/.local/share`; collection never uses
+its own ambient XDG variables, owner configuration or owner session files.
+An arbitrary external XDG root is not retained by the current profile contract
+and is not inferred. Parent `runtime.session.metadata` workspace_root is
+compared to the attempt worktree using A1 home, kind, time and revocation
+rules. Child metadata lacks workspace_root: the exact parent file path in
+that home supplies its workspace binding, while the child's own metadata
+time still has to meet A1. Missing or untimed parent metadata leaves children unbound.
+Child session identities and parent links come from directories, not the
+fixture's independently sanitized stream ids or text.
+
+Only `runtime.session` / `payload.event.kind=model_completed` contributes
+usage, once per (path-derived session, outer event id). The shared reader
+budgets, complete-line waiting, cursor inode/truncation replay, transaction
+boundaries, malformed quarantine and tombstones apply unchanged. Stream
+`ingest` migration 0013 adds `muse_events` and exact parent-path digests in `muse_parents`; it follows the native-session
+retention and backup class, including restore tombstone filtering. Accounting
+migration 0018 extends the existing ledger source/normalization constraints
+without changing its follows-sources retention or backup classification.
+
+DG4i normalizes input as inclusive of cache reads and writes; output includes
+reasoning. The near-constant parent input (19,947 then 19,993), while read
+hits rise from 5,233 to 14,065, supports treating reads as an input subset.
+This is the corpus-based normalization rule, not a provider-wide live claim.
+For example turn two input 19,993 includes 14,065 read hits, leaving 5,928
+new input. Explicit cache_read_tokens and cache_write_tokens are used;
+`cached_tokens` is never added or used as a read alias because DG4g found it
+can sum creation and reads for Anthropic. Nonzero creation is not established
+by this corpus (all four writes are zero). Normalization `muse-v1` uses
+new input = input − read − write and total = input + output.
+`goal_usage_attribution` repeats completion quantities and is excluded;
+`session.end` resource usage and terminal/display events are not token usage.
+The four observed completions total input 46,344, read 22,227, output 1,318,
+reasoning 1,058 and total 47,662. Two children count toward the parent attempt
+and retain SubAgentActivity metadata and path-derived parent links.
+
+The adapter maps only session identity, binding workspace, timestamp, version,
+model, completion id and numeric usage through the existing metadata
+allowlist. It retains no prompt, assistant text, tool input/output, reminders,
+terminal or display bodies. Planted-secret E2E scans include database/WAL/SHM.
+`telemetry_live::muse_live` obtains harness_usage from the execution home's
+own model_completed events, including children, with the same normalization
+and deduplication; stdout and attribution events cannot inflate reconciliation.
+
+
+### DG4i validation
+
+Ran all 22 `tests/telemetry*.rs` suites with
+`TMPDIR=$PWD/target/tmp cargo test --locked --offline -j 3 --features state-store --no-fail-fast`
+and one `--test <suite>` argument per suite: **228 passed, 7 socket-only
+failures, 17 ignored**. Ignored cases include the four owner-gated live harnesses
+and 13 on-disk scale/resource cases; no agent CLI was run.
+After final A1 hardening, reran `telemetry`, `telemetry_accounting` and
+`telemetry_muse`: **52 passed, 2 of the same socket failures**; Muse's six
+E2E workflows all pass. The full run also passes the other native adapters,
+conformance, certification, collectors, maintenance, scale and runbook workflows.
+The source allowlist envelopes and the database/WAL/SHM secret scans pass.
+
+Every remaining failure is `Operation not permitted` at a socket bind:
+
+| Suite | Test | Socket |
+| --- | --- | --- |
+| `telemetry` | `attempts_show_attention_summary` | Unix |
+| `telemetry_accounting` | `attention_intervals_union_and_censor` | Unix |
+| `telemetry_health` | `recommendations_and_notices_change_no_canonical_state_and_no_dispatch` | Unix |
+| `telemetry_otlp` | `http_auth_limits_malformed_and_replay` | TCP loopback |
+| `telemetry_otlp` | `http_request_rate_is_bounded` | TCP loopback |
+| `telemetry_otlp` | `http_protobuf_attempt_token_binding_auth_and_project_token_unchanged` | TCP loopback |
+| `telemetry_workspace` | `thread_start_records_the_dispatch_reason_and_the_sidebar_suffix` | Unix |
+
+No socket workaround was attempted. The steward reruns these outside the sandbox.
+Native live certification and exporter behavior remain pending that rerun.
+
+`cargo clippy --locked --offline -j 3 --features state-store --all-targets`
+completed successfully. No warning points at a changed line or either new Rust
+file; pre-existing warnings elsewhere remain. `git diff --check` passes.

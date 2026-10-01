@@ -847,7 +847,7 @@ fn rollouts_read_before_a4_gain_their_metadata_on_the_next_collect() {
     }
     let (upgraded, _) = f.cli("collect");
     assert_eq!(upgraded["collected"]["records"], 0, "the re-read counts nothing twice");
-    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 12}));
+    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 13}));
     assert!(fresh == ledger(&f), "the upgraded sidecar equals a fresh collect");
     assert_eq!(f.cli_args(&["usage", "--json"]).0, fresh_usage);
     assert_eq!(f.cli_args(&["collectors", "sessions"]).0, fresh_sessions);
@@ -944,7 +944,7 @@ fn rollouts_read_before_a5_gain_their_thread_lineage_on_the_next_collect() {
     assert_eq!(sessions[2]["subagent"]["kind"], "other");
     let (upgraded, _) = f.cli("collect");
     assert_eq!(upgraded["collected"]["records"], 0, "the re-read counts nothing twice");
-    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 12}));
+    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 13}));
     assert!(fresh == ledger(&f), "the upgraded sidecar equals a fresh collect");
     assert_eq!(f.cli_args(&["usage", "--json"]).0, fresh_usage);
     assert_eq!(f.cli_args(&["collectors", "sessions"]).0, fresh_sessions);
@@ -1064,7 +1064,7 @@ fn rollouts_read_before_a6_gain_their_tool_metadata_on_the_next_collect() {
     assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 5}), "a read does not migrate");
     let (upgraded, _) = f.cli("collect");
     assert_eq!(upgraded["collected"]["records"], 0, "the re-read counts nothing twice");
-    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 12}));
+    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 13}));
     assert!(fresh == ledger(&f), "the upgraded sidecar equals a fresh collect");
     assert_eq!(f.cli_args(&["usage", "--json"]).0, fresh_usage);
     assert_eq!(f.cli_args(&["collectors", "tools", "--json"]).0, fresh_tools);
@@ -1128,7 +1128,7 @@ fn rollouts_read_before_a8_gain_their_live_run2_metadata_on_the_next_collect() {
     assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 7}), "a read does not migrate");
     let (upgraded, _) = f.cli("collect");
     assert_eq!(upgraded["collected"]["records"], 0, "the re-read counts nothing twice");
-    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 12}));
+    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 13}));
     assert!(fresh == ledger(&f), "the upgraded sidecar equals a fresh collect");
     assert_eq!(f.count("ingest_quarantine"), 0, "no digest conflict");
     assert_eq!(f.cli_args(&["usage", "--json"]).0, fresh_usage);
@@ -1186,7 +1186,7 @@ fn rollouts_read_before_a7_gain_their_subagent_detail_and_turn_state_on_the_next
     assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 6}), "a read does not migrate");
     let (upgraded, _) = f.cli("collect");
     assert_eq!(upgraded["collected"]["records"], 0, "the re-read counts nothing twice");
-    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 12}));
+    assert_eq!(f.cli_args(&["collectors", "status"]).0, json!({"stream": "ingest", "version": 13}));
     assert!(fresh == ledger(&f), "the upgraded sidecar equals a fresh collect");
     assert_eq!(f.count("ingest_quarantine"), 0, "no digest conflict");
     assert_eq!(f.cli_args(&["usage", "--json"]).0, fresh_usage);

@@ -513,7 +513,7 @@ fn computed(list: &[Session], coverage: &Value) -> BTreeMap<String, Value> {
         "collaboration": {"calls": t.by_namespace.get(COLLABORATION).copied().unwrap_or(0), "spawned_threads": t.spawned.len(), "collab_items": t.collab_items,
             "basis": "function calls in namespace `collaboration` (spawn_agent, wait_agent) and the agent threads a spawn call started (its SubAgentActivity \
                 item id is the call id); not tool executions"},
-        "certified": {"calls": if list.iter().any(|s| s.id.starts_with("claude-code:") || s.id.starts_with("opencode:")) { "fixture" } else { "live" }, "call_status": "live for custom_tool_call, fixture for function_call", "exec_items": if list.iter().any(|s| s.id.starts_with("claude-code:") || s.id.starts_with("opencode:")) { "fixture" } else { "live" }, "mcp_calls": "live",
+        "certified": {"calls": if list.iter().any(|s| s.id.starts_with("claude-code:") || s.id.starts_with("opencode:") || s.id.starts_with("muse:")) { "fixture" } else { "live" }, "call_status": "live for custom_tool_call, fixture for function_call", "exec_items": if list.iter().any(|s| s.id.starts_with("claude-code:") || s.id.starts_with("opencode:") || s.id.starts_with("muse:")) { "fixture" } else { "live" }, "mcp_calls": "live",
             "turn_aborts": "live", "namespaces": "live"},
         "coverage": coverage});
     if list.iter().any(|s| s.id.starts_with("claude-code:")) {

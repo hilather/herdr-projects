@@ -200,6 +200,34 @@ fn own_stdout(bytes: &[u8]) -> Vec<Value> {
 }
 // Only adapter usage outputs are inspected, never configuration or credentials.
 fn own_files(kind: &str, home: &Path) -> Vec<Value> {
+    if kind == "muse" {
+        fn scan(dir: &Path, depth: usize, out: &mut Vec<Value>, seen: &mut std::collections::BTreeSet<(String,String)>) {
+            if depth > 6 || !fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) { return; }
+            let Ok(entries) = fs::read_dir(dir) else { return };
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|t| t.is_dir()) { scan(&entry.path(),depth+1,out,seen); }
+                else if entry.file_type().is_ok_and(|t| t.is_file()) && entry.file_name() == "session.jsonl" {
+                    let session = dir.strip_prefix(dir.ancestors().nth(depth).unwrap_or(dir)).unwrap_or(dir).display().to_string();
+                    for line in fs::read(entry.path()).unwrap().split(|b| *b == b'\n') {
+                        let Ok(v) = serde_json::from_slice::<Value>(line) else { continue };
+                        if v["payload_type"] != "runtime.session" || v["payload"]["event"]["kind"] != "model_completed" { continue; }
+                        let Some(id) = v["id"].as_str() else { continue };
+                        if !seen.insert((session.clone(),id.to_owned())) { continue; }
+                        let u = &v["payload"]["event"]["usage"];
+                        let input = u["input_tokens"].as_u64();
+                        let output = u["output_tokens"].as_u64();
+                        let c = json!({"input_tokens":input,"output_tokens":output,
+                            "cached_input_tokens":u["cache_read_tokens"],"cache_write_input_tokens":u["cache_write_tokens"],
+                            "reasoning_output_tokens":u["reasoning_tokens"],"total_tokens":input.zip(output).and_then(|(i,o)| i.checked_add(o))});
+                        out.push(json!({"counters":c,"unmapped_keys":[],"model":v["payload"]["event"]["model"].as_str().filter(|s| s.len()<=128 && s.chars().all(|c|c.is_ascii_alphanumeric() || "-._/:".contains(c)) && !s.contains(MARKER))}));
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        scan(&home.join(".local/share/muse/sessions"),0,&mut out,&mut std::collections::BTreeSet::new());
+        return out;
+    }
     let mut paths = Vec::new();
     if kind == "codex" {
         fn sessions(dir: &Path, paths: &mut Vec<PathBuf>) {
@@ -429,7 +457,7 @@ fn live(kind: &str) {
     }
     drop(receiver);
     let file_usage = if kind == "grok" { Vec::new() } else { own_files(kind, &f.home) };
-    if !file_usage.is_empty() {
+    if kind == "muse" || !file_usage.is_empty() {
         own = file_usage;
     }
     if matches!(kind, "claude" | "grok") {

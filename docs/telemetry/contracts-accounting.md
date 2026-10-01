@@ -1589,3 +1589,17 @@ input, stale-frontier unavailability, late **80/1100** restatement and pinned
 as-of value/body/digest/watermarks. The unchanged scale gate remains the
 correctness oracle. 100k measurements: certificate-scale §4.15, pending the
 steward's serial 1M certification.
+
+### DG4i Muse fixture ledger
+
+Accounting stream 0018 admits source `muse` with normalization `muse-v1`,
+preserving existing entries and dispositions. Native `model_completed` events
+are request deltas; identity is (path-derived session, outer event id), and
+child usage joins the parent attempt by the exact parent session file path.
+Input includes explicit read/write cache counts, output includes reasoning,
+and total is input + output. Combined `cached_tokens` and repeated goal
+attribution are excluded. Creation overlap is not exercised by the corpus:
+all four observed cache-write counters are zero. This is fixture certification
+for Muse 1.4.0-R4161.1, pending steward live reconciliation. Source identities
+and projections follow native-session retention/backup and tombstones. See
+[DG4i collection](contracts-collection.md#dg4i--muse-native-sessions-fixture-certification).

@@ -942,14 +942,10 @@ fn accounting_fields_match_the_adapter_certificate() {
         }
     }
     for (name, reason) in [
-        ("muse", "local_usage_schema_not_established"),
         ("cursor-agent", "stable_local_usage_format_not_evident"),
         ("otlp:cursor-agent", "protobuf_traces_only_no_usable_logs_or_metrics"),
     ] {
         let adapter = adapters.iter().find(|a| a["adapter"] == name).unwrap();
-        if name == "muse" {
-            assert_eq!(adapter["reviewed_versions"], json!(["1.4.0-R4161.1"]));
-        }
         assert_eq!(adapter["interface"], "none");
         assert_eq!(adapter["certified_versions"], json!([]));
         let fields = adapter["fields"].as_array().unwrap();

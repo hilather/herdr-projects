@@ -121,3 +121,11 @@ login copy, delete any scratch remaining after interrupted runs, and retain
 only the reviewed counts-only report. Never clean up an owner home, running
 server or ticker. DG4h adds OTLP stream migration 0003 and retained hashed-token/revocation
 metadata in full sidecar backups; plaintext attempt credentials are never stored.
+
+DG4i: `muse_live` reads its execution home's
+`.local/share/muse/sessions/**/session.jsonl`, including `subagent/<child>`
+files, for `harness_usage`. It counts only `runtime.session` model_completed
+outer event ids once per path session. Input includes explicit cache read/write
+counts, output includes reasoning; combined cached_tokens and repeated
+attribution events are excluded. Native fixture certification precedes the
+steward's live ledger reconciliation; public-build OTLP export may be disabled.
