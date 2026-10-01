@@ -1307,10 +1307,9 @@ the existing certified rollout adapter remains its collection path.
 | Gemini `gemini_cli.tool_call` | tool | `function_name`, `success`, `duration_ms` |
 
 Gemini's documented name uses **`api_response`**, not `api.response`;
-the latter is unmapped. Known log names may arrive in `eventName`, a string
-body containing exactly the reviewed name, or `event.name`. Arbitrary bodies
-are never stored. Known sum metrics retain their nonnegative value, reviewed
-unit (empty, USD, token/tokens/{token}), start/end nanosecond timestamps and
+the latter is unmapped. Known log names may arrive in `eventName` or
+`event.name`. Log bodies are never inspected or stored. Known sum metrics
+retain their nonnegative value, reviewed unit (empty, USD, token/tokens/{token}), start/end nanosecond timestamps and
 explicit delta/cumulative temporality. Cumulative samples remain snapshots,
 never deltas computed by guessing resets. Both logs and metrics are retained
 as independent native evidence: do not sum their overlapping token or cost
@@ -1904,10 +1903,13 @@ and `service.version=1.0.46 (2765805b9442)`. The exact semver gate remains
 fixture-certified; the certification registry is not promoted to live.
 
 `grok_code.api_request` logs are the single authoritative usage source.
-The event name may be the protobuf `eventName` or the exact reviewed string
-body `grok_code.api_request`; every other body is discarded.
+The real exporter supplies the event name in protobuf field 12 (`eventName`);
+`event.name` metadata is also accepted. Log bodies are never inspected.
 Allowlisted fields are model, input/output/reasoning/cache-read/cache-creation
 counts, integer `cost_usd_micros`, duration, stop reason and turn number.
+Invalid counters, inconsistent cache/reasoning subsets and overflow demote only
+the affected record to keys-only `kind=unmapped`, `reason=invalid_usage_counters`;
+valid records in the same batch still persist.
 Canonical counter aliases are also stored for the live comparison. Replay
 identity is scoped to attempt and binding, then a digest of `(session.id,
 event.sequence)` plus available prompt/turn context (sequences restart on

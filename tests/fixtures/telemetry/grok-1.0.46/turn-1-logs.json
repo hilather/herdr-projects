@@ -39,9 +39,7 @@
         {
           "logRecords": [
             {
-              "body": {
-                "stringValue": "grok_code.session_start"
-              },
+              "eventName": "grok_code.session_start",
               "timeUnixNano": "1000000000",
               "attributes": [
                 {
@@ -131,9 +129,7 @@
               ]
             },
             {
-              "body": {
-                "stringValue": "grok_code.user_prompt"
-              },
+              "eventName": "grok_code.user_prompt",
               "timeUnixNano": "1000000001",
               "attributes": [
                 {
@@ -199,9 +195,7 @@
               ]
             },
             {
-              "body": {
-                "stringValue": "grok_code.api_request"
-              },
+              "eventName": "grok_code.api_request",
               "timeUnixNano": "1000000002",
               "attributes": [
                 {
@@ -303,9 +297,7 @@
               ]
             },
             {
-              "body": {
-                "stringValue": "grok_code.turn_completed"
-              },
+              "eventName": "grok_code.turn_completed",
               "timeUnixNano": "1000000003",
               "attributes": [
                 {
@@ -377,9 +369,7 @@
               ]
             },
             {
-              "body": {
-                "stringValue": "grok_code.assistant_response"
-              },
+              "eventName": "grok_code.assistant_response",
               "timeUnixNano": "1000000004",
               "attributes": [
                 {
@@ -433,9 +423,7 @@
               ]
             },
             {
-              "body": {
-                "stringValue": "grok_code.session_end"
-              },
+              "eventName": "grok_code.session_end",
               "timeUnixNano": "1000000005",
               "attributes": [
                 {

@@ -480,8 +480,8 @@ fn unsupported_names_categories_and_missing_service_are_unmapped() {
         .as_array_mut()
         .unwrap()
         .truncate(1);
-    logs["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["body"] =
-        json!({"stringValue":"gemini_cli.api.response"});
+    logs["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["eventName"] =
+        json!("gemini_cli.api.response");
     assert_eq!(
         otlp::ingest(&f.project, "/v1/logs", &serde_json::to_vec(&logs).unwrap()).unwrap(),
         1
@@ -1354,16 +1354,10 @@ fn grok_live_shape_protobuf_two_turns_uses_api_calls_without_pii_or_double_count
         for turn in 1..=2 {
             for metrics in if metrics_first { [true, false] } else { [false, true] } {
                 let signal = if metrics { "metrics" } else { "logs" };
-                let mut root: Value = serde_json::from_slice(&fs::read(format!(
+                let root: Value = serde_json::from_slice(&fs::read(format!(
                     "{}/tests/fixtures/telemetry/grok-1.0.46/turn-{turn}-{signal}.json",
                     env!("CARGO_MANIFEST_DIR")
                 )).unwrap()).unwrap();
-                if metrics_first && !metrics {
-                    for log in root["resourceLogs"][0]["scopeLogs"][0]["logRecords"].as_array_mut().unwrap() {
-                        log["eventName"] = log["body"]["stringValue"].clone();
-                        log.as_object_mut().unwrap().remove("body");
-                    }
-                }
                 let endpoint = if metrics { "/v1/metrics" } else { "/v1/logs" };
                 let bytes = pb_request(&root, metrics);
                 assert!(otlp::ingest_attempt(&f.project, endpoint, &bytes, "application/x-protobuf", token).unwrap() > 0);
@@ -1425,6 +1419,18 @@ fn grok_build_version_fallback_and_request_identity_are_fail_closed() {
     let minted = otlp::mint_attempt_token(&f.project, &f.attempt, 600).unwrap();
     let token = minted["token"].as_str().unwrap();
     let original: Value = serde_json::from_slice(include_bytes!("fixtures/telemetry/grok-1.0.46/turn-1-logs.json")).unwrap();
+    let mut body_only = original.clone();
+    for log in body_only["resourceLogs"][0]["scopeLogs"][0]["logRecords"].as_array_mut().unwrap() {
+        log["body"] = json!({"stringValue": log["eventName"].clone()});
+        log.as_object_mut().unwrap().remove("eventName");
+    }
+    for (bytes, content_type) in [
+        (serde_json::to_vec(&body_only).unwrap(), "application/json"),
+        (pb_request(&body_only, false), "application/x-protobuf"),
+    ] {
+        otlp::ingest_attempt(&f.project, "/v1/logs", &bytes, content_type, token).unwrap();
+        assert!(otlp::records(&f.project).unwrap().as_array().unwrap().iter().all(|r| r["kind"] == "unmapped"));
+    }
     let mut root = original.clone();
     root["resourceLogs"][0]["resource"]["attributes"].as_array_mut().unwrap().retain(|a| a["key"] != "client.version");
     otlp::ingest_attempt(&f.project, "/v1/logs", &pb_request(&root, false), "application/x-protobuf", token).unwrap();
@@ -1452,13 +1458,13 @@ fn grok_build_version_fallback_and_request_identity_are_fail_closed() {
 }
 
 #[test]
-fn grok_prompt_turn_fallback_retains_cache_creation_and_rejects_invalid_usage_atomically() {
+fn grok_prompt_turn_fallback_retains_cache_creation_and_isolates_invalid_usage() {
     let f = Fixture::reserved();
     let minted = otlp::mint_attempt_token(&f.project, &f.attempt, 600).unwrap();
     let token = minted["token"].as_str().unwrap();
     let mut root: Value = serde_json::from_slice(include_bytes!("fixtures/telemetry/grok-1.0.46/turn-1-logs.json")).unwrap();
     let logs = root["resourceLogs"][0]["scopeLogs"][0]["logRecords"].as_array_mut().unwrap();
-    logs.retain(|r| r["body"]["stringValue"] == "grok_code.api_request");
+    logs.retain(|r| r["eventName"] == "grok_code.api_request");
     let attrs = logs[0]["attributes"].as_array_mut().unwrap();
     attrs.retain(|a| !["session.id", "event.sequence"].contains(&a["key"].as_str().unwrap()));
     for attr in attrs {
@@ -1475,8 +1481,19 @@ fn grok_prompt_turn_fallback_retains_cache_creation_and_rejects_invalid_usage_at
     for attr in root["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["attributes"].as_array_mut().unwrap() {
         if attr["key"] == "cache_read_tokens" { attr["value"]["intValue"] = json!("15426"); }
     }
-    assert!(otlp::ingest_attempt(&f.project, "/v1/logs", &pb_request(&root, false), "application/x-protobuf", token).is_err());
-    assert_eq!(otlp::records(&f.project).unwrap(), before);
+    let good = serde_json::from_slice::<Value>(include_bytes!("fixtures/telemetry/grok-1.0.46/turn-2-logs.json")).unwrap();
+    let good = good["resourceLogs"][0]["scopeLogs"][0]["logRecords"].as_array().unwrap().iter().find(|r| r["eventName"] == "grok_code.api_request").unwrap().clone();
+    root["resourceLogs"][0]["scopeLogs"][0]["logRecords"].as_array_mut().unwrap().push(good);
+    assert_eq!(otlp::ingest_attempt(&f.project, "/v1/logs", &pb_request(&root, false), "application/x-protobuf", token).unwrap(), 2);
+    let records = f.cli_args(&["otlp", "records"]).0;
+    let rows = records.as_array().unwrap();
+    assert_eq!(rows.iter().filter(|r| r["kind"] == "usage").count(), 2);
+    assert!(rows.iter().any(|r| r["kind"] == "usage" && r["attributes"]["input_tokens"] == 15468));
+    let diagnostic = rows.iter().find(|r| r["reason"] == "invalid_usage_counters").unwrap();
+    assert_eq!(diagnostic["kind"], "unmapped");
+    assert!(diagnostic.get("attributes").is_none());
+    assert!(diagnostic.get("usage_authority").is_none());
+    assert!(diagnostic["unmapped_attribute_keys"].as_array().unwrap().contains(&json!("cache_read_tokens")));
     privacy_scan(&f, &["lc4-planted-secret@example.invalid"]);
 }
 
@@ -1487,7 +1504,7 @@ fn grok_continuation_sequence_restart_does_not_merge_distinct_api_calls() {
     let token = minted["token"].as_str().unwrap();
     let mut root: Value = serde_json::from_slice(include_bytes!("fixtures/telemetry/grok-1.0.46/turn-1-logs.json")).unwrap();
     let logs = root["resourceLogs"][0]["scopeLogs"][0]["logRecords"].as_array_mut().unwrap();
-    logs.retain(|r| r["body"]["stringValue"] == "grok_code.api_request");
+    logs.retain(|r| r["eventName"] == "grok_code.api_request");
     assert_eq!(otlp::ingest_attempt(&f.project, "/v1/logs", &pb_request(&root, false), "application/x-protobuf", token).unwrap(), 1);
     // A resumed headless process restarts its event sequence. Prompt/turn
     // context keeps an equally numbered call in the same session distinct.

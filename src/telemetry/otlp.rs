@@ -335,13 +335,12 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
         for scope in array(resource, if metrics { "scopeMetrics" } else { "scopeLogs" })? {
             for entry in array(scope, if metrics { "metrics" } else { "logRecords" })? {
                 let ea = attributes(entry)?;
-                // Log body may carry only a reviewed event name, never arbitrary text.
+                // Event names come from metadata; log bodies are never inspected.
                 let name = if metrics {
                     entry["name"].as_str()
                 } else {
                     entry["eventName"]
                         .as_str()
-                        .or_else(|| entry["body"]["stringValue"].as_str())
                         .or_else(|| ea.get("event.name").and_then(Value::as_str))
                 }
                 .unwrap_or("");
@@ -426,6 +425,7 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                         }
                     }
                     let mut allowed = BTreeMap::new();
+                    let mut invalid_usage = false;
                     if let Some((_, native, kind, fields)) = mapping {
                         payload["native_name"] = json!(native);
                         payload["kind"] = json!(kind);
@@ -462,6 +462,10 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                                         .map(|b| json!(b)),
                                     _ => number(raw),
                                 };
+                                if safe.is_none() && harness == "grok" && !metrics && *native == "grok_code.api_request" {
+                                    invalid_usage = true;
+                                    continue;
+                                }
                                 ensure!(safe.is_some(), "invalid mapped attribute");
                                 allowed.insert(*field, safe.unwrap());
                             }
@@ -484,18 +488,27 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                                 if let Some(key) = key {
                                     payload["usage_source_key"] = json!(format!("{:x}", Sha256::digest(serde_json::to_vec(&key)?)));
                                     payload["usage_authority"] = json!("api_request");
-                                    let input = payload["attributes"]["input_tokens"].as_u64().context("invalid Grok input")?;
-                                    let output = payload["attributes"]["output_tokens"].as_u64().context("invalid Grok output")?;
-                                    let cached = payload["attributes"]["cache_read_tokens"].as_u64().context("invalid Grok cache")?;
-                                    let creation = payload["attributes"]["cache_creation_tokens"].as_u64().context("invalid Grok cache creation")?;
-                                    let reasoning = payload["attributes"]["reasoning_tokens"].as_u64().context("invalid Grok reasoning")?;
-                                    ensure!(payload["attributes"]["cost_usd_micros"].as_u64().is_some(), "invalid Grok cost");
-                                    ensure!(cached.checked_add(creation).is_some_and(|n| n <= input), "Grok cache exceeds input");
-                                    ensure!(reasoning <= output, "Grok reasoning exceeds output");
-                                    payload["attributes"]["cached_input_tokens"] = json!(cached);
-                                    payload["attributes"]["cache_write_input_tokens"] = payload["attributes"]["cache_creation_tokens"].clone();
-                                    payload["attributes"]["reasoning_output_tokens"] = payload["attributes"]["reasoning_tokens"].clone();
-                                    payload["attributes"]["total_tokens"] = json!(input.checked_add(output).context("Grok token overflow")?);
+                                    let counters = (|| {
+                                        let a = &payload["attributes"];
+                                        let input = a["input_tokens"].as_u64()?;
+                                        let output = a["output_tokens"].as_u64()?;
+                                        let cached = a["cache_read_tokens"].as_u64()?;
+                                        let creation = a["cache_creation_tokens"].as_u64()?;
+                                        let reasoning = a["reasoning_tokens"].as_u64()?;
+                                        a["cost_usd_micros"].as_u64()?;
+                                        if cached.checked_add(creation)? > input || reasoning > output {
+                                            return None;
+                                        }
+                                        Some((cached, input.checked_add(output)?))
+                                    })();
+                                    if let Some((cached, total)) = counters {
+                                        payload["attributes"]["cached_input_tokens"] = json!(cached);
+                                        payload["attributes"]["cache_write_input_tokens"] = payload["attributes"]["cache_creation_tokens"].clone();
+                                        payload["attributes"]["reasoning_output_tokens"] = payload["attributes"]["reasoning_tokens"].clone();
+                                        payload["attributes"]["total_tokens"] = json!(total);
+                                    } else {
+                                        invalid_usage = true;
+                                    }
                                 } else {
                                     payload["kind"] = json!("unmapped");
                                     payload["reason"] = json!("missing_usage_identity");
@@ -534,7 +547,15 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                     } else {
                         payload["kind"] = json!("unmapped");
                     }
-                    let allowed_keys = mapping.map_or(&[][..], |m| m.3);
+                    if invalid_usage {
+                        payload["kind"] = json!("unmapped");
+                        payload["reason"] = json!("invalid_usage_counters");
+                        let object = payload.as_object_mut().unwrap();
+                        object.remove("attributes");
+                        object.remove("usage_authority");
+                        object.remove("usage_source_key");
+                    }
+                    let allowed_keys = if invalid_usage { &[][..] } else { mapping.map_or(&[][..], |m| m.3) };
                     let keys: Vec<_> = attrs
                         .keys()
                         .filter(|k| {
