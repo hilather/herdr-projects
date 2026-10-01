@@ -1,9 +1,24 @@
-# Codex 0.159.2 certification — DRAFT
+# Codex 0.159.2 live certification
 
-The owner's installed version is 0.159.2. The steward will append the passing
-live reconciliation after rerunning the owner-approved two-turn `exec` /
-`exec resume --last` workflow. This draft does not claim that rerun passed.
-No agent CLI was run during LC1.
+The owner's installed version is 0.159.2. **Certified live on 2026-10-01** by
+the steward's owner-approved run of `tests/telemetry_live.rs::codex_live`:
+two turns (`exec --json -s read-only`, then `exec resume --last --json`), model
+`gpt-6.1-sol`, reasoning effort low, in a disposable execution home that
+held a private 0600 copy of the owner's login (never read; the home was deleted
+after the run).
+
+| | Input | Cached | Cache write | Output | Reasoning | Total |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Turn 1 delta (ledger) | 14,345 | 12,288 | 0 | 5 | 0 | 14,350 |
+| Turn 2 delta (ledger) | 14,378 | 14,208 | 0 | 5 | 0 | 14,383 |
+| Ledger total | 28,723 | 26,496 | 0 | 10 | 0 | 28,733 |
+| Codex's own `thread_token_usage` | 28,723 | 26,496 | 0 | 10 | 0 | 28,733 |
+| Difference | 0 | 0 | 0 | 0 | 0 | 0 |
+
+Binding was `bound` and unmapped keys were empty. The privacy marker
+scan over telemetry.db, including WAL/SHM, found 0 hits. The counts-only
+report is retained by the steward. The sections below record the first, failed
+report and why it failed: a harness summation bug, not a collector defect.
 
 The initial live report failed: input 28,703, cached 24,576, output 10,
 total 28,713 became ledger input 57,406. Binding was bound, unmapped keys
@@ -60,8 +75,7 @@ Capabilities now expose `live_versions` on Codex fields. 0.159.2 evidence
 covers usage counters (including reconciliation totals), turn_context model,
 and session binding inputs (id, timestamp, cwd, cli_version). Tool, subagent,
 fork, duration, quota and other existing field claims retain their 0.154.0
-scope. The all-version certification registry cites this draft pending the
-steward's passing reconciliation.
+scope. The certification registry cites this report.
 
 ## LC1 sandbox validation
 
