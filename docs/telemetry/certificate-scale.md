@@ -1845,6 +1845,138 @@ locked/offline `-j 3` flags; no warning falls on changed lines. Benchmark
 datasets are removed before commit. Files: accounting migration 0017,
 `tests/telemetry_accounting.rs`, `tests/telemetry_claude.rs`, and this certificate.
 
+### 4.17 P5c: recover capture after compact table replacement (100k only)
+
+Branch `perf/sidecar-size`, 2026-10-01. **Pending the steward's serial 1M
+certification.** Stream versions and every existing metric/coverage expectation
+are unchanged. This repairs the accounting frontier underlying P1's incremental
+sync while preserving L6's compact size; it closes no freshness or 1M target.
+
+`DROP TABLE` removes its triggers. The migration runner already preserves
+surviving trigger SQL around native rebuilds, but cannot recover triggers lost
+by an earlier upgrade once the stream versions are current. P5c checks the
+22 required compact-table capture names in one read of `sqlite_master`, even
+on the current-store fast path. Missing capture is restored atomically from
+0012's exact trigger definitions, and `capture_repaired` requests one full
+replay: mutations committed without capture are absent from the dirty queue.
+The trigger-preservation selector also now follows accounting compaction at
+**17**, rather than DG2's **16**. Intact current stores still take no migration
+write transaction. No new stream, table, crate or source process spawn.
+
+The complete restored trigger inventory is:
+
+| Backing table | Restored triggers |
+| --- | --- |
+| `codex_turns` | `accounting_codex_turns_insert`, `accounting_codex_turns_update`, `accounting_codex_turns_delete` |
+| `codex_rate_limits` | `accounting_codex_rate_limits_insert`, `accounting_codex_rate_limits_update`, `accounting_codex_rate_limits_delete`, `accounting_quota_limits_update` |
+| `codex_rate_limit_windows` | `accounting_codex_rate_limit_windows_insert`, `accounting_codex_rate_limit_windows_update`, `accounting_codex_rate_limit_windows_delete`, `accounting_quota_secondary_insert`, `accounting_quota_secondary_update` |
+| `rollout_metadata` | `accounting_rollout_metadata_insert`, `accounting_rollout_metadata_update`, `accounting_rollout_metadata_delete` |
+| `rollout_threads` | `accounting_rollout_threads_insert`, `accounting_rollout_threads_update`, `accounting_rollout_threads_delete` |
+| `rollout_forks` | `accounting_rollout_forks_insert`, `accounting_rollout_forks_update`, `accounting_rollout_forks_delete` |
+| `usage_dispositions` | `accounting_dispositions_update` (also repairs stores predating P5b) |
+
+Sequence increments, old/new dirty session selection, native-delete
+invalidation, projection invalidation and quota rebuild conditions are copied
+unchanged. In particular, metadata/thread/fork deletes retain main's dirty/sequence
+behavior without adding native-delete invalidation. The secondary INSERT
+`WHEN EXISTS` and untouched source quota `WHEN` conditions retain their exact
+semantics. No arithmetic, normalization, coverage or as-of selector changes.
+
+The audit covers every DROP/RENAME/view replacement in all four compaction
+migrations. Native 0004 rebuilds the first two tables above and replaces only
+an index on `codex_usage`. Ingest 0012 also rebuilds `codex_usage_times`,
+`codex_tool_calls`, `codex_exec_items`, `codex_turn_aborts`, `codex_mcp_calls`,
+`codex_agent_items`, `codex_tool_namespaces`, `rollout_subagents`,
+`rollout_ingest_state`, `rollout_turn_ends`, `rollout_turn_terminations`,
+`codex_tool_sources` and `source_bindings`; these have analytics capture,
+not 0012 accounting capture. Accounting 0017 rebuilds dispositions. Analytics
+0004 replaces `analytics_lineage` and `analytics_provider_aggregates` with
+views over `analytics_lineage_rows`/`analytics_lineage_values` and
+`analytics_provider_rows`; analytics-owned tables are intentionally excluded
+from the input frontier. Ingest's `source_observations` becomes a view over
+`source_observation_rows`, `source_observation_strings` and
+`source_observation_payloads`. Its INSTEAD OF writes reach those physical
+tables, which P2's schema-version installation discovers and captures.
+No accounting-tracked table becomes a view in these migrations.
+
+The new public CLI E2E reproduces a current compact sidecar with missing
+capture, including a projection correction missed while capture was absent.
+Sync repairs it and replays the original facts. The sidecar's own
+`sqlite_master` guards all twelve original accounting-tracked tables and all
+five quota triggers, and every eligible physical table's three analytics
+input triggers. A zero-usage child session is established first (a brand-new
+session intentionally uses DG2's missing-cache full replay). The workflow then
+appends a completed turn, primary rate snapshot, secondary window, fork,
+metadata and thread header to a resumed rollout, collects, and explicitly
+requires incremental sync. Ledger, sessions, quota bytes and the stable
+accounting status frontier equal a forced full replay; mode/rebuild reason
+appropriately identify the different paths. Independent persisted updates
+and deletes check each affected table's dirty session and exact sequence
+increment, then run public sync. The first secondary insertion leaves replay
+off; a replacement after its primary observation exists sets replay on.
+The envelope backing-row input generation advances on actual collection.
+No unit or source-text tests were added; the scale gate is unchanged.
+
+Both release builds use §1's exact locked/offline `-j 3` no-run command.
+Phases 0/1 prepare the baseline, followed by `scale_8_accounting_pass` with
+`SCALE_EVENTS=100000 SCALE_ACTIVE=64 SCALE_REPEATS=3 SCALE_TAG=p5c-before`.
+After the change, restore the archived initial fixture at the same absolute
+paths (canonical/source bytes and generator state unchanged), refresh only
+the 64 active files' mtimes, then repeat phases 1/8 with `p5c-after`.
+Phase 8 appends the same deterministic counter/event mix, with its usual live
+wall-clock timestamps. All datasets and copies remain under `$PWD/bench-data/`;
+one bench process at a time, no overlapping build/test. No 1M run.
+
+| Cold ingest, one sample per version, 100k/64 | Before | After |
+| --- | --- | --- |
+| Rollout bytes | 53,714,281 | 53,714,281 |
+| Sidecar database / WAL bytes | 105,041,920 / 0 | 105,041,920 / 0 |
+| Collection wall time | 22,538.43 ms | 16,284.29 ms |
+| Accounting sync wall time / peak RSS | 3,898.61 ms / 60,896 KiB | 3,106.76 ms / 60,812 KiB |
+| Analytics refresh wall time / peak RSS | 3,552.06 ms / 203,192 KiB | 2,783.45 ms / 202,664 KiB |
+| Health evaluation wall time / peak RSS | 4,275.39 ms / 89,532 KiB | 2,242.21 ms / 89,404 KiB |
+| Loadavg start (1 / 5 / 15 min) | 4.31 / 4.26 / 4.24 | 4.90 / 2.96 / 3.15 |
+| Loadavg end (1 / 5 / 15 min) | 4.11 / 4.20 / 4.22 | 3.57 / 2.80 / 3.10 |
+
+| Incremental accounting, three appended-data samples | Before | After |
+| --- | --- | --- |
+| Sync wall p50 / p95 | 317.42 / 340.42 ms | 250.84 / 252.38 ms |
+| Peak RSS | 30,184 KiB | 29,988 KiB |
+| Loadavg start (1 / 5 / 15 min) | 4.10 / 4.20 / 4.22 | 2.85 / 2.68 / 3.05 |
+| Loadavg end (1 / 5 / 15 min) | 4.09 / 4.19 / 4.22 | 2.94 / 2.70 / 3.06 |
+
+All four phase results report `violations: []` and
+`canonical_unchanged: true`. Cold totals remain 19,800 accepted records:
+input 202,285,731, cached 50,862,666, output 20,258,435, reasoning 5,062,106.
+L6's compact bytes are preserved exactly on this intact fixture. The after
+host is quieter over the accounting samples; **no timing speedup or RSS
+improvement is claimed**, and damaged-store recovery pays one full replay.
+
+Validation uses `TMPDIR=$PWD/target/tmp`, `RUST_TEST_THREADS=1` and the exact
+locked/offline `-j 3` commands. The fifteen requested suites pass **184 tests**
+with **12 ignored**; all twenty telemetry suites pass **213 tests**, with
+**12 ignored** and only **six socket-only failures**. The four Unix-socket
+bind denials (`Operation not permitted`) are:
+
+- `telemetry::attempts_show_attention_summary`
+- `telemetry_accounting::attention_intervals_union_and_censor`
+- `telemetry_health::recommendations_and_notices_change_no_canonical_state_and_no_dispatch`
+- `telemetry_workspace::thread_start_records_the_dispatch_reason_and_the_sidebar_suffix`
+
+The additional TCP loopback bind denials are
+`telemetry_otlp::http_auth_limits_malformed_and_replay` and
+`telemetry_otlp::http_request_rate_is_bounded`. No workaround or expectation
+change. The unchanged debug load gate passes all exact-total, single-acceptance,
+as-of, byte-identical rebuild and canonical-digest checks. Two final unchanged
+release gate runs pass in **11.61 s** and **11.65 s**. An initial additional
+release run failed with SQLite `IOERR_WRITE` (778, error writing to disk);
+it is recorded separately from socket failures, without assigning an
+unconfirmed cause or changing the gate. Clippy on accounting and scale reports
+zero warnings on changed lines (97 unrelated diagnostics).
+Benchmark data is removed before commit. Files: `src/telemetry/sidecar.rs`,
+`migrations/telemetry/accounting/repair_compact_capture.sql`,
+`tests/telemetry_accounting.rs`, and this certificate.
+
 ## 5. Inefficiencies found and fixed
 
 The first measurement (same generator, same host) missed the query and
@@ -2070,7 +2202,12 @@ owner. None is hidden by loosening the target.
   4.83 → 4.54 before / 4.78 → 4.54 after. **P5b preserves compact size
   at 105,037,824 → 105,037,824 bytes on its current 100k fixture (§4.16),
   at loads 5.26 → 4.16 before / 2.51 → 1.91 after; pending the steward's
-  1M certification.** TM5.3's defaults require an
+  1M certification.** **P5c restores compact-table accounting capture and
+  preserves 105,041,920 → 105,041,920 bytes at 100k/64 (§4.17), with
+  cold-phase 1-minute loads 4.31 → 4.11 before / 4.90 → 3.57 after;
+  incremental sync p50/p95 317.42/340.42 → 250.84/252.38 ms at loads
+  4.10 → 4.09 before / 2.85 → 2.94 after. Pending the steward's 1M
+  certification; no speedup claim.** TM5.3's defaults require an
   operator-confirmed apply; automatic destructive retention was not enabled.
   Incremental page reclamation is enabled on new stores. Indefinitely retained
   valuation/latest history, active attempts and holds still prevent a universal

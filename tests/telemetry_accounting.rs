@@ -2614,3 +2614,154 @@ fn restored_accounting_frontier_requires_a_full_rebuild() {
     assert_eq!(f.cli_args(&["accounting", "entries"]).1, first);
 
 }
+
+/// A current compact sidecar must repair capture lost by an older upgrade,
+/// then observe every rebuilt native kind through real collection and sync.
+#[test]
+fn compact_capture_repairs_current_store_and_tracks_late_rollout_kinds() {
+    use std::io::Write;
+    let f = Fixture::new();
+    f.rollout(&f.home, "capture-parent", &[RECORD], &f.worktree(), f.decided + 1000, "0.154.0");
+    let child = f.rollout(&f.home, "capture-child", &[RECORD], &f.worktree(), f.decided + 2000, "0.154.0");
+    let child_id = "00000000-0000-4000-8000-00000000c0e1";
+    let text = fs::read_to_string(&child).unwrap().replace(SID, child_id);
+    fs::write(&child, "").unwrap();
+    // Establish this session's zero-usage cache base before the resumed source
+    // arrives: a brand-new session intentionally takes DG2's missing-cache
+    // full-rebuild path, which would not prove incremental capture.
+    let seed = f.rollout(&f.home, "capture-child-seed", &[RECORD], &f.worktree(), f.decided + 2000, "0.154.0");
+    fs::write(&seed, text.lines().next().unwrap().to_owned() + "\n").unwrap();
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    let affected = ["codex_turns", "codex_rate_limits", "codex_rate_limit_windows", "rollout_forks", "rollout_metadata", "rollout_threads"];
+    // Reproduce a previously migrated store, retaining its current versions
+    // and P2's recorded schema installation, but missing the dropped capture.
+    let db = f.sidecar();
+    let missing: Vec<String> = db.prepare("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'accounting_%'").unwrap()
+        .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+    for name in missing.iter().filter(|n| affected.iter().any(|t| n.starts_with(&format!("accounting_{t}_"))) || n.starts_with("accounting_quota_limits_") || n.starts_with("accounting_quota_secondary_") || *n == "accounting_dispositions_update") {
+        db.execute_batch(&format!("DROP TRIGGER {name}")).unwrap();
+    }
+    db.execute("UPDATE usage_dispositions SET disposition='unresolved'", []).unwrap();
+    db.execute("UPDATE analytics_input_installation SET schema_version=(SELECT schema_version FROM pragma_schema_version)", []).unwrap();
+    drop(db);
+    f.cli_args(&["accounting", "sync"]);
+    let repaired = f.cli_args(&["accounting", "status"]).0;
+    assert_eq!(repaired["sync"]["mode"], "full_rebuild");
+    assert_eq!(repaired["sync"]["rebuild_reason"], "capture_repaired");
+    assert_eq!(f.report()["metrics"]["M08"]["value"], 1000, "repair replays facts missed by capture");
+    let db = f.sidecar();
+    // Schema guard uses the sidecar's real sqlite_master, never source files.
+    for table in ["codex_usage", "codex_quarantine", "codex_turns", "codex_rate_limits", "codex_rate_limit_windows", "codex_fork_reconciliation", "rollout_sources", "rollout_metadata", "rollout_threads", "rollout_forks"] {
+        for event in ["insert", "update", "delete"] {
+            let name = format!("accounting_{table}_{event}");
+            let backing: String = db.query_row("SELECT tbl_name FROM sqlite_master WHERE type='trigger' AND name=?1", [&name], |r| r.get(0)).unwrap();
+            assert_eq!(backing, table, "{name}");
+        }
+    }
+    for (name, table) in [("accounting_dispositions_update", "usage_dispositions"), ("accounting_ledger_delete", "usage_ledger"),
+        ("accounting_quota_limits_update", "codex_rate_limits"), ("accounting_quota_secondary_insert", "codex_rate_limit_windows"),
+        ("accounting_quota_secondary_update", "codex_rate_limit_windows"), ("accounting_quota_source_insert", "rollout_sources"), ("accounting_quota_source_update", "rollout_sources")] {
+        assert_eq!(db.query_row("SELECT tbl_name FROM sqlite_master WHERE type='trigger' AND name=?1", [name], |r| r.get::<_, String>(0)).unwrap(), table);
+    }
+    let tables: Vec<String> = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'analytics_%' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'health_%' AND name NOT LIKE 'policy_%'").unwrap()
+        .query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+    for table in tables {
+        for event in ["INSERT", "UPDATE", "DELETE"] {
+            let name = format!("analytics_input_{table}_{event}");
+            assert_eq!(db.query_row("SELECT tbl_name FROM sqlite_master WHERE type='trigger' AND name=?1", [name], |r| r.get::<_, String>(0)).unwrap(), table);
+        }
+    }
+    let sequence: i64 = db.query_row("SELECT sequence FROM accounting_stream", [], |r| r.get(0)).unwrap();
+    let frontier: i64 = db.query_row("SELECT sequence FROM analytics_input_frontiers WHERE input='source_observation_rows'", [], |r| r.get(0)).unwrap();
+    drop(db);
+    // Metadata is accepted only at a rollout's first session_meta. Append it
+    // to the previously empty child, followed by its turn and native usage.
+    let mut lines: Vec<serde_json::Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    lines[0]["payload"]["forked_from_id"] = json!(SID);
+    lines[0]["payload"]["forked_from_ordinal_exclusive"] = json!(1);
+    lines[0]["payload"]["parent_thread_id"] = json!(SID);
+    lines[0]["payload"]["thread_source"] = json!("user");
+    let timestamp = jiff::Timestamp::from_millisecond(f.decided + 3000).unwrap().to_string();
+    lines.push(json!({"timestamp": timestamp, "type": "event_msg", "payload": {"type": "token_count", "info": null,
+        "rate_limits": {"limit_id": "codex", "primary": {"used_percent": 20, "window_minutes": 300, "resets_at": f.decided / 1000 + 3600},
+            "secondary": {"used_percent": 10, "window_minutes": 10080, "resets_at": f.decided / 1000 + 86400}, "plan_type": "pro"}}}));
+    lines.push(json!({"timestamp": timestamp, "type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-1", "duration_ms": 1000, "time_to_first_token_ms": 100}}));
+    let mut out = fs::OpenOptions::new().append(true).open(&child).unwrap();
+    for line in lines { writeln!(out, "{line}").unwrap(); }
+    drop(out);
+    f.cli("collect");
+    let db = f.sidecar();
+    assert!(db.query_row("SELECT sequence FROM accounting_stream", [], |r| r.get::<_, i64>(0)).unwrap() > sequence);
+    assert!(db.query_row("SELECT EXISTS(SELECT 1 FROM accounting_dirty_sessions WHERE session_id=?1)", [child_id], |r| r.get::<_, bool>(0)).unwrap());
+    assert!(db.query_row("SELECT sequence FROM analytics_input_frontiers WHERE input='source_observation_rows'", [], |r| r.get::<_, i64>(0)).unwrap() > frontier);
+    assert_eq!(db.query_row("SELECT quota_rebuild FROM accounting_stream", [], |r| r.get::<_, i64>(0)).unwrap(), 0, "first secondary snapshot preserves ordered extension");
+    for (table, count) in [("codex_turns", 1), ("codex_rate_limits", 1), ("codex_rate_limit_windows", 1),
+        ("rollout_forks", 3), ("rollout_metadata", 3), ("rollout_threads", 3)] {
+        assert_eq!(f.count(table), count, "collected {table}");
+    }
+    drop(db);
+    f.cli_args(&["accounting", "sync"]);
+    let status = f.cli_args(&["accounting", "status"]).0;
+    assert_eq!(status["sync"]["mode"], "incremental", "{status}");
+    assert_eq!(f.count("accounting_dirty_sessions"), 0);
+    let before = (f.cli_args(&["accounting", "entries"]).1, f.cli_args(&["accounting", "sessions"]).1, f.cli_args(&["accounting", "quota", "--json"]).1);
+    assert!(f.count("quota_windows") >= 2);
+    // Public full-rebuild path: removing the projection invalidates its base.
+    f.sidecar().execute("DELETE FROM usage_ledger", []).unwrap();
+    f.cli_args(&["accounting", "sync"]);
+    let rebuilt = f.cli_args(&["accounting", "status"]).0;
+    assert_eq!(rebuilt["sync"]["mode"], "full_rebuild");
+    for field in ["sequence", "watermark", "invalidated"] {
+        assert_eq!(rebuilt["sync"][field], status["sync"][field], "{field}");
+    }
+    assert_eq!((f.cli_args(&["accounting", "entries"]).1, f.cli_args(&["accounting", "sessions"]).1, f.cli_args(&["accounting", "quota", "--json"]).1), before);
+    // Persisted source corrections exercise UPDATE separately: the source
+    // trigger cannot mask another table's missing capture in this check.
+    let child_path = digest(&child);
+    for (table, key) in [("codex_turns", "session_id"), ("codex_rate_limits", "session_id"), ("codex_rate_limit_windows", "session_id"),
+        ("rollout_forks", "path_digest"), ("rollout_metadata", "path_digest"), ("rollout_threads", "path_digest")] {
+        let db = f.sidecar();
+        let sequence: i64 = db.query_row("SELECT sequence FROM accounting_stream", [], |r| r.get(0)).unwrap();
+        let identity = if key == "session_id" { child_id } else { &child_path };
+        assert_eq!(db.execute(&format!("UPDATE {table} SET {key}={key} WHERE {key}=?1"), [identity]).unwrap(), 1);
+        assert_eq!(db.query_row("SELECT sequence FROM accounting_stream", [], |r| r.get::<_, i64>(0)).unwrap(), sequence + 1, "{table} update");
+        assert!(db.query_row("SELECT EXISTS(SELECT 1 FROM accounting_dirty_sessions WHERE session_id=?1)", [child_id], |r| r.get::<_, bool>(0)).unwrap());
+        if table.starts_with("codex_rate_limit") {
+            assert_eq!(db.query_row("SELECT quota_rebuild FROM accounting_stream", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        }
+        drop(db);
+        f.cli_args(&["accounting", "sync"]);
+    }
+    assert_eq!((f.cli_args(&["accounting", "entries"]).1, f.cli_args(&["accounting", "sessions"]).1, f.cli_args(&["accounting", "quota", "--json"]).1), before);
+    // The secondary INSERT WHEN condition must request replay only when its
+    // primary observation already exists. An ordinary first snapshot above
+    // did not request it; a late secondary replacement must request it.
+    let db = f.sidecar();
+    db.execute_batch("CREATE TEMP TABLE secondary_saved AS SELECT * FROM codex_rate_limit_windows").unwrap();
+    db.execute("DELETE FROM codex_rate_limit_windows", []).unwrap();
+    assert_eq!(db.query_row("SELECT invalidated FROM accounting_stream", [], |r| r.get::<_, String>(0)).unwrap(), "source_rows_deleted");
+    db.execute("UPDATE accounting_stream SET quota_rebuild=0", []).unwrap();
+    db.execute("INSERT INTO codex_rate_limit_windows SELECT * FROM secondary_saved", []).unwrap();
+    assert_eq!(db.query_row("SELECT quota_rebuild FROM accounting_stream", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    drop(db);
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "quota", "--json"]).1, before.2);
+    for (table, key) in [("codex_turns", "session_id"), ("codex_rate_limits", "session_id"), ("codex_rate_limit_windows", "session_id"),
+        ("rollout_forks", "path_digest"), ("rollout_metadata", "path_digest"), ("rollout_threads", "path_digest")] {
+        let db = f.sidecar();
+        let sequence: i64 = db.query_row("SELECT sequence FROM accounting_stream", [], |r| r.get(0)).unwrap();
+        let identity = if key == "session_id" { child_id } else { &child_path };
+        assert_eq!(db.execute(&format!("DELETE FROM {table} WHERE {key}=?1"), [identity]).unwrap(), 1);
+        assert_eq!(db.query_row("SELECT sequence FROM accounting_stream", [], |r| r.get::<_, i64>(0)).unwrap(), sequence + 1, "{table} delete");
+        assert!(db.query_row("SELECT EXISTS(SELECT 1 FROM accounting_dirty_sessions WHERE session_id=?1)", [child_id], |r| r.get::<_, bool>(0)).unwrap());
+        let invalidated: Option<String> = db.query_row("SELECT invalidated FROM accounting_stream", [], |r| r.get(0)).unwrap();
+        assert_eq!(invalidated.as_deref(), if key == "session_id" { Some("source_rows_deleted") } else { None }, "{table} delete preserves main's invalidation semantics");
+        drop(db);
+        f.cli_args(&["accounting", "sync"]);
+    }
+    let deleted = (f.cli_args(&["accounting", "entries"]).1, f.cli_args(&["accounting", "sessions"]).1, f.cli_args(&["accounting", "quota", "--json"]).1);
+    f.sidecar().execute("DELETE FROM usage_ledger", []).unwrap();
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!((f.cli_args(&["accounting", "entries"]).1, f.cli_args(&["accounting", "sessions"]).1, f.cli_args(&["accounting", "quota", "--json"]).1), deleted);
+}

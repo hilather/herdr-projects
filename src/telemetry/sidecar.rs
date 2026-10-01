@@ -15,6 +15,42 @@ const CODEX: &[&str] = &[include_str!("../../migrations/telemetry/0001_codex_usa
     include_str!("../../migrations/telemetry/0003_read_indexes.sql"),
     include_str!("../../migrations/telemetry/0004_compact_native.sql")];
 
+// Compaction in older binaries could silently remove 0012's capture triggers.
+// Check the actual schema even when every migration version is current.
+const COMPACT_CAPTURE: &str = include_str!("../../migrations/telemetry/accounting/repair_compact_capture.sql");
+const COMPACT_CAPTURE_NAMES: &[&str] = &[
+    "accounting_codex_turns_insert",
+    "accounting_codex_turns_update",
+    "accounting_codex_turns_delete",
+    "accounting_codex_rate_limits_insert",
+    "accounting_codex_rate_limits_update",
+    "accounting_codex_rate_limits_delete",
+    "accounting_codex_rate_limit_windows_insert",
+    "accounting_codex_rate_limit_windows_update",
+    "accounting_codex_rate_limit_windows_delete",
+    "accounting_rollout_metadata_insert",
+    "accounting_rollout_metadata_update",
+    "accounting_rollout_metadata_delete",
+    "accounting_rollout_threads_insert",
+    "accounting_rollout_threads_update",
+    "accounting_rollout_threads_delete",
+    "accounting_rollout_forks_insert",
+    "accounting_rollout_forks_update",
+    "accounting_rollout_forks_delete",
+    "accounting_quota_limits_update",
+    "accounting_quota_secondary_insert",
+    "accounting_quota_secondary_update",
+    "accounting_dispositions_update",
+];
+
+fn compact_capture_current(db: &Connection) -> Result<bool> {
+    let placeholders = vec!["?"; COMPACT_CAPTURE_NAMES.len()].join(",");
+    let count: usize = db.query_row(
+        &format!("SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name IN ({placeholders})"),
+        rusqlite::params_from_iter(COMPACT_CAPTURE_NAMES.iter()), |r| r.get(0))?;
+    Ok(count == COMPACT_CAPTURE_NAMES.len())
+}
+
 /// Every stream and its migrations; index + 1 is the stream version.
 fn streams() -> impl Iterator<Item = (&'static str, &'static [&'static str])> {
     std::iter::once(("codex", CODEX)).chain(super::LANES.iter().map(|lane| (lane.stream, lane.migrations)))
@@ -113,7 +149,8 @@ pub(crate) fn migrate(db: &mut Connection) -> Result<()> {
     // under IMMEDIATE so concurrent openers cannot apply a migration twice.
     let current = stream_versions(db)?;
     if streams().all(|(stream, migrations)| current.get(stream).copied().unwrap_or(0) == migrations.len())
-        && super::analytics::inputs::installation_current(db)? {
+        && super::analytics::inputs::installation_current(db)?
+        && compact_capture_current(db)? {
         return Ok(());
     }
     // One transaction: a pre-streams sidecar gains `telemetry_streams` with
@@ -142,7 +179,7 @@ pub(crate) fn migrate(db: &mut Connection) -> Result<()> {
                 // Rebuilding native tables drops their triggers. Preserve the
                 // original accounting/frontier SQL, then reinstall it on the
                 // replacement tables in this same migration transaction.
-                let triggers: Vec<(String, String)> = if matches!((stream, index + 1), ("codex", 4) | ("ingest", 12) | ("accounting", 16)) {
+                let triggers: Vec<(String, String)> = if matches!((stream, index + 1), ("codex", 4) | ("ingest", 12) | ("accounting", 17)) {
                     tx.prepare("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND sql IS NOT NULL")?
                         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
                 } else { Vec::new() };
@@ -156,6 +193,12 @@ pub(crate) fn migrate(db: &mut Connection) -> Result<()> {
             tx.execute("INSERT INTO telemetry_streams(stream,version) VALUES(?1,?2) ON CONFLICT(stream) DO UPDATE SET version=excluded.version",
                 rusqlite::params![stream, index + 1])?;
         }
+    }
+    if !compact_capture_current(&tx)? {
+        tx.execute_batch(COMPACT_CAPTURE)?;
+        // Inputs committed while capture was absent cannot be reconstructed
+        // from the dirty queue. Replay once before trusting incremental sync.
+        super::accounting::ledger::invalidate(&tx, "capture_repaired")?;
     }
     if upgraded { super::accounting::ledger::invalidate(&tx, "schema_upgrade")?; }
     super::analytics::inputs::install(&tx)?;
