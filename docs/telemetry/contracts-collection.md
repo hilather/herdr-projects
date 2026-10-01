@@ -1892,3 +1892,143 @@ with `Operation not permitted`; the steward must run them outside it:
 - `telemetry_workspace::thread_start_records_the_dispatch_reason_and_the_sidebar_suffix` (Unix socket)
 - `telemetry_otlp::http_auth_limits_malformed_and_replay` (TCP loopback)
 - `telemetry_otlp::http_request_rate_is_bounded` (TCP loopback)
+
+## DG4f: Cursor CLI installed-format review and second-wave status
+
+### Installed-format evidence (2026.09.28)
+
+Read-only evidence is the program JS under
+`/home/brewerm/.local/share/mise/installs/cursor-agent/latest/dist-package/`
+and the `latest/bin/cursor-agent` launcher. Only program files were searched
+with bounded grep fragments (minified files have very long lines). No agent
+CLI was executed and no owner data/config/session directories were read,
+listed or opened. The launcher executes its bundled Node and `bin/index.js`;
+its text is not evidence of a telemetry usage exporter.
+
+Quoted program fragments, with module names for reproducible lookup:
+
+| Program/module | Evidence fragment |
+|---|---|
+| `1623.index.js`, `./src/tracing.ts` | `a="2026.09.28-64d2043"`; `"service.name":e.serviceName??"cursor-agent-cli","service.version":e.serviceVersion??a` |
+| same module | `exporter-trace-otlp-proto@0.203.0`; `const t=e.backendUrl,r=await e.credentialManager.getAccessToken()`; ``n=`${t}/v1/traces` ``; `new i.Q({url:n,headers:s})` |
+| same module | ``authorization:`Bearer ${r}` ``; `"x-ghost-mode"`; `"x-cursor-client-version":"agent-cli"`; `m=new l.li({resource:s,spanProcessors:r?[new l.J(r)]:[]})`; `m.register()` |
+| `2240.index.js`, OTLP trace exporter | `OTEL_EXPORTER_OTLP_${e}_ENDPOINT`; `OTEL_EXPORTER_OTLP_ENDPOINT`; `OTEL_EXPORTER_OTLP_${e}_HEADERS`; `OTEL_EXPORTER_OTLP_HEADERS`; `OTEL_EXPORTER_OTLP_${e}_TIMEOUT`; `OTEL_EXPORTER_OTLP_TIMEOUT`; `OTEL_EXPORTER_OTLP_${e}_COMPRESSION`; `OTEL_EXPORTER_OTLP_COMPRESSION`; `"TRACES","v1/traces"`; `"Content-Type":"application/x-protobuf"` |
+| `index.js`, startup tracing | `getTracer("cursor-agent-cli").startSpan("cli.startup.mcp_init"`; `duration_ms`; `cli.startup.has_compile_cache`; `cli.startup.is_headless`; `cli.startup.mcp_deferred`; `cli.startup.deferred`; `cli.startup.channel` |
+| `index.js`, MCP client | `e.withName("McpSdkClient.callTool")`; `.span.setAttribute("toolName",t)`; `e.withName("McpSdkClient.getInstructions")`; `.span.setAttribute("serverName",this.serverName)` |
+| `index.js`, execution daemon | `"exec_daemon.readTextFile"`; `"file.path"`; `"file.size"`; `"exec.exit_code"`; `recordException(e)` |
+| `index.js`, bundled Sentry OpenAI/Vercel instrumentation | `gen_ai.usage.input_tokens`; `gen_ai.usage.output_tokens`; `gen_ai.usage.total_tokens`; `openai.usage.prompt_tokens`; `openai.usage.completion_tokens`; `ai.toolCall.name`; `ai.toolCall.id` |
+| `index.js`, hook payload conversion | `input_tokens:void 0!==e.inputTokens?Number(e.inputTokens):void 0`; `output_tokens`; `cache_read_tokens`; `cache_write_tokens`; `conversation_id`; `generation_id`; `model`; `status`; `loop_count` |
+| `index.js`, `../metrics/dist/index.js` | `Symbol("metricsBackend"),{record:()=>{},increment:()=>{},gauge:()=>{},histogram:()=>{}}` |
+
+The application configures a **trace** provider with an explicit backend URL
+and access-token headers. The SDK recognizes the OTEL exporter variables
+above, but the supplied URL/headers take precedence; their presence does not
+establish an opt-in Herdr JSON logs/metrics exporter. The resource also includes
+`host.name`, `os.type`, `os.version`, `process.runtime.name`,
+`process.runtime.version`, `client.os.platform`, `client.os.release`,
+`client.arch`, `client.node.version` and `client.cli.version`.
+
+Tool and error evidence is span metadata/exception recording, not a usage log
+or metric stream. Bundled Sentry instrumentation contains token span keys,
+including cached/cache-write/reasoning variants, and content-bearing
+`gen_ai.request.messages`, `gen_ai.response.text`, `gen_ai.response.tool_calls`
+and `gen_ai.tool.input/output`. Bundling these integrations does not prove
+Cursor's agent requests emit them. Hook/RPC token and billing fields likewise
+do not establish OTel emission or local persistence. No application OTel
+usage/token/cost/tool/error log or metric name was established. Cost fields
+`total_cost_cents`, `total_request_cost`, `totalCents`, `spendCents` and
+`UsageEventDisplay.token_usage` occur in generated RPC messages, not a reviewed
+OTLP exporter. No names or token semantics are guessed from dependencies.
+
+### Local layout and schema evidence
+
+| Program/module | Evidence fragment |
+|---|---|
+| `index.js`, `../cursor-config/dist/paths.js` | `process.env.CURSOR_CONFIG_DIR`; `process.env.XDG_CONFIG_HOME`; `join(homedir(),".cursor")`; `process.env.CURSOR_DATA_DIR`; `join(c(),"projects")`; `"cli-config.json"` |
+| `index.js`, chat paths | `join(...,"chats")`; `createHash("md5").update(t).digest("hex")`, where `t=resolve(workspace)` |
+| `1623.index.js`, subagent store | `getDbPath(e){return ...join(this.chatsDir,e,"store.db")}`; `setMetadata("subagentInfo",t)` |
+| `1623.index.js`, SQLite blob store | `PRAGMA user_version = 1`; `CREATE TABLE IF NOT EXISTS blobs (id TEXT PRIMARY KEY, data BLOB)`; `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)`; `SELECT value FROM meta WHERE key = ?`, key `"0"`; `d.serialize(this.metadata)` |
+| same module, metadata names | `agentId`, `latestRootBlobId`, `name`, `createdAt`, `mode`, `isRunEverything`, `approvalMode`, `lastUsedModel`, `lastDebugServerPort`, `currentPlanUri`, `subagentInfo` |
+| `1623.index.js`, transcript writer | `writeText:!1,writeJsonl:!0`; `rootPromptMessagesJson`; `summaryArchives`; `writeFromStateIncremental`; `writeTurnEndedFromState` |
+| `7923.index.js`, transcript path resolver | `agent-transcripts`; `` `${s.O2}/${e}/${e}.${t.ext}` ``; `` `${s.O2}/${r}/subagents/${e}.${t.ext}` `` |
+| `7923.index.js`, transcript serialization | `const o={role:t.role,message:{content:r}}`; `JSON.stringify({type:"turn_ended",...e})`; `{type:"metadata",metadata:{overview:e}}` |
+
+Default local chat layout is `<config-root>/chats/<md5-resolved-workspace>/
+<conversation-id>/store.db`. Transcript layout is `<data-root>/projects/
+<sanitized-workspace>/agent-transcripts/<encoded-id>/<encoded-id>.jsonl`,
+with subagents under the parent's `subagents/`. Default roots are `.cursor`
+under the execution home; config and data overrides are distinct. These paths
+are program layout evidence only; Herdr does not discover or read them.
+Transcript fields include role/message/content, text/thinking/tool input/result
+and turn-ended status/error. The JSONL projection supplies no stable token
+usage row. SQLite's meta value is serialized metadata and blobs hold the
+conversation graph; its schema is not an allowlisted usage table. Context
+window `usedTokens/maxTokens` and token deltas in generated/live protocol
+objects do not establish persisted per-request usage semantics. Native source
+is **none: stable local usage format with token counts not evident**.
+
+### Mapping, binding, capabilities, privacy and maintenance
+
+DG4a mapping is **none** for the installed 2026.09.28 package: the configured
+export is protobuf traces, with no usable OTLP JSON logs/metrics established.
+DG4a still rejects `/v1/traces`. No `MAPPINGS` entry, version gate, listener,
+launcher environment wiring, native reader or worker kind is added. Grok's
+DG4e exact-service/version pattern would apply only after usable names are
+established; DG4e's implementation/contract is not present in this checkout.
+Cursor's observed default service is `cursor-agent-cli`, not `cursor-agent`.
+
+Capabilities list `cursor-agent` and `otlp:cursor-agent`, interface `none`,
+empty certified versions and unavailable token/cost/tool/error fields with
+explicit reasons. These are declarations of missing coverage, never zero
+usage. All non-Codex adapters remain fixture-certified at most, never live;
+Cursor presently has certification `none`. Content has no allowlist here:
+no Cursor value, exception, body, tool argument/output or transcript is stored
+or hashed. Unknown OTLP services keep DG4a's existing unmapped diagnostics;
+no Cursor content grants binding authority. Existing exact-resource OTLP
+binding and native adapter bindings remain unchanged. Unbound records stay
+unbound; nothing enters Cursor attempt totals.
+
+There are no schema or table changes, so no migration/version bump or new
+retention/backup classification is needed. Existing `sidecar.otlp` and
+`sidecar.normalized_sessions` retention, tombstones and backup inventory are
+unchanged; no Cursor raw files or credentials enter backups.
+
+### Synthetic E2E certification and remaining second wave
+
+The public capabilities CLI certificate test checks the two `none` surfaces,
+empty certified versions, reasons and the non-Codex prohibition on live fields.
+The existing public OTLP store workflow additionally rejects a synthetic trace
+with the exact installed service/version and a planted content secret, then
+asserts the same eleven Claude/Gemini rows and zero secret hits in returned
+rows and DB/WAL/SHM. Existing unbound/replay tests continue to exercise DG4a.
+No captured Cursor session or invented Cursor usage fixture is used.
+
+GitHub Copilot CLI, Amp and Aider are each **not built: not installed; build
+when installed**. The Copilot wrapper installs on first use and was not
+executed. No code, capability claim or fixture is added for those harnesses.
+
+
+### DG4f sandbox validation (2026-10-01)
+
+Every `tests/telemetry*.rs` suite ran with `TMPDIR=$PWD/target/tmp` and
+`cargo test --locked --offline -j 3 --features state-store --no-fail-fast`
+(selecting each suite with `--test`): **208 passed, 6 failed, 12 existing
+scale tests ignored across 20 suites**. The final edited-suite rerun passed
+certification **13/13** and OTLP **5/7**. All six failures were solely socket
+bind permission failures (`Operation not permitted`), without workarounds:
+
+| Suite | Test |
+|---|---|
+| `telemetry` | `attempts_show_attention_summary` |
+| `telemetry_accounting` | `attention_intervals_union_and_censor` |
+| `telemetry_health` | `recommendations_and_notices_change_no_canonical_state_and_no_dispatch` |
+| `telemetry_otlp` | `http_auth_limits_malformed_and_replay` |
+| `telemetry_otlp` | `http_request_rate_is_bounded` |
+| `telemetry_workspace` | `thread_start_records_the_dispatch_reason_and_the_sidebar_suffix` |
+
+The two OTLP failures are TCP loopback binds; the other four are Unix socket
+binds. The steward must rerun these outside the hard sandbox. Final
+`cargo clippy --locked --offline -j 3 --features state-store --all-targets`
+completed successfully; existing unrelated warnings remain, with no warnings
+in changed files or lines. No live agent/data access was attempted. A usable
+Cursor collector remains unbuilt pending evidence of an eligible signal.

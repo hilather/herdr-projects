@@ -424,9 +424,17 @@ Cards (gaps that stop those questions being answered):
     local paths are evident but the usage-file schema is not established.
     Export requires protobuf/gRPC conversion and injected binding; see
     contracts-collection.md DG4e.
-  - **DG4f second wave:** Cursor (`cursor-agent`), GitHub Copilot CLI, Amp,
-    Aider. OTLP mapping where the harness supports it; otherwise a native
-    adapter if its local records are stable enough to certify.
+  - **Done (DG4f installed-format review): Cursor (`cursor-agent`) 2026.09.28.**
+    Installed program reports `2026.09.28-64d2043`, default service
+    `cursor-agent-cli`. Its configured OTel exporter sends protobuf traces;
+    no usable OTLP usage/tool logs or metrics were established. DG4a mapping
+    **none**. Local content transcripts and serialized SQLite blobs do not
+    establish a stable metadata-only token usage source: native **none**.
+    Capabilities explicitly report unavailable/none for both surfaces;
+    no live certification. Evidence and limitations: contracts-collection.md DG4f.
+    GitHub Copilot CLI, Amp and Aider: **not built: not installed; build when
+    installed**. Copilot's wrapper only installs on first use and was not run.
+    No code is added for these three harnesses.
 - **DG5 cost M04/M12 (external).** Needs real rate cards and provider charges
   imported by the owner (contracts-accounting.md). Still blocked.
 - **DG6 flakes under concurrent load (owner-approved design, 2026-09-30).**

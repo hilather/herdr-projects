@@ -911,8 +911,8 @@ fn candidate_group_cost_includes_every_arm() {
 /// Codex is the only live-certified collector. Since the 2026-09-30 owner
 /// decision (harness coverage, phase2-lanes.md DG4) the OTLP receiver adds
 /// `otlp:<harness>` adapters and DG4b the native `claude-code` adapter, but
-/// those are fixture-certified at most, so no other adapter may claim a
-/// `live` field. An uncertified Codex version is
+/// those are fixture-certified at most; Cursor's reviewed surfaces are
+/// unavailable (`none`). No other adapter may claim a `live` field. An uncertified Codex version is
 /// never summed.
 #[test]
 fn accounting_fields_match_the_adapter_certificate() {
@@ -921,10 +921,27 @@ fn accounting_fields_match_the_adapter_certificate() {
     let adapters = capabilities["adapters"].as_array().unwrap();
     let names: Vec<&str> = adapters.iter().map(|a| a["adapter"].as_str().unwrap()).collect();
     assert_eq!(names[0], "codex", "{names:?}");
+    assert!(names[1..].iter().all(|n| *n == "claude-code" || *n == "gemini-cli" || *n == "opencode" || *n == "cursor-agent" || n.starts_with("otlp:")), "only declared adapters besides Codex: {names:?}");
     assert!(names.contains(&"otlp:grok"), "Grok fixture adapter must be advertised: {names:?}");
     for other in &adapters[1..] {
         let live: Vec<&Value> = other["fields"].as_array().into_iter().flatten().filter(|f| f["certified"] == "live").collect();
         assert!(live.is_empty(), "{} must not claim live-certified fields: {live:?}", other["adapter"]);
+    }
+    for (name, reason) in [
+        ("cursor-agent", "stable_local_usage_format_not_evident"),
+        ("otlp:cursor-agent", "protobuf_traces_only_no_usable_logs_or_metrics"),
+    ] {
+        let adapter = adapters.iter().find(|a| a["adapter"] == name).unwrap();
+        assert_eq!(adapter["interface"], "none");
+        assert_eq!(adapter["certified_versions"], json!([]));
+        let fields = adapter["fields"].as_array().unwrap();
+        assert_eq!(fields.iter().map(|f| f["field"].as_str().unwrap()).collect::<Vec<_>>(),
+            vec!["input_tokens", "output_tokens", "cost", "tool_calls", "errors"]);
+        for field in fields {
+            assert_eq!(field["available"], false);
+            assert_eq!(field["certified"], "none");
+            assert_eq!(field["reason"], reason);
+        }
     }
     let codex = &adapters[0];
     assert_eq!(codex["certified_versions"], json!(["0.154.0"]));

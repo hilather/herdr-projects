@@ -304,6 +304,20 @@ fn capabilities(project: &Path) -> Result<Value> {
         }
     }
     let mut adapters = super::otlp::capabilities();
+    // Installed 2026.09.28 exposes protobuf traces and content transcripts,
+    // not a reviewed logs/metrics exporter or metadata-only usage file.
+    for (adapter, reason) in [
+        ("cursor-agent", "stable_local_usage_format_not_evident"),
+        ("otlp:cursor-agent", "protobuf_traces_only_no_usable_logs_or_metrics"),
+    ] {
+        let fields: Vec<Value> = ["input_tokens", "output_tokens", "cost", "tool_calls", "errors"]
+            .into_iter()
+            .map(|field| json!({"kind":"usage","field":field,"available":false,
+                "basis":"unavailable","certified":"none","caveat":null,"reason":reason}))
+            .collect();
+        adapters.push(json!({"adapter":adapter,"interface":"none","certified_versions":[],
+            "uncertified_version":reason,"fields":fields}));
+    }
     adapters.push(super::gemini::capabilities());
     adapters.insert(0, super::codex::claude::capabilities());
     adapters.insert(0, super::codex::opencode::capabilities());

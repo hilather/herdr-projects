@@ -34,6 +34,15 @@ fn documented_harness_fixtures_map_exact_rows_and_replay() {
         assert_eq!(otlp::ingest(&f.project, path, &bytes).unwrap(), count);
         assert_eq!(otlp::ingest(&f.project, path, &bytes).unwrap(), 0);
     }
+    // Synthetic Cursor trace canary: traces are unsupported, including the
+    // installed service/version. Rejection must leave other adapters intact.
+    let traces = json!({"resourceSpans":[{"resource":{"attributes":[
+        {"key":"service.name","value":{"stringValue":"cursor-agent-cli"}},
+        {"key":"service.version","value":{"stringValue":"2026.09.28-64d2043"}}
+    ]},"scopeSpans":[{"spans":[{"name":"McpSdkClient.callTool","attributes":[
+        {"key":"tool.output","value":{"stringValue":"OTLP_SECRET_CONTENT"}}
+    ]}]}]}]});
+    assert!(otlp::ingest(&f.project, "/v1/traces", &serde_json::to_vec(&traces).unwrap()).is_err());
     let rows = otlp::records(&f.project).unwrap();
     assert_eq!(rows.as_array().unwrap().len(), 11);
     for r in rows.as_array().unwrap() {
