@@ -67,39 +67,44 @@ fn cells(project: &Path, extra: Option<Cell>) -> Result<Option<Vec<Cell>>> {
     Ok(Some(cells))
 }
 
+fn track_cell(tx: &rusqlite::Transaction<'_>, cell: &Cell, key: &str, now: i64) -> Result<()> {
+    tx.prepare_cached("INSERT OR IGNORE INTO analytics_cells(cell,metric,definition,cohort,window_from_unix_ms,window_to_unix_ms,horizon_ms,dimension,tracked_unix_ms)
+        VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)")?.execute(rusqlite::params![key, cell.metric.id, cell.version.definition, cell.cohort.as_str(), cell.from, cell.to,
+        cell.horizon, cell.by, now])?;
+    Ok(())
+}
+
 /// Append one cell without retaining other cells' lineage in memory.
 fn append_cell(tx: &rusqlite::Transaction<'_>, e: &Evaluated, watermarks: &str, now: i64) -> Result<Option<Value>> {
-        tx.prepare_cached("INSERT OR IGNORE INTO analytics_cells(cell,metric,definition,cohort,window_from_unix_ms,window_to_unix_ms,horizon_ms,dimension,tracked_unix_ms)
-            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)")?.execute(rusqlite::params![e.key, e.cell.metric.id, e.cell.version.definition, e.cell.cohort.as_str(), e.cell.from, e.cell.to,
-            e.cell.horizon, e.cell.by, now])?;
-        let latest: Option<(i64, String)> = tx.prepare_cached("SELECT revision,content_digest FROM analytics_revisions WHERE cell=?1 ORDER BY revision DESC LIMIT 1")?.query_row([&e.key],
-            |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-        if latest.as_ref().is_some_and(|(_, digest)| *digest == e.digest) {
-            tx.prepare_cached("UPDATE analytics_cells SET checked_unix_ms=?2 WHERE cell=?1")?.execute(rusqlite::params![e.key, now])?;
-            // Normally this row already exists. Refresh also repairs missing
-            // disposable projections without restating the authoritative cell.
-            let revision = latest.as_ref().unwrap().0;
-            if let Some(body) = &e.projection {
-                let exists: bool = tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM analytics_workspace_metrics WHERE revision=?1)")?.query_row([revision], |r| r.get(0))?;
-                if !exists { insert_workspace_body(&tx, revision, body)?; }
-            }
-            return Ok(None);
-        }
-        let supersedes = latest.map(|(revision, _)| revision);
-        let kind = if supersedes.is_some() { "restatement" } else { "initial" };
-        tx.prepare_cached("INSERT INTO analytics_revisions(cell,kind,supersedes,body,content_digest,watermarks,registry,recorded_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)")?.execute(
-            rusqlite::params![e.key, kind, supersedes, e.core, e.digest, watermarks, registry::VERSION, now])?;
-        let revision = tx.last_insert_rowid();
-        if let Some(body) = &e.projection { insert_workspace_body(&tx, revision, body)?; }
-        let mut insert = tx.prepare_cached("INSERT INTO analytics_lineage(revision,bucket,ordinal,entity_kind,entity_id,attrs) VALUES(?1,?2,?3,?4,?5,?6)")?;
-        for (bucket, rows) in &e.lineage {
-            for (ordinal, (kind, id, attrs)) in rows.iter().enumerate() {
-                insert.execute(rusqlite::params![revision, bucket, ordinal as i64, kind, id, attrs])?;
-            }
-        }
-        drop(insert);
+    track_cell(tx, &e.cell, &e.key, now)?;
+    let latest: Option<(i64, String)> = tx.prepare_cached("SELECT revision,content_digest FROM analytics_revisions WHERE cell=?1 ORDER BY revision DESC LIMIT 1")?.query_row([&e.key],
+        |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+    if latest.as_ref().is_some_and(|(_, digest)| *digest == e.digest) {
         tx.prepare_cached("UPDATE analytics_cells SET checked_unix_ms=?2 WHERE cell=?1")?.execute(rusqlite::params![e.key, now])?;
-        Ok(Some(json!({"cell": serde_json::from_str::<Value>(&e.key)?, "revision": revision, "kind": kind, "supersedes": supersedes, "content_digest": e.digest})))
+        // Normally this row already exists. Refresh also repairs missing
+        // disposable projections without restating the authoritative cell.
+        let revision = latest.as_ref().unwrap().0;
+        if let Some(body) = &e.projection {
+            let exists: bool = tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM analytics_workspace_metrics WHERE revision=?1)")?.query_row([revision], |r| r.get(0))?;
+            if !exists { insert_workspace_body(tx, revision, body)?; }
+        }
+        return Ok(None);
+    }
+    let supersedes = latest.map(|(revision, _)| revision);
+    let kind = if supersedes.is_some() { "restatement" } else { "initial" };
+    tx.prepare_cached("INSERT INTO analytics_revisions(cell,kind,supersedes,body,content_digest,watermarks,registry,recorded_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)")?.execute(
+        rusqlite::params![e.key, kind, supersedes, e.core, e.digest, watermarks, registry::VERSION, now])?;
+    let revision = tx.last_insert_rowid();
+    if let Some(body) = &e.projection { insert_workspace_body(tx, revision, body)?; }
+    let mut insert = tx.prepare_cached("INSERT INTO analytics_lineage(revision,bucket,ordinal,entity_kind,entity_id,attrs) VALUES(?1,?2,?3,?4,?5,?6)")?;
+    for (bucket, rows) in &e.lineage {
+        for (ordinal, (kind, id, attrs)) in rows.iter().enumerate() {
+            insert.execute(rusqlite::params![revision, bucket, ordinal as i64, kind, id, attrs])?;
+        }
+    }
+    drop(insert);
+    tx.prepare_cached("UPDATE analytics_cells SET checked_unix_ms=?2 WHERE cell=?1")?.execute(rusqlite::params![e.key, now])?;
+    Ok(Some(json!({"cell": serde_json::from_str::<Value>(&e.key)?, "revision": revision, "kind": kind, "supersedes": supersedes, "content_digest": e.digest})))
 
 }
 
@@ -162,42 +167,117 @@ fn workspace_metric_body(db: &Connection, metric: &str, core: &Value, revision: 
 pub fn refresh(project: &Path, extra: Option<Cell>) -> Result<Value> {
     let Some(mut db) = crate::telemetry::sidecar::open(project, false)? else { return Ok(unavailable("collection_not_run")) };
     let Some(cells) = cells(project, extra)? else { return Ok(unavailable("collection_not_run")) };
-    // Freeze sidecar inputs before capturing the dependency generations.
-    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // All provider opens on this thread share these pinned read snapshots.
+    // WAL writers can collect/sync while evaluation and serialization run.
+    let canonical_before = super::inputs::canonical_current(project)?;
+    let snapshot = crate::telemetry::EvaluationReads::begin(project)?;
     let mut sources = Sources::new(project)?;
+    if canonical_before != sources.canonical_inputs {
+        let keys = cells.iter().map(Cell::key).collect::<Vec<_>>();
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let locked = std::time::Instant::now();
+        let now = jiff::Timestamp::now().as_millisecond();
+        for (cell, key) in cells.iter().zip(&keys) { track_cell(&tx, cell, key, now)?; }
+        tx.commit()?;
+        return Ok(json!({"appended": [], "unchanged": 0, "cells": cells.len(),
+            "recorded_unix_ms": jiff::Timestamp::now().as_millisecond(), "evaluated": [],
+            "deferred": cells.iter().map(|c| serde_json::from_str::<Value>(&c.key())).collect::<serde_json::Result<Vec<_>>>()?,
+            "comparison_deferred": true, "write_lock_ms": locked.elapsed().as_secs_f64() * 1000.0}));
+    }
     let watermarks = serde_json::to_string(&sources.watermarks()?)?;
     let now = jiff::Timestamp::now().as_millisecond();
     let (mut appended, mut unchanged) = (Vec::new(), 0);
+    let (mut evaluated, mut deferred) = (Vec::new(), Vec::new());
+    let mut write_lock_ms = 0.0;
+    let mut skipped = Vec::new();
     for cell in &cells {
         let key = cell.key();
         let group = super::inputs::group(cell.version.provider, cell.metric.id);
         let inputs = super::inputs::stamp(group, &sources.canonical_inputs, &sources.input_generations);
-        let previous: Option<String> = tx.query_row("SELECT inputs FROM analytics_checked_inputs WHERE cell=?1
+        let read = crate::telemetry::sidecar::read(project)?.expect("sidecar snapshot");
+        let previous: Option<String> = read.query_row("SELECT inputs FROM analytics_checked_inputs WHERE cell=?1
             AND EXISTS(SELECT 1 FROM analytics_revisions WHERE cell=?1)", [&key], |r| r.get(0)).optional()?;
-        if !super::inputs::clock(group) && previous.as_deref() == Some(inputs.as_str()) {
-            tx.execute("UPDATE analytics_cells SET checked_unix_ms=?2 WHERE cell=?1", rusqlite::params![key, now])?;
-            unchanged += 1;
+        let missing_projection = crate::telemetry::workspace::METRICS.contains(&cell.metric.id) && !read.query_row(
+            "SELECT EXISTS(SELECT 1 FROM analytics_workspace_metrics WHERE revision=(SELECT max(revision) FROM analytics_revisions WHERE cell=?1))",
+            [&key], |r| r.get::<_, bool>(0))?;
+        let e = if !super::inputs::clock(group) && !missing_projection && previous.as_deref() == Some(inputs.as_str()) {
+            None
+        } else {
+            let (core, lineage) = query::evaluate(&mut sources, cell)?;
+            let digest = query::content_digest(&core, &lineage);
+            let projection = workspace_body(cell.metric.id, &core)?;
+            let core = serde_json::to_string(&core)?;
+            let lineage = lineage.into_iter().map(|(bucket, rows)| Ok((bucket, rows.into_iter().map(|(kind, id, attrs)|
+                Ok((kind, id, serde_json::to_string(&attrs)?))).collect::<Result<Vec<_>>>()?))).collect::<Result<SerializedLineage>>()?;
+            evaluated.push(serde_json::from_str::<Value>(&key)?);
+            Some(Evaluated { key: key.clone(), cell: cell.clone(), digest, core, projection, lineage })
+        };
+        if e.is_none() {
+            skipped.push((key, group, inputs));
             continue;
         }
-        let (core, lineage) = query::evaluate(&mut sources, cell)?;
-        let digest = query::content_digest(&core, &lineage);
-        let projection = workspace_body(cell.metric.id, &core)?;
-        let core = serde_json::to_string(&core)?;
-        let lineage = lineage.into_iter().map(|(bucket, rows)| Ok((bucket, rows.into_iter().map(|(kind, id, attrs)| Ok((kind, id, serde_json::to_string(&attrs)?))).collect::<Result<Vec<_>>>()?))).collect::<Result<SerializedLineage>>()?;
-        let e = Evaluated { key: key.clone(), cell: cell.clone(), digest, core, projection, lineage };
-        match append_cell(&tx, &e, &watermarks, now)? { Some(revision) => appended.push(revision), None => unchanged += 1 }
-        tx.execute("INSERT INTO analytics_checked_inputs(cell,inputs) VALUES(?1,?2) ON CONFLICT(cell) DO UPDATE SET inputs=excluded.inputs",
-            rusqlite::params![key, inputs])?;
+        // A separate writer reads the live generations, never the pinned snapshot.
+        // Revalidate even skipped cells: a racing mutation must leave them due.
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let locked = std::time::Instant::now();
+        let current = super::inputs::generations(&tx)?.unwrap_or_default();
+        let canonical = super::inputs::canonical_current(project)?;
+        if inputs != super::inputs::stamp(group, &canonical, &current) {
+            deferred.push(serde_json::from_str::<Value>(&key)?);
+            // Persist the request without certifying its stale inputs. This
+            // also keeps a deferred extra/default cell due on the next refresh.
+            track_cell(&tx, cell, &key, now)?;
+            tx.commit()?;
+            write_lock_ms += locked.elapsed().as_secs_f64() * 1000.0;
+            continue;
+        }
+        match append_cell(&tx, e.as_ref().expect("evaluated cell"), &watermarks, now)? {
+            Some(revision) => appended.push(revision), None => unchanged += 1,
+        }
+        tx.prepare_cached("INSERT INTO analytics_checked_inputs(cell,inputs) VALUES(?1,?2) ON CONFLICT(cell) DO UPDATE SET inputs=excluded.inputs")?
+            .execute(rusqlite::params![key, inputs])?;
+        tx.commit()?;
+        write_lock_ms += locked.elapsed().as_secs_f64() * 1000.0;
     }
-    for ((since, group), body) in &sources.bodies {
-        if super::inputs::clock(group) { continue; }
-        let inputs = super::inputs::stamp(group, &sources.canonical_inputs, &sources.input_generations);
-        tx.execute("INSERT INTO analytics_provider_aggregates(provider,window_key,inputs,body) VALUES(?1,?2,?3,?4)
-            ON CONFLICT(provider,window_key) DO UPDATE SET inputs=excluded.inputs,body=excluded.body",
-            rusqlite::params![group, super::inputs::window(*since), inputs, serde_json::to_string(body)?])?;
+    // Comparison and provider bodies are serialized before taking the writer.
+    let comparison = serde_json::to_string(&crate::telemetry::workspace::comparison(project)?)?;
+    let bodies = sources.bodies.iter().filter(|((_, group), _)| !super::inputs::clock(group))
+        .map(|((since, group), body)| Ok((group.clone(), super::inputs::window(*since),
+            super::inputs::stamp(group, &sources.canonical_inputs, &sources.input_generations), serde_json::to_string(body)?)))
+        .collect::<Result<Vec<_>>>()?;
+    drop(snapshot);
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let locked = std::time::Instant::now();
+    let current = super::inputs::generations(&tx)?.unwrap_or_default();
+    let canonical = super::inputs::canonical_current(project)?;
+    // Unchanged cells need only one bounded batch of checked-time updates.
+    for (key, group, inputs) in skipped {
+        if inputs != super::inputs::stamp(group, &canonical, &current) {
+            deferred.push(serde_json::from_str::<Value>(&key)?);
+            continue;
+        }
+        tx.prepare_cached("UPDATE analytics_cells SET checked_unix_ms=?2 WHERE cell=?1")?
+            .execute(rusqlite::params![key, now])?;
+        unchanged += 1;
+    }
+    let comparison_deferred = super::inputs::stamp("central", &canonical, &current)
+        != super::inputs::stamp("central", &sources.canonical_inputs, &sources.input_generations);
+    if !comparison_deferred {
+        let previous: Option<String> = tx.query_row("SELECT body FROM analytics_workspace_comparisons ORDER BY revision DESC LIMIT 1", [], |r| r.get(0)).optional()?;
+        if previous.as_deref() != Some(comparison.as_str()) {
+            tx.execute("INSERT INTO analytics_workspace_comparisons(body,recorded_unix_ms) VALUES(?1,?2)", rusqlite::params![comparison, now])?;
+        }
+    }
+    for (group, window, inputs, body) in bodies {
+        if inputs != super::inputs::stamp(&group, &canonical, &current) { continue; }
+        tx.prepare_cached("INSERT INTO analytics_provider_aggregates(provider,window_key,inputs,body) VALUES(?1,?2,?3,?4)
+            ON CONFLICT(provider,window_key) DO UPDATE SET inputs=excluded.inputs,body=excluded.body")?
+            .execute(rusqlite::params![group, window, inputs, body])?;
     }
     tx.commit()?;
-    Ok(json!({"appended": appended, "unchanged": unchanged, "cells": cells.len(), "recorded_unix_ms": now}))
+    write_lock_ms += locked.elapsed().as_secs_f64() * 1000.0;
+    Ok(json!({"appended": appended, "unchanged": unchanged, "cells": cells.len(), "recorded_unix_ms": now,
+        "evaluated": evaluated, "deferred": deferred, "comparison_deferred": comparison_deferred, "write_lock_ms": write_lock_ms}))
 }
 
 /// A stored revision's lineage, as evaluation produced it.

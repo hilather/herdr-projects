@@ -535,3 +535,54 @@ fn report_and_query_share_one_read_path() {
     assert_eq!(priced["rate_card_revision"], json!({"status": "unavailable", "reason": "not_priced"}));
     assert_eq!(p.json(&["report", "--json"]), report, "a query writes nothing a report reads");
 }
+
+/// A schema change after installation must cause open/refresh to install new
+/// input triggers even when every stream is already current. Exercise both
+/// creation and a later mutation, whose schema version does not change.
+#[test]
+fn refresh_tracks_tables_created_after_input_installation() {
+    let f = Fixture::new();
+    f.cli_args(&["collect"]);
+    f.cli_args(&["accounting", "sync"]);
+    f.cli_args(&["analytics", "refresh"]);
+    let sidecar = f.project.join(".state/telemetry.db");
+    let db = rusqlite::Connection::open(&sidecar).unwrap();
+    db.execute_batch("CREATE TABLE codex_tool_future(id INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT").unwrap();
+    drop(db);
+    let first = f.cli_args(&["analytics", "refresh"]).0;
+    assert!(first["evaluated"].as_array().unwrap().iter().any(|c| c["metric"] == "M16"), "{first}");
+    let tool_cell = |snapshot: Value| snapshot["cells"].as_array().unwrap().iter().find(|c| c["cell"]["metric"] == "M16").unwrap().clone();
+    let before = tool_cell(f.cli_args(&["analytics", "snapshot"]).0);
+    let db = rusqlite::Connection::open(&sidecar).unwrap();
+    db.execute("INSERT INTO codex_tool_future VALUES(1,'new observation')", []).unwrap();
+    drop(db);
+    let changed = f.cli_args(&["analytics", "refresh"]).0;
+    assert!(changed["evaluated"].as_array().unwrap().iter().any(|c| c["metric"] == "M16"), "new table mutation was missed: {changed}");
+    assert!(changed["deferred"].as_array().unwrap().is_empty());
+    // The conservative dependency has no defined contribution to M16 yet:
+    // re-evaluation preserves all metric bodies, digests and lineage.
+    assert_eq!(tool_cell(f.cli_args(&["analytics", "snapshot"]).0), before);
+    let settled = f.cli_args(&["analytics", "refresh"]).0;
+    assert!(!settled["evaluated"].as_array().unwrap().iter().any(|c| c["metric"] == "M16"), "{settled}");
+
+    // A deterministic writer fixture mutates an input after the read snapshot
+    // was captured, as the earlier M08 cell commits its checked timestamp.
+    // Later cells must defer rather than mark the old snapshot checked.
+    let db = rusqlite::Connection::open(&sidecar).unwrap();
+    let checked = || db.query_row("SELECT i.inputs FROM analytics_checked_inputs i JOIN analytics_cells c USING(cell) WHERE c.metric='M16'", [], |r| r.get::<_, String>(0)).unwrap();
+    let checked_before = checked();
+    db.execute_batch("CREATE TRIGGER fixture_late_input AFTER UPDATE OF checked_unix_ms ON analytics_cells
+        WHEN NEW.metric='M08' BEGIN INSERT OR REPLACE INTO codex_tool_future VALUES(2,'late observation'); END").unwrap();
+    let racing = f.cli_args(&["analytics", "refresh", "--metric", "M16", "--from", "0"]).0;
+    assert!(racing["deferred"].as_array().unwrap().iter().any(|c| c["metric"] == "M16"), "{racing}");
+    assert_eq!(racing["comparison_deferred"], true);
+    assert_eq!(db.query_row("SELECT count(*) FROM analytics_cells WHERE metric='M16' AND window_from_unix_ms=0 AND checked_unix_ms IS NULL", [], |r| r.get::<_, i64>(0)).unwrap(), 1,
+        "a deferred new request stays tracked for the next refresh");
+    assert_eq!(checked(), checked_before, "stale evaluation must leave its checked inputs untouched");
+    assert_eq!(tool_cell(f.cli_args(&["analytics", "snapshot"]).0), before);
+    db.execute_batch("DROP TRIGGER fixture_late_input").unwrap();
+    let resumed = f.cli_args(&["analytics", "refresh"]).0;
+    assert!(resumed["deferred"].as_array().unwrap().is_empty(), "{resumed}");
+    assert!(resumed["evaluated"].as_array().unwrap().iter().any(|c| c["metric"] == "M16"), "{resumed}");
+    assert_eq!(db.query_row("SELECT count(*) FROM analytics_cells WHERE metric='M16' AND window_from_unix_ms=0 AND checked_unix_ms IS NOT NULL", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+}

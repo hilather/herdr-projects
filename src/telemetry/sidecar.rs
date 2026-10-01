@@ -83,17 +83,15 @@ pub fn open(project: &Path, create: bool) -> Result<Option<Connection>> {
     // first openers can therefore get SQLITE_BUSY without the busy handler
     // running. Retry the standalone pragma after its read lock is released;
     // migrations themselves acquire their write lock with BEGIN IMMEDIATE.
-    let journal_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let started = std::time::Instant::now();
     loop {
         match db.pragma_update(None, "journal_mode", "WAL") {
             Ok(()) => break,
-            Err(rusqlite::Error::SqliteFailure(error, _))
-                if error.code == rusqlite::ErrorCode::DatabaseBusy
-                    && std::time::Instant::now() < journal_deadline =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(error) => return Err(error).context("set telemetry journal mode"),
+            Err(error) if matches!(error.sqlite_error_code(), Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+                && started.elapsed() < std::time::Duration::from_secs(5) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                },
+            Err(error) => return Err(error).context("configure telemetry WAL"),
         }
     }
     // Retain FULL durability: valuation revisions and live attention samples
@@ -108,7 +106,8 @@ pub(crate) fn migrate(db: &mut Connection) -> Result<()> {
     // Current stores need no write lock. An upgrade still rechecks versions
     // under IMMEDIATE so concurrent openers cannot apply a migration twice.
     let current = stream_versions(db)?;
-    if streams().all(|(stream, migrations)| current.get(stream).copied().unwrap_or(0) == migrations.len()) {
+    if streams().all(|(stream, migrations)| current.get(stream).copied().unwrap_or(0) == migrations.len())
+        && super::analytics::inputs::installation_current(db)? {
         return Ok(());
     }
     // One transaction: a pre-streams sidecar gains `telemetry_streams` with

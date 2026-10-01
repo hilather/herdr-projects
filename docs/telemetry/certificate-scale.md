@@ -29,7 +29,7 @@ for either. This is not a certification of an OTLP transport.
 | --- | --- |
 | Source | branch `telemetry/tm51-scale-certification` from `main` `20a763f`, plus the fixes in §5 |
 | Build | `cargo test --release --locked --offline -j 3 --features state-store --test telemetry_scale --no-run` (rustc 1.98.0), system SQLite 3.53.4 |
-| Stores | canonical `SCHEMA = 67`; sidecar streams `codex` 3, `ingest` 9, `accounting` 12, `quality` 2, `analytics` 3, `health` 1, `policies` 1 |
+| Stores | canonical `SCHEMA = 67`; sidecar streams `codex` 3, `ingest` 9, `accounting` 13, `quality` 2, `analytics` 3, `health` 1, `policies` 1 |
 | CPU / memory | Intel Core i7-8750H, 6 cores / 12 threads, 62 GiB RAM, zram swap |
 | Disk | Intel SSDPEKNW010T8 NVMe, LUKS, btrfs (`compress=zstd:3`). Every dataset lived under `bench-data/` on this disk, never on the RAM-backed `/tmp` |
 | OS | Linux 7.2.3-arch1-3 |
@@ -793,8 +793,9 @@ the canonical head/file identity. A refresh evaluates only changed cells;
 clock-dependent attention, fleet, quality and review cells always evaluate.
 Unchanged cells advance `checked_unix_ms` without changing their revisions.
 Evaluated cells are appended and released one at a time rather than keeping
-all cells' lineage in memory. Dependency capture, revisions and saved
-provider bodies share one immediate transaction. Rebuild bypasses all
+all cells' lineage in memory. The original P2 path held one immediate transaction across evaluation;
+P2b replaces that path with shared read snapshots and generation-validated
+short write transactions (§4.11). Rebuild bypasses all
 aggregate shortcuts and replays original sources; digest, lineage,
 restatement and stored as-of semantics are unchanged.
 
@@ -949,6 +950,109 @@ through public health evaluation and persisted alerts. Existing expected
 values and the gate body are unchanged. Clippy completed with no diagnostics
 on changed lines (existing warnings remain elsewhere).
 
+### 4.11 P2b: snapshot evaluation and short validated writes (100k only)
+
+Branch `perf/incremental-analytics`, rebased onto main `033e93b` (P3/P3b/P3c).
+**Pending the steward's serial 1M certification.** Analytics migrations are
+now `0001_aggregate_revisions`, `0002_workspace_projections`, then
+`0003_input_frontiers`: current analytics stream **3**, accounting **13**.
+The original P2 measurements in §4.10 predate this workspace merge.
+
+Providers that independently open canonical/sidecar readers now share pinned
+DEFERRED snapshots for one refresh, including their nested read transactions.
+Evaluation, metric/projection JSON, lineage attributes, comparison and provider
+bodies are produced outside the writer lock. Each evaluated cell takes a short
+IMMEDIATE transaction, reads live input generations and a fresh canonical
+fingerprint, then atomically decides its revision and writes serialized data.
+Changed inputs defer that cell without advancing its checked inputs; a new
+request remains tracked even when deferred. Unchanged-input cells batch their
+checked-time updates. Clock-dependent cells continue to evaluate. The final
+short transaction independently validates provider bodies and the workspace
+comparison before storing them. Refresh reports `evaluated`, `deferred`,
+`comparison_deferred` and cumulative `write_lock_ms` (acquisition waits excluded).
+Missing metric renderings are repaired without restating their authoritative
+revision; workspace comparisons use main's unchanged estimator and projection.
+
+Current-stream migration opens retain P3c's read-only shortcut only when the
+input-trigger installation also matches `PRAGMA schema_version`. Otherwise,
+installation runs under the migration transaction, covering tables created
+since the last refresh. A bounded initial WAL-transition retry also handles
+SQLite's immediate BUSY response when first collectors race to create a store.
+
+Both release builds used §1's exact locked/offline `-j 3` command. Phases 0/1
+prepared one on-disk dataset under `$PWD/bench-data/`, with 100,000 configured
+events, 64 active attempts, 10,000 retained bindings and the complete P6 facts.
+The preserved rebased P2 CLI supplies before; the final CLI supplies after.
+No source events, canonical inputs or generator totals changed between runs.
+Both refresh runs are warm-input measurements, not cache-initialization or
+full-invalidation measurements. Run `scale_9_analytics_refresh` and
+`scale_2_queries` serially with `SCALE_REPEATS=3`, `SCALE_PER_ROUND=1` and
+`SCALE_TAG=p2b-before|p2b-after`, using §1's environment. Before refresh uses
+`SCALE_ANALYTICS_BIN` to select the preserved CLI. A temporary SQLite step
+interposer around each refresh records successful BEGIN IMMEDIATE through
+successful COMMIT; lock acquisition waits are excluded. No instrumentation
+wrapper or dataset is committed. No build or other bench ran during either
+measurement. No 1M run was performed.
+
+| 100k/64, three refreshes | Before | After |
+| --- | --- | --- |
+| Refresh wall p50 / p95 | 220.48 / 242.58 ms | 804.11 / 805.69 ms |
+| Peak RSS | 36,240 KiB (35.4 MiB) | 77,732 KiB (75.9 MiB) |
+| Uninterrupted IMMEDIATE scope p50 / maximum | 206.83 / 209.63 ms (3 scopes) | 6.73 / 14.78 ms (81 scopes) |
+| Cumulative writer hold per refresh, p50 / maximum | 206.83 / 209.63 ms | 187.33 / 195.51 ms |
+| Refresh load averages, 1 / 5 / 15 minutes, start → end | 2.77 / 5.66 / 4.89 → 2.77 / 5.66 / 4.89 | 2.50 / 4.58 / 4.80 → 2.50 / 4.58 / 4.80 |
+
+This fixes the uninterrupted lock hold; cumulative hold is only modestly
+lower. The after path also restores P3's workspace comparison that the old
+P2 refresh omitted, and pays for 27 short scopes per refresh rather than
+one long scope. Wall latency and RSS increase in this comparison; neither is
+claimed as a speedup or a memory improvement. The 100k warm refresh stays
+below the unchanged 256 MiB envelope. Full invalidation, whole-pass resources,
+concurrent-load behavior and 1M remain for the steward's certification.
+Both refresh phases report zero usage-gate violations and unchanged canonical
+digests. Individual after scopes are milliseconds, comparable to P3c's
+14.96 ms maximum (§4.9).
+
+| 100k/64 reads, three samples; wall p50 / p95 | Before | After |
+| --- | --- | --- |
+| M08 | 23.00 / 23.38 ms | 22.83 / 26.80 ms |
+| M13 | 37.55 / 37.79 ms | 37.81 / 38.21 ms |
+| Report | 244.14 / 260.81 ms | 239.77 / 241.99 ms |
+| Query load averages, 1 / 5 / 15 minutes, start → end | 1.52 / 4.86 / 4.66 → 1.72 / 4.63 / 4.59 | 1.37 / 4.04 / 4.61 → 1.30 / 3.81 / 4.52 |
+
+All three read p95s remain below 500 ms at 100k; these small, shared-host
+samples are not a read-path speedup claim. No evaluator, arithmetic, coverage
+rule, digest serialization, lineage order or as-of selection rule changes.
+The unchanged gate checks exact totals, single acceptance, pinned as-of
+answers, byte-identical rebuilds and the canonical digest. CLI E2E coverage
+creates a source table after installation, refreshes, mutates it without
+changing its schema, then verifies dependent-cell evaluation with an identical
+stored answer. A deterministic late-writer fixture changes inputs after the
+read snapshot: refresh defers stale cells and a new requested cell, preserves
+checked inputs and recorded answers, and the next refresh resumes the request.
+Existing operations workflows still verify projection repair and retention.
+
+Final validation used `RUST_TEST_THREADS=1 cargo test --locked --offline -j 3
+--features state-store --no-fail-fast` with all fifteen requested telemetry
+suites plus `--test telemetry_routines`: **178 passed, 11 ignored, four
+socket-only failures**. The four failures are solely Unix bind denials
+(`Operation not permitted`), without a workaround:
+
+- `telemetry::attempts_show_attention_summary`
+- `telemetry_accounting::attention_intervals_union_and_censor`
+- `telemetry_health::recommendations_and_notices_change_no_canonical_state_and_no_dispatch`
+- `telemetry_workspace::thread_start_records_the_dispatch_reason_and_the_sidebar_suffix`
+
+The first full run also exposed `database is locked` in the first-collector
+creation race. After the bounded WAL transition retry, that existing E2E
+passed ten serial runs and the final full suite. The unchanged debug load
+gate passed in the final full and focused runs; the unchanged release gate
+also passed in 12.26 s. Clippy (`--locked --offline
+-j 3 --features state-store --test telemetry_query --test telemetry_scale
+--test telemetry_operations`) completed; no warning location falls on a line
+changed from `origin/main`. Existing unrelated warnings remain. No unit or
+source-text tests were added; only the stream-version expectation advances.
+
 ## 5. Inefficiencies found and fixed
 
 The first measurement (same generator, same host) missed the query and
@@ -1071,10 +1175,14 @@ owner. None is hidden by loosening the target.
   analytics revisions (`--as-of-seq`, 159 ms) is the bounded path today.
   **P2 follow-up: 100k/64 M08 p95 1,073.07 → 27.91 ms, M13
   2,542.99 → 46.54 ms, report 2,443.80 → 308.27 ms and cost view
-  752.10 → 133.76 ms; pending the steward's 1M certification** (§4.7).
+  752.10 → 133.76 ms; pending the steward's 1M certification** (§4.10).
   Maintained session/attempt/valuation summaries and validated provider
   bodies replace history replay on these reads. Full derivation remains the
   live fallback for missing/stale projections and the rebuild verifier.
+  **P2b retains the 100k read target: M08/M13/report p95
+  23.38/37.79/260.81 → 26.80/38.21/241.99 ms; pending the steward's
+  1M certification** (§4.11; query load before 1.52 → 1.72, after
+  1.37 → 1.30). No read-speedup claim on these shared-host samples.
   Owners: accounting lane, analytics (TM4.1).
 - **L4: the ticker's telemetry pass exceeds the 256 MiB envelope at 10,000
   bindings.** The collector itself stays within it (58–115 MB) and its byte
@@ -1098,10 +1206,16 @@ owner. None is hidden by loosening the target.
   certified by P1. **Analytics P2 follow-up: 276.4 → 180.0 MiB peak
   RSS across three 100k/64 refreshes including cache initialization; wall
   p50/p95 3,669.20/8,291.27 → 332.01/2,292.04 ms; pending the
-  steward's 1M certification** (§4.7; load before 10.44–10.24, after
+  steward's 1M certification** (§4.10; load before 10.44–10.24, after
   5.18–5.33). Subsequent unchanged-input refreshes use 35.1–35.2 MiB.
   Health, whole-pass RSS and full invalidation/rebuild memory remain
-  uncertified by P2.
+  uncertified by P2. **P2b shortens uninterrupted analytics writer
+  scopes at 100k from p50/max 206.83/209.63 to 6.73/14.78 ms;
+  pending the steward's 1M certification** (§4.11; refresh load
+  2.77 before / 2.50 after). Warm refresh p95/RSS increase from
+  242.58 ms/35.4 MiB to 805.69 ms/75.9 MiB while restoring P3's
+  omitted comparison work; this is a lock-hold fix, not a latency/RSS
+  improvement. The 100k warm RSS remains below 256 MiB.
 - **L5: the fleet pane and the digest section take seconds, not 250 ms / 100
   ms.** At 64 active attempts with 10,000 retained ones, one snapshot builds
   the full attempt projection three times (the active list, `compare`,
@@ -1123,6 +1237,9 @@ owner. None is hidden by loosening the target.
   17.10 → 17.57 before / 5.09 → 9.40 after; current-store migration
   transactions 12 → 0. Pending the steward's 1M certification. The noisy
   P3c digest read still misses 100 ms; this does not close all of L5.
+  P2b preserves these projections while reducing its regressed maximum
+  uninterrupted refresh writer hold from 209.63 to 14.78 ms at 100k
+  (§4.11; pending the steward's 1M certification).
   Original 1M measurements above remain the last certified ones.
   Owners: TM4.8, TM1.8, TM4.1.
 - **L6: sidecar size.** The sidecar is 2.7–3.1 times the rollout bytes it

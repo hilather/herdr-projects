@@ -147,10 +147,16 @@ Commands (writes only this stream's tables; needs an existing sidecar, else
 `unavailable: collection_not_run`):
 
 - `analytics refresh [--metric M --cohort --from --to --horizon-ms --by]`:
-  evaluates every tracked cell (first run: every active metric's default
-  cell) and, in one immediate transaction, appends a revision only for a cell
-  whose content changed (incremental: an unchanged cell only gets
-  `checked_unix_ms`). A late correction therefore appends a `restatement`
+  evaluates tracked cells whose inputs changed (first run: every active metric's
+  default cell). Clock-dependent cells always evaluate. Providers share pinned
+  canonical and sidecar read snapshots. Serialized revisions are committed in
+  short immediate transactions after rechecking the live input generations;
+  `deferred` lists cells whose inputs changed during evaluation, leaving them
+  due for the next refresh. `comparison_deferred` reports the same condition
+  for the workspace comparison. Unchanged cells only advance `checked_unix_ms`.
+  `evaluated` lists the cells evaluated and `write_lock_ms` reports cumulative
+  time inside successful immediate transactions, excluding acquisition waits.
+  A late correction therefore appends a `restatement`
   superseding the previous revision; earlier revisions stay readable byte for
   byte. Racing refreshes append once.
 - `analytics rebuild [--verify]`: recomputes every tracked cell from the
@@ -238,3 +244,8 @@ DG6 adds `verification_flip_rate.v1` in registry v2: quality lane,
 activity window, since-only, completed verification record time, per-project
 pair ratio with per-policy id/digest drill-down. See contracts-quality.md §6.
 The prior metric definitions retain their meanings.
+Analytics stream 3 (`0003_input_frontiers.sql`) adds durable source-table
+mutation generations, checked-cell inputs and validated provider aggregates.
+Writable open checks trigger installation against `PRAGMA schema_version`
+even when all stream versions are current, so newly created source tables
+receive mutation triggers. Rebuild continues to bypass provider aggregates.

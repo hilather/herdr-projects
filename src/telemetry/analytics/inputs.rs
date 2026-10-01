@@ -8,6 +8,13 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path};
 use super::registry::Provider;
 
+pub(crate) fn installation_current(db: &Connection) -> Result<bool> {
+    if !db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='analytics_input_installation')", [], |r| r.get::<_, bool>(0))? { return Ok(false); }
+    let schema: i64 = db.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
+    let installed: Option<i64> = db.query_row("SELECT schema_version FROM analytics_input_installation WHERE singleton=1", [], |r| r.get(0)).optional()?;
+    Ok(installed == Some(schema))
+}
+
 pub(crate) fn install(db: &Connection) -> Result<()> {
     let schema: i64 = db.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
     let installed: Option<i64> = db.query_row("SELECT schema_version FROM analytics_input_installation WHERE singleton=1", [], |r| r.get(0)).optional()?;
@@ -40,12 +47,21 @@ pub(crate) fn generations(db: &Connection) -> Result<Option<BTreeMap<String, i64
 }
 
 pub(crate) fn canonical(project: &Path) -> Result<Value> {
+    canonical_with(project, false)
+}
+
+pub(crate) fn canonical_current(project: &Path) -> Result<Value> {
+    canonical_with(project, true)
+}
+
+fn canonical_with(project: &Path, fresh: bool) -> Result<Value> {
     use std::os::unix::fs::MetadataExt;
     let files: Vec<Value> = ["state.db", "state.db-wal"].iter().map(|name| {
         std::fs::metadata(project.join(".state").join(name)).ok().filter(|m| *name != "state.db-wal" || m.len() > 0).map(|m|
             json!([m.dev(),m.ino(),m.len(),m.mtime(),m.mtime_nsec(),m.ctime(),m.ctime_nsec()])).unwrap_or(Value::Null)
     }).collect();
-    let db = crate::telemetry::read_only(&project.join(".state/state.db"))?;
+    let path = project.join(".state/state.db");
+    let db = if fresh { crate::telemetry::read_only_fresh(&path)? } else { crate::telemetry::read_only(&path)? };
     let head: i64 = db.query_row("SELECT coalesce(max(sequence),0) FROM events", [], |r| r.get(0))?;
     Ok(json!({"files": files, "head": head}))
 }

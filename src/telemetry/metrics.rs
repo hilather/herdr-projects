@@ -93,7 +93,7 @@ pub(crate) fn central_uncached(project: &Path, since: Option<i64>, aggregates: b
         "excluded": {"replay_candidate": replayed}})));
 
     let sidecar = super::sidecar::read(project)?;
-    let _snapshot = sidecar.as_deref().map(|db| db.unchecked_transaction()).transpose()?;
+    let _snapshot = sidecar.as_deref().filter(|db| db.is_autocommit()).map(|db| db.unchecked_transaction()).transpose()?;
     usage_metrics(sidecar.as_deref(), &attempts, since, &in_window, &mut metrics, aggregates)?;
     for id in ["M31", "M32", "M33"] { metrics.insert(id, metric(id, json!({"value": unavailable("attention_not_collected")}))); }
     metrics.insert("M40", headroom(project, sidecar.as_deref(), &attempts, &in_window, aggregates)?);

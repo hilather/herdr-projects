@@ -43,14 +43,61 @@ pub const LANES: [Lane; 8] = [lane!(collectors), lane!(accounting), lane!(qualit
 
 /// A read-only connection that writes and creates nothing (contracts §0 "Reads").
 /// Fields drop in order: the connection closes before the lock is released.
+#[derive(Clone)]
 pub(crate) struct ReadOnly {
-    db: rusqlite::Connection,
-    _lock: std::fs::File,
+    db: std::rc::Rc<rusqlite::Connection>,
+    _lock: std::rc::Rc<std::fs::File>,
 }
 
 impl std::ops::Deref for ReadOnly {
     type Target = rusqlite::Connection;
     fn deref(&self) -> &rusqlite::Connection { &self.db }
+}
+
+// Providers reopen stores independently. During refresh, route every read on
+// this thread to the same pinned WAL snapshots, including nested provider reads.
+thread_local! {
+    static EVALUATION_READS: std::cell::RefCell<std::collections::BTreeMap<std::path::PathBuf, ReadOnly>> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+pub(crate) struct ReadTransaction<'a> {
+    db: &'a rusqlite::Connection,
+    _transaction: Option<rusqlite::Transaction<'a>>,
+}
+impl std::ops::Deref for ReadTransaction<'_> {
+    type Target = rusqlite::Connection;
+    fn deref(&self) -> &Self::Target { self.db }
+}
+impl ReadOnly {
+    // A nested reader borrows the existing snapshot; only its owner rolls back.
+    pub(crate) fn unchecked_transaction(&self) -> rusqlite::Result<ReadTransaction<'_>> {
+        Ok(ReadTransaction { db: &self.db,
+            _transaction: self.db.is_autocommit().then(|| self.db.unchecked_transaction()).transpose()? })
+    }
+}
+
+pub(crate) struct EvaluationReads(std::marker::PhantomData<std::rc::Rc<()>>);
+impl EvaluationReads {
+    pub(crate) fn begin(project: &std::path::Path) -> anyhow::Result<Self> {
+        anyhow::ensure!(EVALUATION_READS.with(|reads| reads.borrow().is_empty()), "nested evaluation snapshots");
+        let guard = Self(std::marker::PhantomData);
+        for path in [project.join(".state/state.db"), sidecar::path(project)] {
+            let db = read_only(&path)?;
+            db.execute_batch("BEGIN DEFERRED")?;
+            // BEGIN alone does not establish a WAL snapshot. Pin it now.
+            db.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0))?;
+            EVALUATION_READS.with(|reads| reads.borrow_mut().insert(path, db));
+        }
+        Ok(guard)
+    }
+}
+impl Drop for EvaluationReads {
+    fn drop(&mut self) {
+        EVALUATION_READS.with(|reads| {
+            for db in reads.borrow_mut().values() { let _ = db.execute_batch("ROLLBACK"); }
+            reads.borrow_mut().clear();
+        });
+    }
 }
 
 /// Open a WAL database for reading without creating side files. A shared lock
@@ -62,6 +109,11 @@ impl std::ops::Deref for ReadOnly {
 /// `immutable` (a plain read-only open would create `-wal`/`-shm` that only a
 /// writer removes).
 pub(crate) fn read_only(path: &std::path::Path) -> anyhow::Result<ReadOnly> {
+    if let Some(db) = EVALUATION_READS.with(|reads| reads.borrow().get(path).cloned()) { return Ok(db); }
+    read_only_fresh(path)
+}
+
+pub(crate) fn read_only_fresh(path: &std::path::Path) -> anyhow::Result<ReadOnly> {
     use anyhow::Context;
     use rusqlite::OpenFlags;
     use std::os::unix::fs::OpenOptionsExt;
@@ -83,7 +135,7 @@ pub(crate) fn read_only(path: &std::path::Path) -> anyhow::Result<ReadOnly> {
     };
     let db = opened.with_context(|| format!("open {}", path.display()))?;
     db.busy_timeout(std::time::Duration::from_secs(5))?;
-    Ok(ReadOnly { db, _lock: lock })
+    Ok(ReadOnly { db: std::rc::Rc::new(db), _lock: std::rc::Rc::new(lock) })
 }
 
 /// A read lock on SQLite's SHARED range (`PENDING_BYTE + 2`, 510 bytes), as an
