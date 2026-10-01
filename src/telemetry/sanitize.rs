@@ -9,6 +9,8 @@ use serde_json::{Map, Value};
 pub enum Class {
     /// An identifier: kept verbatim when ≤128 chars without control characters.
     Id,
+    /// Strict ASCII model identifier, excluding secret prefixes; otherwise Text.
+    ModelId,
     /// Enum-like or free text: excerpt rules 1-5.
     Text,
     /// A string, or the first key of an object (Codex `source`), then as `Text`.
@@ -115,6 +117,13 @@ fn keep(value: &Value, class: Class) -> Value {
     let text = |value: &Value| value.as_str().map(|s| Value::String(excerpt(s))).unwrap_or(Value::Null);
     match class {
         Class::Id => value.as_str().filter(|s| s.chars().count() <= 128 && !s.chars().any(char::is_control)).map_or(Value::Null, |s| Value::String(s.into())),
+        Class::ModelId => value.as_str().map_or(Value::Null, |s| {
+            let valid = !s.is_empty() && s.len() <= 128
+                && s.as_bytes()[0].is_ascii_alphanumeric()
+                && s.bytes().all(|c| c.is_ascii_alphanumeric() || b"._:/@-".contains(&c))
+                && !secret_prefix(s);
+            if valid { Value::String(s.into()) } else { text(value) }
+        }),
         Class::Text => text(value),
         Class::Tag => match value {
             Value::Object(map) => map.keys().next().map_or(Value::Null, |key| Value::String(excerpt(key))),
@@ -197,8 +206,12 @@ fn mask_run(run: &str) -> String {
             return format!("{}[redacted]", &run[..at + key.len()]);
         }
     }
-    let secret_prefix = ["sk-", "ghp_", "github_pat_", "akia"].iter().any(|p| lower.starts_with(p) && run.len() > p.len())
-        || (lower.starts_with("xox") && lower.as_bytes().get(4) == Some(&b'-'));
     let long = run.len() >= 20 && run.chars().any(|c| c.is_ascii_alphabetic()) && run.chars().any(|c| c.is_ascii_digit());
-    if secret_prefix || long { "[redacted]".into() } else { run.into() }
+    if secret_prefix(run) || long { "[redacted]".into() } else { run.into() }
+}
+
+fn secret_prefix(run: &str) -> bool {
+    let lower = run.to_ascii_lowercase();
+    ["sk-", "ghp_", "github_pat_", "akia"].iter().any(|p| lower.starts_with(p) && run.len() > p.len())
+        || (lower.starts_with("xox") && lower.as_bytes().get(4) == Some(&b'-'))
 }

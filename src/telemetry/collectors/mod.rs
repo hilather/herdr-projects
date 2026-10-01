@@ -304,7 +304,7 @@ fn capabilities(project: &Path) -> Result<Value> {
         let basis = match (f.kind, class) {
             ("line", _) => "reported",
             (_, None) => "unavailable",
-            (_, Some(Class::Id | Class::Number | Class::Bool | Class::IdList)) => "reported",
+            (_, Some(Class::ModelId | Class::Id | Class::Number | Class::Bool | Class::IdList)) => "reported",
             (_, Some(Class::Text | Class::Tag)) => "reported_excerpt",
             (_, Some(Class::Path)) => "reported_home_redacted",
         };

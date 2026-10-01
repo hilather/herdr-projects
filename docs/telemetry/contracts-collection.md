@@ -1397,9 +1397,9 @@ home-redacted source/digested source identity as Codex), version, model,
 API message id, the four native token counts, sidechain flag, tool-use ids
 and names, tool-result links and reported error booleans. The native envelope
 `claude-code.claude_line.v1` stores flattened sanitized metadata, tool id/name
-lists and error counts. The exact fixture-certified model identifier
-`claude-haiku-4-5-20251001` is preserved as an identifier rather than redacted
-by the generic long-token text rule; other model strings retain excerpt rules.
+lists and error counts. Model identifiers matching `^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,127}$`
+are preserved verbatim unless they have a recognized secret-token prefix
+(such as `sk-ant-`); other model strings retain Text/excerpt redaction.
 Line-type counts and unknown field/type counts are
 obtained from these envelopes; unmapped entries retain **keys only** (up to
 128 names per line, plus the full unmapped count). Unknown

@@ -358,3 +358,48 @@ fn claude_2_1_286_two_turns_in_lossy_project_directory() {
     assert_eq!(attempt_usage(&f)["records"], 2);
     no_secrets(&f);
 }
+
+#[test]
+fn claude_model_identifiers_and_planted_secret_conformance() {
+    let f = claude();
+    let path = transcript(&f, SID, &f.worktree(), "2.1.3", f.decided + 1000);
+    let models = [
+        "claude-haiku-4-5-20251001",
+        "claude-sonnet-4-5-20250929",
+        "claude-opus-4-1",
+        "claude-future-9-7-20301231",
+        "Bearer sk-ant-CLAUDE_SECRET_MODEL_SPACES",
+        "sk-ant-CLAUDE_SECRET_MODEL_TOKEN",
+    ];
+    let mut lines = String::new();
+    for (i, model) in models.iter().enumerate() {
+        lines.push_str(&format!("{}\n", json!({"type":"assistant", "sessionId":SID,
+            "cwd":f.worktree(), "version":"2.1.3",
+            "timestamp":jiff::Timestamp::from_millisecond(f.decided + 1000).unwrap().to_string(),
+            "message":{"id":format!("model-{i}"), "model":model,
+                "usage":{"input_tokens":10,"output_tokens":1},
+                "content":[{"type":"text","text":"CLAUDE_SECRET_MODEL_CONTENT"}]}})));
+    }
+    fs::write(path, lines).unwrap();
+    assert_eq!(f.cli("collect").0["collected"]["records"], 6);
+    f.cli_args(&["accounting", "sync"]);
+    let ledger = f.cli_args(&["accounting", "entries"]).0;
+    let entries = ledger["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 6);
+    for model in &models[..4] {
+        assert!(entries.iter().any(|entry| entry["model"] == *model), "{ledger}");
+    }
+    for expected in ["Bearer [redacted]", "[redacted]"] {
+        assert!(entries.iter().any(|entry| entry["model"] == expected), "{ledger}");
+    }
+    let db = f.sidecar();
+    for (i, model) in models.iter().take(4).enumerate() {
+        let stored: String = db.query_row("SELECT json_extract(payload,'$.model') FROM source_observations WHERE json_extract(payload,'$.message_id')=?1",
+            [format!("model-{i}")], |r| r.get(0)).unwrap();
+        assert_eq!(stored, *model);
+    }
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "entries"]).0["entries"].as_array().unwrap().len(), 6);
+    no_secrets(&f);
+}

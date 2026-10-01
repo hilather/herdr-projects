@@ -22,7 +22,7 @@ pub(super) fn walk(root: &Path, out: &mut Vec<PathBuf>) {
 pub fn capabilities() -> Value {
     use sanitize::Class::*;
     let source_fields = [("sessionId", Id), ("timestamp", Text), ("cwd", Path), ("version", Text), ("type", Tag),
-        ("message.model", Text), ("message.id", Id), ("isSidechain", Bool),
+        ("message.model", ModelId), ("message.id", Id), ("isSidechain", Bool),
         ("message.usage.input_tokens", Number), ("message.usage.output_tokens", Number),
         ("message.usage.cache_creation_input_tokens", Number), ("message.usage.cache_read_input_tokens", Number),
         ("message.content.tool_use.id", Id), ("message.content.tool_use.name", Tag),
@@ -39,7 +39,7 @@ pub fn capabilities() -> Value {
 
 pub fn allowlist() -> Vec<(String, sanitize::Class)> {
     use sanitize::Class::*;
-    [("session_id", Id), ("timestamp", Text), ("version", Text), ("line_type", Tag), ("model", Id), ("message_id", Id),
+    [("session_id", Id), ("timestamp", Text), ("version", Text), ("line_type", Tag), ("model", ModelId), ("message_id", Id),
         ("isSidechain", Bool), ("input_tokens", Number), ("output_tokens", Number), ("cache_creation_input_tokens", Number),
         ("cache_read_input_tokens", Number), ("tool_use_ids", IdList), ("tool_names", IdList), ("tool_result_ids", IdList),
         ("tool_result_errors", Number), ("unmapped_count", Number), ("unmapped_keys", IdList)].into_iter().map(|(k, c)| (k.to_owned(), c)).collect()
@@ -95,11 +95,7 @@ pub(super) fn record_line(tx: &Transaction, ledger: &ingest::Ledger, at: u64, li
     unmapped(usage, "message.usage.", &["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"], &mut unknown, &mut unmapped_count);
     if !matches!(kind, "assistant" | "user" | "summary" | "system") { unknown.push(format!("type:{kind}")); unmapped_count += 1; }
     let mut payload = json!({"session_id": session, "timestamp": timestamp, "version": raw["version"], "line_type": kind,
-        // Preserve the certified model identifier, which the generic long-token
-        // masker otherwise redacts. All other model strings keep excerpt rules.
-        "model": field(message, "model", if message["model"].as_str() == Some("claude-haiku-4-5-20251001") {
-            sanitize::Class::Id
-        } else { sanitize::Class::Text }), "message_id": id(message, "id"), "isSidechain": raw["isSidechain"].as_bool(),
+        "model": field(message, "model", sanitize::Class::ModelId), "message_id": id(message, "id"), "isSidechain": raw["isSidechain"].as_bool(),
         "tool_use_ids": [], "tool_names": [], "tool_result_ids": [], "tool_result_errors": 0});
     for counter in ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"] {
         payload[counter] = field(usage, counter, sanitize::Class::Number);
