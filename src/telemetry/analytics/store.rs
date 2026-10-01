@@ -166,7 +166,12 @@ fn workspace_metric_body(db: &Connection, metric: &str, core: &Value, revision: 
 
 /// `telemetry <slug> analytics refresh`: writes only the sidecar's analytics tables.
 pub fn refresh(project: &Path, extra: Option<Cell>) -> Result<Value> {
-    let Some(mut db) = crate::telemetry::sidecar::open(project, false)? else { return Ok(unavailable("collection_not_run")) };
+    refresh_with_wait(project, extra, &mut crate::telemetry::writer::WriterWait::foreground(), false)
+}
+
+fn refresh_with_wait(project: &Path, extra: Option<Cell>, wait: &mut crate::telemetry::writer::WriterWait, ticker: bool) -> Result<Value> {
+    let Some(db) = crate::telemetry::sidecar::open(project, false)? else { return Ok(unavailable("collection_not_run")) };
+    if ticker { db.busy_timeout(std::time::Duration::ZERO)?; }
     let Some(cells) = cells(project, extra)? else { return Ok(unavailable("collection_not_run")) };
     // All provider opens on this thread share these pinned read snapshots.
     // WAL writers can collect/sync while evaluation and serialization run.
@@ -176,7 +181,7 @@ pub fn refresh(project: &Path, extra: Option<Cell>) -> Result<Value> {
     sources.include_first_candidate_report = cells.iter().any(|cell| cell.metric.id == "M30");
     if canonical_before != sources.canonical_inputs {
         let keys = cells.iter().map(Cell::key).collect::<Vec<_>>();
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).context("acquire analytics writer")?;
+        let tx = wait.acquire(&db).context("acquire analytics writer")?;
         let locked = std::time::Instant::now();
         let now = jiff::Timestamp::now().as_millisecond();
         for (cell, key) in cells.iter().zip(&keys) { track_cell(&tx, cell, key, now)?; }
@@ -220,11 +225,11 @@ pub fn refresh(project: &Path, extra: Option<Cell>) -> Result<Value> {
         }
         // A separate writer reads the live generations, never the pinned snapshot.
         // Revalidate even skipped cells: a racing mutation must leave them due.
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).context("acquire analytics writer")?;
+        let canonical = super::inputs::canonical_current(project)?;
+        let tx = wait.acquire(&db).context("acquire analytics writer")?;
         let locked = std::time::Instant::now();
         let current = super::inputs::generations(&tx)?.unwrap_or_default();
-        let canonical = super::inputs::canonical_current(project)?;
-        if inputs != super::inputs::stamp(group, &canonical, &current) {
+        if !super::inputs::canonical_unchanged(project, &canonical) || inputs != super::inputs::stamp(group, &canonical, &current) {
             deferred.push(serde_json::from_str::<Value>(&key)?);
             // Persist the request without certifying its stale inputs. This
             // also keeps a deferred extra/default cell due on the next refresh.
@@ -259,13 +264,14 @@ pub fn refresh(project: &Path, extra: Option<Cell>) -> Result<Value> {
         let reference = super::compact::reference(&db, &body)?;
         Ok((group, window, inputs, body, reference))
     }).collect::<Result<Vec<_>>>()?;
-    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).context("acquire analytics writer")?;
+    let canonical = super::inputs::canonical_current(project)?;
+    let tx = wait.acquire(&db).context("acquire analytics writer")?;
     let locked = std::time::Instant::now();
     let current = super::inputs::generations(&tx)?.unwrap_or_default();
-    let canonical = super::inputs::canonical_current(project)?;
+    let canonical_valid = super::inputs::canonical_unchanged(project, &canonical);
     // Unchanged cells need only one bounded batch of checked-time updates.
     for (key, group, inputs) in skipped {
-        if inputs != super::inputs::stamp(group, &canonical, &current) {
+        if !canonical_valid || inputs != super::inputs::stamp(group, &canonical, &current) {
             deferred.push(serde_json::from_str::<Value>(&key)?);
             continue;
         }
@@ -273,7 +279,7 @@ pub fn refresh(project: &Path, extra: Option<Cell>) -> Result<Value> {
             .execute(rusqlite::params![key, now])?;
         unchanged += 1;
     }
-    let comparison_deferred = super::inputs::stamp("central", &canonical, &current)
+    let comparison_deferred = !canonical_valid || super::inputs::stamp("central", &canonical, &current)
         != super::inputs::stamp("central", &sources.canonical_inputs, &sources.input_generations);
     if !comparison_deferred {
         let previous: Option<String> = tx.query_row("SELECT body FROM analytics_workspace_comparisons ORDER BY revision DESC LIMIT 1", [], |r| r.get(0)).optional()?;
@@ -282,7 +288,7 @@ pub fn refresh(project: &Path, extra: Option<Cell>) -> Result<Value> {
         }
     }
     for (group, window, inputs, body, reference) in bodies {
-        if inputs != super::inputs::stamp(&group, &canonical, &current) { continue; }
+        if !canonical_valid || inputs != super::inputs::stamp(&group, &canonical, &current) { continue; }
         let reference = match reference {
             Some(reference) if tx.prepare_cached("SELECT EXISTS(SELECT 1 FROM analytics_revisions WHERE revision=?1)")?
                 .query_row([reference.revision], |r| r.get::<_, bool>(0))? => Some(reference),
@@ -420,7 +426,10 @@ pub fn tick(project: &Path) -> Result<()> {
     let last: Option<i64> = db.query_row("SELECT max(checked_unix_ms) FROM analytics_cells", [], |r| r.get(0))?;
     drop(db);
     match last {
-        Some(at) if jiff::Timestamp::now().as_millisecond() - at >= TICK_INTERVAL_MS => refresh(project, None).map(drop),
+        Some(at) if jiff::Timestamp::now().as_millisecond() - at >= TICK_INTERVAL_MS => match refresh_with_wait(project, None, &mut crate::telemetry::writer::WriterWait::ticker(), true) {
+            Err(error) if crate::telemetry::writer::busy(&error) => Ok(()),
+            result => result.map(drop),
+        },
         _ => Ok(()),
     }
 }

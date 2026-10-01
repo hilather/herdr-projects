@@ -280,6 +280,11 @@ pub fn collect(project: &Path, budget: Budget, create: bool) -> Result<Option<Co
     let (attempts, homes) = canonical(project)?;
     super::gemini::collect(project, budget, &attempts)?;
     let Some(mut db) = super::sidecar::open(project, create || !homes.is_empty())? else { return Ok(None) };
+    // Foreground collection races the same accounting/analytics writers. A
+    // longer bounded admission wait prevents their successful retries from
+    // starving a collector at the old five-second timeout. Ticker stays at
+    // its existing policy; cursors are still read under each immediate lock.
+    if create { db.busy_timeout(std::time::Duration::from_secs(30))?; }
     // TM5.3: tombstoned sessions are never collected again (maintenance holds
     // the lock exclusively while it tombstones and deletes).
     let _maintenance = super::maintenance::lock(project, false)?;

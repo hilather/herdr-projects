@@ -90,10 +90,11 @@ impl Window {
 type Fields = (Option<String>, Option<i64>, Option<i64>);
 
 /// Resume the last window of a key from its exact persisted fixed-point fields.
-fn current_window(tx: &Connection, account: &str, limit: &str, kind: &'static str) -> Result<Option<Window>> {
+fn current_window(tx: &Connection, account: &str, limit: &str, kind: &'static str, suffix: bool) -> Result<Option<Window>> {
     Ok(tx.prepare_cached("SELECT window_id,window_minutes,resets_unix_ms,start_evidence,first_observed_unix_ms,last_observed_unix_ms,
         first_used,used,plan_type,observations,flagged FROM quota_windows WHERE account=?1 AND limit_id=?2 AND window_kind=?3
-        ORDER BY resets_unix_ms DESC LIMIT 1")?.query_row(params![account, limit, kind], |r| {
+        AND (?4=0 OR first_observed_unix_ms < (SELECT observed FROM accounting_quota_floors WHERE account=?1))
+        ORDER BY resets_unix_ms DESC LIMIT 1")?.query_row(params![account, limit, kind, suffix], |r| {
         let evidence: String = r.get(3)?;
         let first: String = r.get(6)?;
         let used: String = r.get(7)?;
@@ -120,6 +121,26 @@ pub(crate) fn store_scoped(tx: &Connection, full: bool) -> Result<usize> {
 }
 
 pub(crate) fn store_scoped_observed(tx: &Connection, full: bool) -> Result<(usize, Value)> {
+    let plan = prepare_scoped(tx, full)?;
+    store_prepared(tx, plan)
+}
+
+struct Observation {
+    session: String, ordinal: i64, account: Option<String>, limit: Option<String>, kind: &'static str,
+    minutes: Option<i64>, resets: Option<i64>, used: Option<String>, remaining: Option<String>,
+    plan: Option<String>, observed: i64, trust: &'static str, window_id: Option<String>, reached: Option<String>,
+}
+
+/// TEMP selection/checkpoint tables belong to the connection. The caller must
+/// validate the pinned source and projection generations before applying this
+/// plan; a changed frontier requires preparing again in a new read snapshot.
+pub(crate) struct QuotaPlan {
+    full: bool, append: bool, suffix: bool,
+    observations: Vec<Observation>, windows: Vec<Window>, diagnostics: Value,
+    pub(crate) affected_floor: Option<i64>,
+}
+
+pub(crate) fn prepare_scoped(tx: &Connection, full: bool) -> Result<QuotaPlan> {
     tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS accounting_accounts(account TEXT PRIMARY KEY); DELETE FROM accounting_accounts;
         INSERT OR IGNORE INTO accounting_accounts SELECT home_digest FROM rollout_sources WHERE session_id IN (SELECT session_id FROM accounting_selected);
         INSERT OR IGNORE INTO accounting_accounts SELECT account FROM quota_window_observations WHERE session_id IN (SELECT session_id FROM accounting_selected) AND account IS NOT NULL;
@@ -168,8 +189,7 @@ pub(crate) fn store_scoped_observed(tx: &Connection, full: bool) -> Result<(usiz
                 WHERE c.account=accounting_quota_floors.account) WHERE account IN (SELECT account FROM accounting_quota_crossings)", [])? == 0 { break; }
         }
     }
-    if full { tx.execute_batch("DELETE FROM quota_window_observations; DELETE FROM quota_windows;")?; }
-    else if suffix {
+    if suffix {
         tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS accounting_quota_replay(session_id TEXT,ordinal INTEGER,PRIMARY KEY(session_id,ordinal));
             DELETE FROM accounting_quota_replay;")?;
         // Pin only the suffix's native identities before removing projections.
@@ -186,11 +206,7 @@ pub(crate) fn store_scoped_observed(tx: &Connection, full: bool) -> Result<(usiz
                 WHERE l.session_id IN (SELECT session_id FROM accounting_selected)
                 AND NOT EXISTS(SELECT 1 FROM quota_window_observations o
                     WHERE o.session_id=l.session_id AND o.ordinal=l.ordinal AND o.window_kind='primary')", [cutoff])?;
-        tx.execute_batch("DELETE FROM quota_window_observations WHERE (session_id,ordinal) IN (SELECT session_id,ordinal FROM accounting_quota_replay);
-            DELETE FROM quota_windows WHERE account IN (SELECT account FROM accounting_quota_floors)
-            AND first_observed_unix_ms >= (SELECT observed FROM accounting_quota_floors f WHERE f.account=quota_windows.account);")?;
-    } else if !append { tx.execute_batch("DELETE FROM quota_window_observations WHERE session_id IN (SELECT session_id FROM accounting_quota_sessions);
-        DELETE FROM quota_windows WHERE account IN (SELECT account FROM accounting_accounts);")?; }
+    }
     let filter = if append { " WHERE l.session_id IN (SELECT session_id FROM accounting_selected) AND NOT EXISTS(SELECT 1 FROM quota_window_observations o
         WHERE o.session_id=l.session_id AND o.ordinal=l.ordinal AND o.window_kind='primary')".to_owned() }
         else if suffix { " WHERE (l.session_id,l.ordinal) IN (SELECT session_id,ordinal FROM accounting_quota_replay)".to_owned() }
@@ -206,6 +222,7 @@ pub(crate) fn store_scoped_observed(tx: &Connection, full: bool) -> Result<(usiz
             r.get::<_, bool>(10)?.then(|| Ok::<_, rusqlite::Error>((r.get(11)?, r.get(12)?, r.get(13)?))).transpose()?, r.get(14)?)))?
         .collect::<rusqlite::Result<_>>()?;
     let replayed = rows.len();
+    let mut observations = Vec::new();
     let (mut current, mut done) = (BTreeMap::<(String, String, &str), Window>::new(), Vec::new());
     for (session, ordinal, limit, primary, plan, observed, account, homes, secondary, reached) in rows {
         for (kind, fields) in KINDS.into_iter().zip([Some(primary), secondary]) {
@@ -220,7 +237,7 @@ pub(crate) fn store_scoped_observed(tx: &Connection, full: bool) -> Result<(usiz
                     Some(used) if minutes > 0 && minutes.checked_mul(60_000).is_some_and(|w| resets.checked_sub(w).is_some()) => {
                         let key = (account.clone(), limit.clone(), kind);
                         let snapshot = Snapshot { account, limit, kind, minutes, resets, observed, used, plan: &plan };
-                        if (append || suffix) && !current.contains_key(&key) && let Some(window) = current_window(tx, account, limit, kind)? {
+                        if (append || suffix) && !current.contains_key(&key) && let Some(window) = current_window(tx, account, limit, kind, suffix)? {
                             current.insert(key.clone(), window);
                         }
                         match current.get_mut(&key) {
@@ -261,14 +278,40 @@ pub(crate) fn store_scoped_observed(tx: &Connection, full: bool) -> Result<(usiz
                 },
                 _ => ("incomplete", None),
             };
-            tx.prepare_cached("INSERT INTO quota_window_observations(session_id,ordinal,service,account,limit_id,window_kind,unit,window_minutes,resets_unix_ms,used,remaining,
-                plan_type,observed_unix_ms,trust,window_id,rate_limit_reached_type) VALUES(?1,?2,'codex',?3,?4,?5,'percent',?6,?7,?8,?9,?10,?11,?12,?13,?14)")?
-                    .execute(params![session, ordinal, account.as_ref().filter(|_| homes == 1), limit, kind, minutes, resets, used.map(show), used.map(|u| show(HUNDRED - u)),
-                    plan, observed, trust, window_id, reached])?;
+            observations.push(Observation { session: session.clone(), ordinal,
+                account: account.clone().filter(|_| homes == 1), limit: limit.clone(), kind, minutes, resets,
+                used: used.map(show), remaining: used.map(|u| show(HUNDRED - u)), plan: plan.clone(), observed,
+                trust, window_id, reached: reached.clone() });
         }
     }
     done.extend(current.into_values());
-    for w in &done {
+    let selected: std::collections::BTreeSet<String> = tx.prepare("SELECT session_id FROM accounting_selected")?
+        .query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    let old_floor: Option<i64> = tx.query_row("SELECT min(observed_unix_ms) FROM quota_window_observations
+        WHERE session_id IN (SELECT session_id FROM accounting_selected) OR (SELECT quota_rebuild FROM accounting_stream WHERE singleton=1)=1", [], |r| r.get(0))?;
+    let new_floor = observations.iter().filter(|o| selected.contains(&o.session)).map(|o| o.observed).min();
+    let affected_floor = match (old_floor, new_floor) { (Some(a), Some(b)) => Some(a.min(b)), (a, b) => a.or(b) };
+    Ok(QuotaPlan { full, append, suffix, observations, windows: done, affected_floor,
+        diagnostics: json!({"mode": if full { "full" } else if append { "append" } else if suffix { "suffix" } else { "account_replay" },
+            "snapshots_replayed": replayed, "first_new": first_new, "previous_last": last}) })
+}
+
+pub(crate) fn store_prepared(tx: &Connection, plan: QuotaPlan) -> Result<(usize, Value)> {
+    let QuotaPlan { full, append, suffix, observations, windows, diagnostics, .. } = plan;
+    if full { tx.execute_batch("DELETE FROM quota_window_observations; DELETE FROM quota_windows;")?; }
+    else if suffix {
+        tx.execute_batch("DELETE FROM quota_window_observations WHERE (session_id,ordinal) IN (SELECT session_id,ordinal FROM accounting_quota_replay);
+            DELETE FROM quota_windows WHERE account IN (SELECT account FROM accounting_quota_floors)
+            AND first_observed_unix_ms >= (SELECT observed FROM accounting_quota_floors f WHERE f.account=quota_windows.account);")?;
+    } else if !append { tx.execute_batch("DELETE FROM quota_window_observations WHERE session_id IN (SELECT session_id FROM accounting_quota_sessions);
+        DELETE FROM quota_windows WHERE account IN (SELECT account FROM accounting_accounts);")?; }
+    for o in observations {
+        tx.prepare_cached("INSERT INTO quota_window_observations(session_id,ordinal,service,account,limit_id,window_kind,unit,window_minutes,resets_unix_ms,used,remaining,
+            plan_type,observed_unix_ms,trust,window_id,rate_limit_reached_type) VALUES(?1,?2,'codex',?3,?4,?5,'percent',?6,?7,?8,?9,?10,?11,?12,?13,?14)")?
+            .execute(params![o.session, o.ordinal, o.account, o.limit, o.kind, o.minutes, o.resets, o.used, o.remaining,
+                o.plan, o.observed, o.trust, o.window_id, o.reached])?;
+    }
+    for w in &windows {
         tx.prepare_cached("INSERT OR REPLACE INTO quota_windows(window_id,service,account,limit_id,window_kind,unit,window_minutes,window_start_unix_ms,resets_unix_ms,start_evidence,
             first_observed_unix_ms,last_observed_unix_ms,first_used,used,remaining,observed_increase,plan_type,observations,flagged)
             VALUES(?1,'codex',?2,?3,?4,'percent',?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)")?
@@ -277,8 +320,7 @@ pub(crate) fn store_scoped_observed(tx: &Connection, full: bool) -> Result<(usiz
     }
     tx.execute("UPDATE accounting_stream SET quota_rebuild=0", [])?;
     Ok((tx.query_row("SELECT count(*) FROM quota_windows", [], |r| r.get(0))?,
-        json!({"mode": if full { "full" } else if append { "append" } else if suffix { "suffix" } else { "account_replay" },
-            "snapshots_replayed": replayed, "first_new": first_new, "previous_last": last})))
+        diagnostics))
 }
 
 pub(crate) fn synced(db: &Connection) -> Result<bool> {

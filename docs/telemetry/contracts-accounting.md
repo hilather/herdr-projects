@@ -64,9 +64,16 @@ output`, `total = input + output`; then `input_tokens` (inclusive),
   itself stays accepted, so the steward's `usage`/`attempts` sums still
   include it (certificate restriction R3).
 
-Sync, the collector's per-rollout pass and reprice take the sidecar write
-lock up front (immediate transactions), so a ticker pass and a CLI command
-racing on one project wait for each other (busy timeout) instead of failing.
+Sync, per-rollout collection and reprice retain immediate write transactions.
+Sync prepares the ledger and quota state-machine replay in one pinned read
+snapshot, then validates source/projection frontiers before writing atomically.
+Foreground `accounting sync` retries writer admission with 10–50 ms jitter and
+a 30 s cumulative writer-wait budget per request. Acquisition waits hold no
+transaction; changed inputs require a new plan. The ticker tries writer
+admission once, with no busy wait, and defers contended or stale work to its
+next pass. Other SQLite errors still fail. The admission bound does not bound
+source planning, write execution or the existing sidecar-open wait. Collection
+and repricing retain their existing admission policy.
 
 `usage_ledger(singleton, normalization_version, synced_unix_ms)` records the
 last sync.

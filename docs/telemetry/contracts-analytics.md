@@ -293,6 +293,16 @@ stored revisions. Lane values that depend on the wall clock (e.g. censoring
 at a horizon) restate as time passes. As-of answers exist only for cells
 refreshed by then (`no_revision_as_of` otherwise).
 
+Foreground `analytics refresh` retries writer admission with 10–50 ms
+jitter and a 30 s cumulative writer-wait budget across its write transactions.
+It holds no writer transaction while waiting. After admission it rechecks live source
+generations and the canonical file/WAL identity against the prepared snapshot;
+stale cells and presentation bodies remain deferred. The canonical head read
+runs before admission, outside the sidecar writer. Ticker refreshes try writer
+admission once and defer contention to the next pass. Other errors remain
+visible. The bound covers admission waits, not evaluation, writes or the
+existing sidecar-open wait.
+
 ## 5. Pagination and drill-down
 
 `--drill <bucket>` pages the identities behind one native metric: buckets

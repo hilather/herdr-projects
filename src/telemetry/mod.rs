@@ -22,6 +22,7 @@ pub mod quality;
 pub mod review;
 pub mod sanitize;
 pub mod sidecar;
+mod writer;
 
 /// One phase-2 lane's hooks (docs/telemetry/phase2-lanes.md), each defined in
 /// the lane's own module and registered only here: its sidecar stream and

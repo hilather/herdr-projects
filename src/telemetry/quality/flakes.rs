@@ -34,11 +34,6 @@ pub fn collect(project: &Path, create: bool, limit: usize) -> Result<Value> {
             continue;
         }
         let id: String = row.get(0)?;
-        let exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM quality_verification_runs WHERE run_id=?1)",
-            [&id],
-            |r| r.get(0),
-        )?;
         let raw: Option<String> = row.get(7)?;
         let evidence: Value = raw
             .filter(|s| s.len() <= 2 * 1024 * 1024)
@@ -49,7 +44,10 @@ pub fn collect(project: &Path, create: bool, limit: usize) -> Result<Value> {
             .and_then(|s| s.parse::<f64>().ok())
             .filter(|n| n.is_finite() && *n >= 0.0);
         let tests = validated_tests(&evidence["tests"]);
-        tx.execute(
+        // Make the first sidecar operation a write: a deferred read followed
+        // by an INSERT can fail with BUSY_SNAPSHOT when another lane commits.
+        // The insert count also preserves the idempotent observed-run total.
+        observed += tx.execute(
             "INSERT OR IGNORE INTO quality_verification_runs VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 id,
@@ -96,7 +94,6 @@ pub fn collect(project: &Path, create: bool, limit: usize) -> Result<Value> {
                 }
             }
         }
-        if !exists { observed += 1; }
     }
     tx.execute(
         "UPDATE quality_verification_cursor SET source_rowid=max(source_rowid,?1),collected_unix_ms=?2 WHERE singleton=1",

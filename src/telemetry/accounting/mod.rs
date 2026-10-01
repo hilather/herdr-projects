@@ -420,11 +420,31 @@ pub fn tick(project: &Path, budget: super::codex::Budget) -> Result<()> {
 
 /// The same atomic accounting tick, with diagnostic timings for scale measurements.
 pub fn tick_observed(project: &Path, budget: super::codex::Budget) -> Result<Value> {
+    match tick_once(project, budget) {
+        Err(error) if crate::telemetry::writer::busy(&error) => Ok(json!({"deferred": "writer_busy"})),
+        result => result,
+    }
+}
+
+fn tick_once(project: &Path, budget: super::codex::Budget) -> Result<Value> {
     if let Some(mut db) = super::sidecar::open(project, false)? {
+        db.busy_timeout(std::time::Duration::ZERO)?;
         let t = std::time::Instant::now();
         let observed = attention::observe(project, &mut db, budget);
         let attention_ms = t.elapsed().as_secs_f64() * 1e3;
-        let (_, mut diagnostics) = ledger::sync_observed(&mut db)?;
+        let (_, mut diagnostics) = match ledger::sync_observed(&mut db) {
+            Ok(result) => result,
+            Err(error) if crate::telemetry::writer::busy(&error) => {
+                if let Err(error) = observed && !crate::telemetry::writer::busy(&error) { return Err(error); }
+                return Ok(json!({"deferred": "writer_busy", "attention_ms": attention_ms}));
+            }
+            Err(error) => return Err(error),
+        };
+        if diagnostics["deferred"].is_string() {
+            observed?;
+            diagnostics["attention_ms"] = json!(attention_ms);
+            return Ok(diagnostics);
+        }
         let t = std::time::Instant::now();
         cost::tick(&mut db, budget)?;
         diagnostics["attention_ms"] = json!(attention_ms);

@@ -2938,3 +2938,94 @@ fn compact_capture_repairs_current_store_and_tracks_late_rollout_kinds() {
     f.cli_args(&["accounting", "sync"]);
     assert_eq!((f.cli_args(&["accounting", "entries"]).1, f.cli_args(&["accounting", "sessions"]).1, f.cli_args(&["accounting", "quota", "--json"]).1), deleted);
 }
+
+/// Foreground writers survive the old five-second timeout and revalidate the
+/// source snapshot after admission; ticker admission defers without waiting.
+#[test]
+fn racing_sync_and_refresh_wait_then_revalidate_their_inputs() {
+    let f = Fixture::new();
+    f.rollout(&f.home, "writer-wait", &[RECORD], &f.worktree(), f.decided + 1000, "0.154.0");
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    f.cli_args(&["analytics", "refresh"]);
+    let pinned = f.cli_args(&["analytics", "revisions", "--metric", "M08"]).0["revisions"]
+        .as_array().unwrap().last().unwrap()["revision"].as_i64().unwrap().to_string();
+    let old = f.cli_args(&["query", "--metric", "M08", "--as-of-seq", &pinned, "--json"]).0;
+    let db = f.sidecar();
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let spawn = |args: &[&str]| Command::new(BIN).env_clear()
+        .env("HOME", f.tmp.path().join("home")).env("PATH", "/usr/bin:/bin")
+        .env("HERDR_BIN_PATH", "/bin/false")
+        .args(["--root", f.root.to_str().unwrap(), "telemetry", "demo"]).args(args)
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let mut sync = spawn(&["accounting", "sync"]);
+    let mut refresh = spawn(&["analytics", "refresh"]);
+    let started = std::time::Instant::now();
+    let tick = herdr_projects::telemetry::accounting::tick_observed(&f.project,
+        herdr_projects::telemetry::codex::Budget::TICK);
+    assert_eq!(tick.unwrap()["deferred"], "writer_busy", "a busy ticker turn must defer");
+    assert!(started.elapsed() < Duration::from_secs(2), "ticker waited for a writer");
+    std::thread::sleep(Duration::from_secs(6));
+    assert!(sync.try_wait().unwrap().is_none(), "sync gave up at the old timeout");
+    assert!(refresh.try_wait().unwrap().is_none(), "refresh gave up at the old timeout");
+    // A captured native correction advances the durable frontier while both
+    // requests wait. Sync must throw away its pre-lock plan and replay it.
+    db.execute("UPDATE codex_usage SET input_tokens=1500,total_tokens=1800 WHERE session_id=?1", [SID]).unwrap();
+    db.execute_batch("COMMIT").unwrap();
+    for child in [sync, refresh] {
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+    assert!(started.elapsed() < Duration::from_secs(30));
+    assert_eq!(f.report()["metrics"]["M08"]["value"], 1500);
+    f.cli_args(&["analytics", "refresh"]);
+    let current = f.cli_args(&["query", "--metric", "M08", "--json"]).0;
+    assert_eq!(current["results"][0]["value"], 1500);
+    let after = f.cli_args(&["query", "--metric", "M08", "--as-of-seq", &pinned, "--json"]).0;
+    let pinned_body = |mut result: serde_json::Value| {
+        for key in ["current_revision", "restated", "superseded_by"] {
+            result["projection"].as_object_mut().unwrap().remove(key);
+        }
+        result
+    };
+    assert_eq!(pinned_body(after["results"][0].clone()), pinned_body(old["results"][0].clone()));
+    let before = f.cli_args(&["accounting", "entries"]).1;
+    db.execute("DELETE FROM usage_ledger", []).unwrap();
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "entries"]).1, before);
+    f.cli_args(&["analytics", "refresh"]);
+    assert_eq!(f.cli_args(&["analytics", "rebuild", "--verify"]).0["identical"], true);
+}
+
+/// A racing collector must not abandon a pending rollout at the old timeout.
+#[test]
+fn foreground_collect_waits_and_commits_each_record_once() {
+    let f = Fixture::new();
+    f.cli("collect");
+    f.rollout(&f.home, "collect-wait", &[RECORD], &f.worktree(), f.decided + 1000, "0.154.0");
+    let db = f.sidecar();
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let mut child = Command::new(BIN).env_clear().env("HOME", f.tmp.path().join("home"))
+        .env("PATH", "/usr/bin:/bin").env("HERDR_BIN_PATH", "/bin/false")
+        .args(["--root", f.root.to_str().unwrap(), "telemetry", "demo", "collect"])
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    std::thread::sleep(Duration::from_secs(6));
+    assert!(child.try_wait().unwrap().is_none(), "collect abandoned the pending rollout");
+    db.execute_batch("COMMIT").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let collected: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(collected["collected"]["records"], 1);
+    assert_eq!(f.cli("collect").0["collected"]["records"], 0);
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.report()["metrics"]["M08"]["value"], 1000);
+    let (ledger, entries) = f.cli_args(&["accounting", "entries"]);
+    let records = ledger["entries"].as_array().unwrap().iter()
+        .filter(|entry| entry["basis"] == "delta").collect::<Vec<_>>();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["provenance"].as_array().unwrap().iter()
+        .filter(|p| p["disposition"] == "accepted").count(), 1);
+    db.execute("DELETE FROM usage_ledger", []).unwrap();
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "entries"]).1, entries);
+}

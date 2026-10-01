@@ -2524,6 +2524,345 @@ Files: `src/telemetry/accounting/{ledger,mod,quota,tools}.rs`,
 `tests/telemetry_accounting.rs`, `tests/telemetry_scale.rs`, this certificate.
 All `bench-data/` datasets and preserved binaries are removed before commit.
 
+
+#### P7c: writer admission and lock duration
+
+Follow-up on the steward-rebased P7b commit `7dcb70d`, compared with its
+main base `7e15a15`, 2026-10-01. **Pending the steward's serial 1M
+certification.** No fetch/rebase, gate edit, expectation change, capture-trigger
+change or new crate. Benchmark stores, preserved binaries and restored seed
+archives remain under this worktree's disk-backed `bench-data/` and are removed
+before commit.
+
+**Measurement and diagnosis.** A temporary SQLite interposer measured successful
+`BEGIN IMMEDIATE` completion through `COMMIT`/`ROLLBACK`, excluding admission
+waits and killed unfinished transactions, in three unchanged release gate runs
+per variant. The gate itself uses its original small racing fixture, not a
+100k replacement. These are nearest-rank p50 / p95 / max, milliseconds:
+
+| Variant | Accounting writer scopes (n) | Analytics writer scopes (n) |
+| --- | --- | --- |
+| Main base | 37.287 / 233.722 / 423.504 (96) | 7.303 / 10.835 / 27.630 (959) |
+| P7b before | 55.962 / 282.285 / 358.642 (57) | 8.127 / 13.095 / 41.879 (1,019) |
+| P7c before the quality race fix | 78.954 / 315.886 / 619.089 (91) | 1.944 / 3.820 / 56.065 (535) |
+
+Main's committed accounting scopes alone are 38.522 / 233.722 / 423.504
+(n=84); P7b's are 57.559 / 282.285 / 358.642 (n=49). Main/P7b each
+passed all three local gates, so the steward's failure-rate difference was not
+reproduced at these lighter loads. Main loadavg (1 / 5 / 15 minutes), first
+start → final end: 3.25 / 5.78 / 7.67 → 2.97 / 5.44 / 7.49;
+P7b: 2.97 / 5.44 / 7.49 → 2.74 / 5.08 / 7.28;
+P7c: 10.16 / 6.52 / 5.61 → 7.30 / 6.26 / 5.56. Changed race batching,
+checkpoint timing and host load make those accounting distributions unsuitable
+for claiming an accounting speedup.
+
+P7b did add quota suffix fixed-point/crossing selection, replay-identity
+selection, source reads and state-machine evaluation inside the writer.
+Analytics also opened/read the canonical database for every cell while holding
+the sidecar writer. The fix moves those read-only steps into the prepared read
+snapshot. Native JSON serialization, selected/dirty diagnostic counts and the
+quota dispatch affected-floor calculation move there too. Quota deletion,
+projection insertion, graph/cache/dispatch/frontier writes and commit remain
+atomic. Diagnostics retain `quota_prepare_ms` separately from `quota_store_ms`
+and add accounting `write_lock_ms`; the latter excludes preparation/admission.
+The tools and dispatch frontier algorithms remain unchanged.
+
+A serial paired 100k/64 control restores the exact same seed, including paths,
+before phases 8/9 (`SCALE_REPEATS=3`). Writer scopes include each phase's warm
+turn and its three timed turns:
+
+| Scope | P7b p50 / p95 / max (ms) | P7c p50 / p95 / max (ms) |
+| --- | --- | --- |
+| Accounting writer (n=4 each) | 374.505 / 888.917 / 888.917 | 261.524 / 444.277 / 444.277 |
+| Analytics writer (n=106 each) | 9.821 / 19.144 / 33.052 | 1.754 / 15.308 / 26.811 |
+| Accounting wall, timed turns | 407.54 / 457.37 / 457.37 | 298.16 / 300.99 / 300.99 |
+| Analytics wall, timed turns | 1,216.91 / 3,222.75 / 3,222.75 | 981.74 / 2,397.96 / 2,397.96 |
+
+Accounting results-file loadavg: before 12.02 / 6.66 / 5.64 →
+11.46 / 6.64 / 5.64; after 7.11 / 6.24 / 5.56 →
+7.11 / 6.24 / 5.56. Analytics: before 11.46 / 6.64 / 5.64 →
+10.16 / 6.52 / 5.61; after 7.11 / 6.24 / 5.56 →
+6.62 / 6.15 / 5.53. Both report zero violations and unchanged canonical
+bytes. These short samples and unequal shared-host load are provisional.
+
+**Admission and correctness.** Foreground `accounting sync` and
+`analytics refresh` share a cumulative **30 s writer-admission wait budget**
+across their request's transactions, retrying SQLite BUSY/LOCKED with
+10–50 ms process/request-seeded jitter. No writer transaction is held during sleeps.
+The bound covers admission waits, not read preparation, sidecar migration/open,
+execution after admission or unrelated collectors. Ticker admission tries once
+and defers contention or an invalidated accounting plan to its next pass.
+SQLite BUSY/LOCKED from the accounting tick's attention/cost writes or
+sidecar opening also defers; non-contention errors still propagate.
+No new worker/thread or controller wait is introduced.
+
+Accounting validates the pinned source frontier and all durable input
+projection generations after writer admission, re-preparing a foreground plan
+if they changed. The quota state machine, ordered native identities, crossing
+fixed point, prefix checkpoint and fixed-point arithmetic are identical;
+planning reads the retained prefix before deletion using the same suffix floor
+predicate. The dispatch affected floor is the same minimum of old and newly
+planned selected observations. Analytics checks live input generations and
+canonical file/WAL identities after admission; canonical head reading happens
+before admission and a changed file identity defers publication. Existing
+input stamps, revision bodies and pinned selection rules are unchanged.
+
+A new CLI/public-store E2E holds a competing writer for six seconds, starts
+sync and refresh, checks ticker admission defers promptly, then commits a native
+correction while both foreground requests wait. Both survive the old five-second
+timeout; current usage changes, the pinned body is identical, and full ledger
+and analytics rebuilds match. Existing P1 incremental/full proofs and the P5c
+capture schema guard retain their exact expectations.
+
+The first after 1M fairness attempt exposed a separate quality collector
+read-to-write upgrade race (`quality: database is locked` on a light project).
+Its deferred transaction read `EXISTS` before writing; another lane could
+commit and make that snapshot impossible to upgrade. Removing the lookup and
+using `INSERT OR IGNORE`'s inserted-row count eliminates that upgrade, preserves
+idempotent observed totals and reduces statements. The failed run is retained
+as a real contention failure, not classified as a sandbox socket failure.
+A second attempt exposed an incomplete new ticker deferral: its zero-wait
+connection could return BUSY from attention/cost rather than ledger admission.
+Accounting now defers SQLite BUSY/LOCKED across the whole ticker turn;
+this is an admission deferral, and neither changes committed ledger values
+nor suppresses other errors. Both interrupted runs precede the final rerun.
+
+**1M rerun after ticker fixes and 100k regression.** Same restored seed-5100 hot/light
+stores and binaries built with §1's exact release command; one bench process
+at a time, no overlapping builds or test suites. `SCALE_ACTIVE=64`,
+`SCALE_REPEATS=3`, `SCALE_CADENCE_MS=1000`; only freshness/fairness timed at 1M.
+This rerun includes both ticker-contention corrections above.
+
+| 1M freshness phase | P7b before p95 (s) | P7c after ticker fixes p95 (s) | Passes before / after |
+| --- | ---: | ---: | ---: |
+| Steady 100/s | 4.274 | 4.270 | 66 / 75 |
+| Burst 1,000/s | 11.345 | 9.906 | 14 / 17 |
+| Drain 100/s | 11.941 | 10.219 | 7 / 7 |
+
+All completed before/final freshness phases report no violations, no pass
+errors and zero unseen usage after settling. Steady meets 5 s locally;
+burst/drain still do not. The P7b removal of 20–60 s quota replay spikes holds;
+this is not certification that every freshness target is met.
+
+Quota sub-step p50 / p95 / max, milliseconds, on these same 1M runs. Before
+quota storage includes planning; after separates it outside the writer:
+
+| Phase | P7b quota store | P7c quota prepare, outside writer | P7c quota store, under writer | P7c whole accounting writer |
+| --- | --- | --- | --- | --- |
+| Steady | 53.76 / 584.28 / 700.87 | 37.17 / 131.78 / 164.50 | 3.28 / 312.71 / 450.08 | 518.54 / 873.23 / 1,221.01 |
+| Burst | 1,134.91 / 2,239.01 / 2,239.01 | 162.42 / 256.03 / 256.03 | 759.66 / 1,528.10 / 1,528.10 | 1,845.35 / 3,224.91 / 3,224.91 |
+| Drain | 94.70 / 2,372.64 / 2,372.64 | 231.01 / 300.59 / 300.59 | 1,560.14 / 1,958.54 / 1,958.54 | 3,590.61 / 4,623.03 / 4,623.03 |
+
+Different ingress backlog and batch sizes affect these distributions. In
+particular, the drain median is higher despite less planning under the writer;
+actual suffix deletion/insertion and whole selected-session rewrites still
+hold the writer, and this card does not claim constant-time arbitrary replay.
+
+| Light project | P7b p95 rounds 1 / 2 / 3 (s) | P7c after ticker fixes p95 rounds 1 / 2 / 3 (s) |
+| --- | --- | --- |
+| 1 | 1.578 / 3.621 / 2.897 | 2.756 / 2.771 / 1.815 |
+| 2 | 1.728 / 3.769 / 3.134 | 2.898 / 2.339 / 1.852 |
+| 3 | 1.876 / 3.722 / 3.298 | 3.041 / 2.187 / 1.909 |
+
+The first rerun after ticker fixes passes every unchanged 5 s light-project criterion,
+with zero unseen usage and no core/derived pass errors. Hot-core pass p95 is
+3,963.62 / 2,289.76 / 1,615.64 ms; the bounded shared-worker design is retained.
+
+Results-file loadavg (1 / 5 / 15 minutes):
+
+| Run | Start | Steady / burst / drain ends, or fairness round ends | Finish |
+| --- | --- | --- | --- |
+| 1M freshness P7b | 6.61 / 6.12 / 6.54 | 3.30 / 4.99 / 6.07; 3.23 / 4.63 / 5.86; 3.22 / 4.44 / 5.75 | 3.22 / 4.44 / 5.75 |
+| 1M freshness P7c after ticker fixes | 6.52 / 4.38 / 4.48 | 2.47 / 3.51 / 4.14; 2.93 / 3.43 / 4.06; 2.98 / 3.39 / 4.02 | 3.06 / 3.40 / 4.02 |
+| 1M fairness P7b | 3.20 / 4.42 / 5.73 | 3.16 / 4.30 / 5.65; 3.17 / 4.23 / 5.60; 3.03 / 4.13 / 5.53 | 3.03 / 4.13 / 5.53 |
+| 1M fairness P7c after ticker fixes | 3.14 / 3.41 / 4.02 | 6.08 / 4.07 / 4.22; 5.17 / 4.00 / 4.20; 4.03 / 3.82 / 4.13 | 4.03 / 3.82 / 4.13 |
+
+Shared-host load differs; no timing ratio is an authoritative causal speedup.
+The 100k/64 freshness regression has p95 steady/burst/drain
+**3.337 / 9.537 / 18.067 s**, 108 / 14 / 8 passes, no pass errors,
+zero unseen usage and no correctness violations. Loadavg start → steady/burst/
+drain ends → finish: 4.03 / 3.82 / 4.13 →
+4.58 / 4.02 / 4.16; 4.46 / 4.22 / 4.23; 8.61 / 5.22 / 4.56 →
+8.61 / 5.22 / 4.56. The noisy drain is slower than P7b's earlier quieter
+100k sample; this run certifies the answers and the local steady criterion,
+not a drain latency improvement.
+
+The first ten loaded debug gates passed 9/10: run 8 failed in a racing
+`collect` at its existing five-second writer timeout; neither sync nor refresh
+failed. Foreground collection (`create=true`, as the CLI invokes it) now uses
+SQLite's **30 s busy timeout per admission**. Its transactional source-cursor
+reads and parser are unchanged; ticker collection keeps its original policy.
+This collector bound is per transaction, distinct from sync/refresh's
+cumulative jittered admission budget. A second CLI E2E holds a writer six
+seconds, collects a real pending fixture rollout, verifies one accepted usage
+record, verifies the next collect observes zero new records, and matches a
+full rebuilt ledger byte for byte. It does not retry whole collection calls
+or lose the counts of already committed batches.
+
+**Final production-binary rechecks after the collector wait adjustment.**
+The repeated 1M freshness run remains correct, with no pass errors, no
+violations and zero unseen usage. It is slower during the shared-host load
+spike; these completed results are retained alongside the earlier sample:
+
+| Phase | P7b before p95 (s) | Final binary p95 (s) | Passes before / after |
+| --- | ---: | ---: | ---: |
+| Steady | 4.274 | 14.767 | 66 / 50 |
+| Burst | 11.345 | 17.594 | 14 / 10 |
+| Drain | 11.941 | 8.754 | 7 / 8 |
+
+Final-binary loadavg start → steady/burst/drain ends → finish:
+5.50 / 3.35 / 4.68 → 7.64 / 4.77 / 5.02;
+5.96 / 4.95 / 5.06; 3.80 / 4.51 / 4.91 → 3.80 / 4.51 / 4.91.
+All 68 accounting passes remain incremental, with null invalidation reasons
+and `quota_rebuild=false`. Steady's slowest whole pass is 11,061.61 ms:
+collection 2,385.76 ms, accounting 1,657.68 ms, analytics 6,918.92 ms;
+its accounting writer is 1,484.32 ms and replays two append snapshots.
+Accounting's steady maximum is 4,827.70 ms; burst collection's maximum is
+5,665.46 ms. The old 20–60 s quota-account replay mechanism does not recur,
+but the 5 s steady target is not consistently met on this shared host.
+
+Final-binary fairness has no core/derived writer errors and zero unseen usage,
+but one light project misses the unchanged criterion in each of two completed
+samples. These are genuine performance failures, not socket-only failures:
+
+| Sample | Worst light-project p95 per round (s) | Criterion |
+| --- | --- | --- |
+| First final-binary recheck | 1.925 / 5.181 / 3.551 | fails round 2 |
+| Further paired sample | 5.250 / 4.628 / 1.816 | fails round 1 |
+
+First sample loadavg start → round ends → finish:
+3.58 / 4.45 / 4.89 → 3.82 / 4.42 / 4.86;
+4.61 / 4.57 / 4.91; 4.04 / 4.45 / 4.86 → 4.04 / 4.45 / 4.86.
+Further sample: 3.80 / 2.79 / 3.75 → 5.15 / 3.24 / 3.86;
+5.56 / 3.46 / 3.93; 4.41 / 3.34 / 3.87 → 4.41 / 3.34 / 3.87.
+In the first miss the hot-core p95 is 4,200.25 ms; light turns themselves have
+p95 319–507 ms and still wait behind that hot turn. In the further miss hot-core
+p95 is 4,910.79 ms. No pass was deferred. This leaves a scheduling/whole-pass
+limitation under variable load; the prior split-worker gain is reproducible
+in the earlier passing run, but these final checks do not certify L7 as met.
+No criterion was relaxed, and the steward's serial certification remains
+necessary. No timing ratio is asserted to be a causal regression or speedup.
+
+**Final loaded-gate proof.** After the foreground collector adjustment,
+`scale_gates_hold_under_load` passes **10/10**, with no edits to its body.
+Each invocation uses `cargo test --locked --offline -j 3 --features state-store
+--test telemetry_scale -- --exact scale_gates_hold_under_load --test-threads=1`,
+`TMPDIR=$PWD/target/tmp`. A concurrent serial loop runs `--no-fail-fast
+--test telemetry_workspace --test telemetry_operations` (five iterations),
+with one test thread and at most one extra fixture workflow. Operations passes
+all 14 tests every iteration; workspace passes nine, with only its
+sandbox-denied Unix bind test failing. No concurrent benchmark or build runs.
+
+Gate loadavg (1 / 5 / 15 minutes), start → end:
+
+| Gate | Result | Start | End |
+| --- | --- | --- | --- |
+| 1 | pass | 4.41 / 3.34 / 3.87 | 3.79 / 3.28 / 3.83 |
+| 2 | pass | 3.79 / 3.28 / 3.83 | 4.72 / 3.57 / 3.91 |
+| 3 | pass | 4.72 / 3.57 / 3.91 | 5.19 / 3.80 / 3.97 |
+| 4 | pass | 5.19 / 3.80 / 3.97 | 4.93 / 3.88 / 4.00 |
+| 5 | pass | 4.93 / 3.88 / 4.00 | 4.87 / 3.98 / 4.03 |
+| 6 | pass | 4.87 / 3.98 / 4.03 | 4.90 / 4.08 / 4.06 |
+| 7 | pass | 4.90 / 4.08 / 4.06 | 8.37 / 5.17 / 4.44 |
+| 8 | pass | 8.37 / 5.17 / 4.44 | 8.36 / 5.53 / 4.58 |
+| 9 | pass | 8.36 / 5.53 / 4.58 | 8.73 / 6.05 / 4.81 |
+| 10 | pass | 8.73 / 6.05 / 4.81 | 8.95 / 6.40 / 4.97 |
+
+**Final correctness and lint checks.** Run `cargo test --locked --offline
+-j 3 --features state-store --no-fail-fast` with all 21 `tests/telemetry*.rs`
+targets plus `--test cli --test canonical_worker`, `TMPDIR=$PWD/target/tmp`
+and `RUST_TEST_THREADS=1`; leave paid/live tests ignored and unset
+`HP_CODEX_SANDBOX_BIN` so worker fixtures use their deterministic stand-in.
+The final run passes **291 tests**, with **18 ignored** and **53 failures solely
+from sandbox-denied socket binds/startup**. All ordinary scale tests pass,
+including the unchanged gate; all existing telemetry expectations remain
+unchanged. Accounting passes 32 tests, including both new contention E2Es,
+P1's incremental/full proofs and P5c's capture guard; its only failure is the
+expected attention socket bind. No other correctness failure remains.
+The preceding full run (before the collector-only policy) passed 290 tests,
+with the same 53 socket denials and 18 ignored.
+
+Final clippy command: `cargo clippy --locked --offline -j 3 --features
+state-store --bin herdr-projects --test telemetry_accounting --test
+telemetry_scale --message-format=json`. It completes successfully; checking
+primary/secondary spans and child notes against changed lines finds **zero
+warning locations in the diff**. There are 157 existing unrelated warning
+diagnostics across these targets. `git diff --check` is clean.
+
+
+
+
+Socket-only failure inventory (the same hard-sandbox bind prohibition also
+denies the OTLP TCP loopback fixtures). Each listed failure has direct
+`Operation not permitted` evidence, either at the bind or in the fixture
+server's traceback before its startup deadline expires. No socket workaround,
+real agent CLI, live service or owner data directory was used:
+
+```text
+canonical_worker::a_hidden_path_covering_the_execution_home_refuses_the_launch_before_creation
+canonical_worker::a_launch_reaches_running_while_another_holder_takes_the_shared_root_intermittently
+canonical_worker::a_legacy_thread_holding_the_planned_worktree_blocks_its_creation
+canonical_worker::a_proven_worker_end_keeps_the_project_admitted_but_an_unexplained_pane_loss_pauses_it
+canonical_worker::a_sandboxed_reviewer_uses_its_worker_channel_through_the_spool
+canonical_worker::a_subdirectory_binding_runs_in_the_same_subdirectory_of_the_new_worktree
+canonical_worker::a_worker_branch_reaching_a_corrupt_quarantined_object_is_refused
+canonical_worker::an_isolated_codex_worker_commits_through_codex_workspace_write_sandbox
+canonical_worker::an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_commits_and_submits
+canonical_worker::an_isolated_worker_submits_only_through_its_own_spool
+canonical_worker::an_untracked_working_directory_is_refused_before_the_approval_is_used
+canonical_worker::canonical_attempt_sidebar_clears_after_termination_in_an_active_project
+canonical_worker::canonical_attempt_sidebar_does_not_publish_to_a_replaced_terminal
+canonical_worker::canonical_attempt_sidebar_refreshes_and_clears_on_pause_and_termination
+canonical_worker::canonical_attempt_sidebar_restart_offers_no_historical_cleanup_or_native_request
+canonical_worker::canonical_attempt_sidebar_uses_collected_usage_and_observed_waiting
+canonical_worker::review_assignment_launches_with_blind_brief_and_records_session
+canonical_worker::ticker_does_not_dispatch_a_launch_cancelled_before_creation
+canonical_worker::ticker_launches_and_briefs_once_then_stops_a_cancelled_worker_while_paused_and_revoked
+canonical_worker::ticker_launches_nothing_on_a_server_without_the_launch_contract_or_while_paused
+canonical_worker::ticker_recovers_a_lost_creation_reply_without_creating_again
+canonical_worker::ticker_retires_a_cancelled_gated_worker_without_starting_it
+cli::canonical_ownership_cli_adopts_recorded_coordinator_without_prompting
+cli::controller_captures_uncommitted_worker_edits_for_submission_and_verification
+cli::hot_paths_skip_the_whole_store_check_and_the_ticker_checks_off_its_pass_then_pauses_admission_and_effects_on_corruption
+cli::integration_releases_project_ownership_during_the_candidate_check
+cli::launch_reserve_records_operator_reason
+cli::native_ticker_claims_legacy_routine_and_restart_delivers_without_rerun
+cli::operator_verify_releases_project_ownership_during_the_check
+cli::outcome_success_path
+cli::rejected_reservation_writes_no_decision
+cli::ticker_auto_chain_releases_verified_integrated_and_fan_in_dependents
+cli::ticker_auto_integrates_two_results_serially_and_recovers_stale_and_crash
+cli::ticker_auto_verification_releases_project_ownership_during_the_check
+cli::ticker_auto_verifies_once_and_recovers_after_kill
+cli::ticker_canonical_notification_confirms_or_retains_ambiguity_after_owner_death
+cli::ticker_canonical_observations_commit_cancel_and_restart_in_the_shared_pool
+cli::ticker_coordinator_prime_confirms_or_recovers_once_across_restart
+cli::ticker_coordinator_start_then_prime_recover_without_replaying_start
+cli::ticker_local_and_remote_launches_acknowledge_once_and_recover_lost_replies
+cli::ticker_native_briefs_confirm_or_recover_uncertainty_without_replay
+cli::ticker_native_copy_publishes_announces_and_does_not_recopy_after_restart
+cli::ticker_native_merged_finalization_resolves_and_replays_notice_after_restart
+cli::ticker_notifications_recover_across_restart_and_reconcile_through_cli
+cli::ticker_remote_briefs_confirm_or_recover_uncertainty_without_replay
+cli::ticker_tokens_use_supervised_local_remote_and_coordinator_refreshes_after_restart
+telemetry::attempts_show_attention_summary
+telemetry_accounting::attention_intervals_union_and_censor
+telemetry_health::recommendations_and_notices_change_no_canonical_state_and_no_dispatch
+telemetry_otlp::http_auth_limits_malformed_and_replay
+telemetry_otlp::http_protobuf_attempt_token_binding_auth_and_project_token_unchanged
+telemetry_otlp::http_request_rate_is_bounded
+telemetry_workspace::thread_start_records_the_dispatch_reason_and_the_sidebar_suffix
+```
+
+Files: `src/telemetry/writer.rs`, `src/telemetry/mod.rs`,
+`src/telemetry/accounting/{ledger,mod,quota}.rs`,
+`src/telemetry/analytics/{inputs,store}.rs`, `src/telemetry/quality/flakes.rs`,
+`src/telemetry/codex.rs`, `tests/telemetry_accounting.rs`, this certificate,
+and the accounting/analytics contracts. No new source process spawn, crate,
+unit/source-text assertion or existing test expectation change. Benchmark
+stores, archives, temporary interposer and preserved binaries are removed
+before commit; verification logs remain under ignored `target/`.
+
 ### 4.21 P8: maintained M02 comparison and live health (100k follow-up)
 
 Branch `perf/compare-1m`, base `628b59f`. **Pending the steward's serial
@@ -2789,6 +3128,12 @@ owner. None is hidden by loosening the target.
   quota replay inside incremental ledger turns; complete-window suffix replay
   removes it without weakening capture. The after host is quieter; burst/drain,
   growing active-window suffixes and full rebuild costs remain limitations.
+  **P7c: 1M steady/burst/drain 4.274/11.345/11.941 →
+  4.270/9.906/10.219 s in the first rerun; the final-binary recheck is
+  14.767/17.594/8.754 s under rising load. Writer admission now retries for up to 30 s
+  cumulatively in foreground requests, while quota read planning runs outside
+  the writer (§4.20). Pending the steward's serial certification; the 100k
+  regression is 3.337/9.537/18.067 s under rising load.**
   Owner: accounting lane.
 - **L3: lane and central metrics are not indexed aggregates.** Native cohort
   queries, as-of reads of stored revisions and paged exports meet 500 ms at
@@ -2936,7 +3281,11 @@ owner. None is hidden by loosening the target.
   passes every round with two bounded shared workers; accounting-only scheduling
   still fails behind 6.5 s analytics / 17.8 s health work. Derived-lane refresh
   delays and unproduced/live-signal gaps remain; no general freshness target is
-  relaxed or closed.
+  relaxed or closed. **P7c: first-rerun 1M worst light-project p95 per round
+  1.876/3.769/3.298 → 3.041/2.771/1.909 s; all three rounds
+  met the unchanged 5 s criterion in the first rerun. Final-binary samples
+  miss at 5.181 and 5.250 s, without writer errors (§4.20); L7 remains open
+  pending the steward's serial certification.**
 - **L8: simulated capacity is not live capacity.** See the opening. Planted
   attempts and generated rollouts certify the telemetry path's behaviour at
   these volumes on this host, nothing about live workers or providers.

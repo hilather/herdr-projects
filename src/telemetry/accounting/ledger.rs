@@ -2,7 +2,7 @@
 //! normalized from the Codex sidecar tables, read by SQL only, with one
 //! disposition per entry and rollout that observed it.
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
@@ -140,9 +140,16 @@ fn prepare_sync(db: &Connection) -> Result<SyncPlan> {
         tx.execute_batch("INSERT OR IGNORE INTO accounting_selected SELECT session_id FROM session_graph_nodes WHERE claimed_parent_session_id IN (SELECT session_id FROM accounting_dirty_sessions);")?;
     }
     let entries = derive_scoped(&tx, true)?;
+    let quota_timer = std::time::Instant::now();
+    let quota = super::quota::prepare_scoped(&tx, full)?;
+    let quota_prepare_ms = quota_timer.elapsed().as_secs_f64() * 1e3;
+    let dirty = tx.query_row("SELECT count(*) FROM accounting_dirty_sessions", [], |r| r.get(0))?;
+    let selected = tx.query_row("SELECT count(*) FROM accounting_selected", [], |r| r.get(0))?;
+    let native = entries.iter().map(|e| Value::Object(NATIVE.iter().zip(e.native)
+        .map(|(k, v)| ((*k).to_owned(), json!(v))).collect()).to_string()).collect();
     let generations = crate::telemetry::analytics::inputs::generations(&tx)?;
     tx.commit()?;
-    Ok(SyncPlan { entries, sequence, reason, full, frontier, generations })
+    Ok(SyncPlan { entries, sequence, reason, full, frontier, generations, quota, quota_prepare_ms, dirty, selected, native })
 }
 
 type SyncFrontier = (i64, i64, Option<String>, i64, i64);
@@ -153,6 +160,11 @@ fn sync_frontier(db: &Connection) -> Result<SyncFrontier> {
 
 struct SyncPlan {
     entries: Vec<Entry>,
+    native: Vec<String>,
+    quota: super::quota::QuotaPlan,
+    quota_prepare_ms: f64,
+    dirty: i64,
+    selected: i64,
     sequence: i64,
     reason: Option<String>,
     full: bool,
@@ -165,10 +177,14 @@ struct SyncPlan {
 /// together. Invalidated bases replay the complete history. Counts describe the
 /// whole projection, as before incremental sync.
 pub fn sync(db: &mut Connection) -> Result<Value> {
-    Ok(sync_observed(db)?.0)
+    Ok(sync_with_wait(db, &mut crate::telemetry::writer::WriterWait::foreground())?.0)
 }
 
 pub(crate) fn sync_observed(db: &mut Connection) -> Result<(Value, Value)> {
+    sync_with_wait(db, &mut crate::telemetry::writer::WriterWait::ticker())
+}
+
+fn sync_with_wait(db: &mut Connection, wait: &mut crate::telemetry::writer::WriterWait) -> Result<(Value, Value)> {
     let mut steps = serde_json::Map::new();
     let mut timer = std::time::Instant::now();
     let project = db.path().map(std::path::Path::new).and_then(std::path::Path::parent)
@@ -178,33 +194,35 @@ pub(crate) fn sync_observed(db: &mut Connection) -> Result<(Value, Value)> {
     // source frontier and projection generations: a collector, correction or
     // racing sync invalidates the plan, and the next read snapshot recomputes it.
     // All ledger, graph, quota, aggregate and watermark writes remain atomic.
-    let (tx, plan) = loop {
+    let (tx, plan, locked) = loop {
         let plan = prepare_sync(db).context("prepare accounting replay")?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).context("acquire accounting writer")?;
+        let tx = wait.acquire(db).context("acquire accounting writer")?;
+        let locked = std::time::Instant::now();
         if sync_frontier(&tx)? == plan.frontier
             && crate::telemetry::analytics::inputs::generations(&tx)? == plan.generations {
-            break (tx, plan);
+            break (tx, plan, locked);
         }
         tx.rollback()?;
+        if !wait.retry_plan() {
+            return Ok((Value::Null, json!({"deferred": "inputs_changed"})));
+        }
     };
     steps.insert("prepare_and_validate_ms".into(), json!(timer.elapsed().as_secs_f64() * 1e3));
-    let dirty: i64 = tx.query_row("SELECT count(*) FROM accounting_dirty_sessions", [], |r| r.get(0))?;
-    let selected: i64 = tx.query_row("SELECT count(*) FROM accounting_selected", [], |r| r.get(0))?;
-    let quota_rebuild: bool = tx.query_row("SELECT quota_rebuild FROM accounting_stream", [], |r| r.get(0))?;
-    let SyncPlan { entries, sequence, reason, full, .. } = plan;
+    let quota_rebuild = plan.frontier.3 != 0;
+    let SyncPlan { entries, native, quota, quota_prepare_ms, dirty, selected, sequence, reason, full, .. } = plan;
+    steps.insert("quota_prepare_ms".into(), json!(quota_prepare_ms));
     let mode = if full { "full_rebuild" } else { "incremental" };
     timer = std::time::Instant::now();
     if full { tx.execute_batch("DELETE FROM usage_dispositions; DELETE FROM usage_entries;")?; }
     else { tx.execute_batch("DELETE FROM usage_dispositions WHERE entry_id IN (SELECT entry_id FROM usage_entries WHERE session_id IN (SELECT session_id FROM accounting_selected));
         DELETE FROM usage_entries WHERE session_id IN (SELECT session_id FROM accounting_selected);")?; }
     let mut counts = BTreeMap::<&str, usize>::new();
-    for e in &entries {
+    for (e, native) in entries.iter().zip(&native) {
         let n = e.normalized.map(|n| n.map(Some)).unwrap_or([None; 7]);
-        let native = Value::Object(NATIVE.iter().zip(e.native).map(|(k, v)| ((*k).to_owned(), json!(v))).collect());
         tx.prepare_cached("INSERT INTO usage_entries(entry_id,source,session_id,basis,scope,normalization_version,precedence,position,response_id,model,native,
             input_tokens,cache_read_tokens,new_input_tokens,cache_write_tokens,output_tokens,reasoning_tokens,total_tokens)
             VALUES(?1,?18,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)")?
-                .execute(params![e.id, e.session, e.basis, e.scope, if e.session.starts_with("otlp:") { "otlp-inclusive-v1" } else if e.session.starts_with("muse:") { "muse-v1" } else if e.session.starts_with("opencode:") { "opencode-v1" } else if e.session.starts_with("claude-code:") { "claude-code-v1" } else { NORMALIZATION }, e.precedence, e.position, e.response_id, e.model, native.to_string(),
+                .execute(params![e.id, e.session, e.basis, e.scope, if e.session.starts_with("otlp:") { "otlp-inclusive-v1" } else if e.session.starts_with("muse:") { "muse-v1" } else if e.session.starts_with("opencode:") { "opencode-v1" } else if e.session.starts_with("claude-code:") { "claude-code-v1" } else { NORMALIZATION }, e.precedence, e.position, e.response_id, e.model, native,
                 n[0], n[1], n[2], n[3], n[4], n[5], n[6], source(&e.session)])?;
         for (path, disposition, reason) in &e.provenance {
             tx.prepare_cached("INSERT INTO usage_dispositions(entry_id,path_digest,disposition,reason) VALUES(?1,?2,?3,?4)")?
@@ -217,14 +235,10 @@ pub(crate) fn sync_observed(db: &mut Connection) -> Result<(Value, Value)> {
     let (sessions, segments) = super::graph::store_scoped(&tx, &entries, full)?;
     steps.insert("graph_ms".into(), json!(timer.elapsed().as_secs_f64() * 1e3));
     timer = std::time::Instant::now();
-    let quota_floor: Option<i64> = tx.query_row("SELECT min(observed_unix_ms) FROM quota_window_observations
-        WHERE session_id IN (SELECT session_id FROM accounting_selected) OR (SELECT quota_rebuild FROM accounting_stream WHERE singleton=1)=1", [], |r| r.get(0))?;
-    let (windows, quota) = super::quota::store_scoped_observed(&tx, full)?;
+    let quota_floor = quota.affected_floor;
+    let (windows, quota) = super::quota::store_prepared(&tx, quota)?;
     steps.insert("quota_store_ms".into(), json!(timer.elapsed().as_secs_f64() * 1e3));
     timer = std::time::Instant::now();
-    let new_floor: Option<i64> = tx.query_row("SELECT min(observed_unix_ms) FROM quota_window_observations
-        WHERE session_id IN (SELECT session_id FROM accounting_selected)", [], |r| r.get(0))?;
-    let quota_floor = match (quota_floor, new_floor) { (Some(a), Some(b)) => Some(a.min(b)), (a, b) => a.or(b) };
     if full { tx.execute_batch("DELETE FROM accounting_usage_totals; DELETE FROM accounting_cache_totals; DELETE FROM accounting_native_totals; DELETE FROM accounting_source_summary;")?; }
     else { tx.execute_batch("DELETE FROM accounting_usage_totals WHERE session_id IN (SELECT session_id FROM accounting_selected);
         DELETE FROM accounting_cache_totals WHERE session_id IN (SELECT session_id FROM accounting_selected);
@@ -289,6 +303,7 @@ pub(crate) fn sync_observed(db: &mut Connection) -> Result<(Value, Value)> {
         counts.insert(key, count);
     }
     tx.commit()?;
+    steps.insert("write_lock_ms".into(), json!(locked.elapsed().as_secs_f64() * 1e3));
     steps.insert("frontier_counts_commit_ms".into(), json!(timer.elapsed().as_secs_f64() * 1e3));
     Ok((json!({"entries": entry_count, "dispositions": counts, "sessions": sessions, "model_segments": segments, "quota_windows": windows}),
         json!({"last_mode": mode, "last_reason": reason, "dirty_sessions": dirty, "selected_sessions": selected, "quota_rebuild": quota_rebuild, "quota": quota, "steps_ms": steps})))

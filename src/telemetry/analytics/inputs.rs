@@ -55,15 +55,26 @@ pub(crate) fn canonical_current(project: &Path) -> Result<Value> {
 }
 
 fn canonical_with(project: &Path, fresh: bool) -> Result<Value> {
-    use std::os::unix::fs::MetadataExt;
-    let files: Vec<Value> = ["state.db", "state.db-wal"].iter().map(|name| {
-        std::fs::metadata(project.join(".state").join(name)).ok().filter(|m| *name != "state.db-wal" || m.len() > 0).map(|m|
-            json!([m.dev(),m.ino(),m.len(),m.mtime(),m.mtime_nsec(),m.ctime(),m.ctime_nsec()])).unwrap_or(Value::Null)
-    }).collect();
+    let files = canonical_files(project);
     let path = project.join(".state/state.db");
     let db = if fresh { crate::telemetry::read_only_fresh(&path)? } else { crate::telemetry::read_only(&path)? };
     let head: i64 = db.query_row("SELECT coalesce(max(sequence),0) FROM events", [], |r| r.get(0))?;
     Ok(json!({"files": files, "head": head}))
+}
+
+/// Validate a canonical read prepared before writer admission without opening
+/// another database while holding the sidecar writer. File/WAL identity is
+/// already part of every canonical stamp; a changed identity defers the plan.
+pub(crate) fn canonical_unchanged(project: &Path, prepared: &Value) -> bool {
+    prepared["files"] == json!(canonical_files(project))
+}
+
+fn canonical_files(project: &Path) -> Vec<Value> {
+    use std::os::unix::fs::MetadataExt;
+    ["state.db", "state.db-wal"].iter().map(|name| {
+        std::fs::metadata(project.join(".state").join(name)).ok().filter(|m| *name != "state.db-wal" || m.len() > 0).map(|m|
+            json!([m.dev(),m.ino(),m.len(),m.mtime(),m.mtime_nsec(),m.ctime(),m.ctime_nsec()])).unwrap_or(Value::Null)
+    }).collect()
 }
 
 pub(crate) fn group(provider: Provider, id: &str) -> &'static str {
