@@ -24,7 +24,7 @@ fn claude() -> Fixture {
     f
 }
 fn transcript(f: &Fixture, sid: &str, cwd: &str, version: &str, time: i64) -> PathBuf {
-    let dir = f.home.join(".claude/projects").join(cwd.replace('/', "-"));
+    let dir = f.home.join(".claude/projects").join(cwd.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect::<String>());
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("{sid}.jsonl"));
     let text = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/telemetry/claude-code/session.jsonl")).unwrap();
@@ -86,7 +86,7 @@ fn native_claude_usage_tools_sidechains_and_privacy() {
     assert_eq!(attempt_usage(&f)["total_tokens"], 407);
     let capabilities = f.cli_args(&["collectors", "capabilities", "--json"]).0;
     let adapter = capabilities["adapters"].as_array().unwrap().iter().find(|a| a["adapter"] == "claude-code").unwrap();
-    assert_eq!(adapter["fixture_versions"], json!(["2.1.3"]));
+    assert_eq!(adapter["fixture_versions"], json!(["2.1.3", "2.1.286"]));
     assert!(adapter["fields"].as_array().unwrap().iter().all(|f| f["certified"] != "live"));
     no_secrets(&f);
 }
@@ -302,4 +302,59 @@ fn claude_aggregate_reads_match_replay_and_verified_rebuild() {
     assert_eq!((f.report()["metrics"]["M12"].clone(), f.report()["metrics"]["M14"].clone()), cost_metrics);
     f.cli_args(&["analytics", "refresh"]);
     assert_eq!(f.cli_args(&["analytics", "rebuild", "--verify"]).0["identical"], true);
+}
+
+#[test]
+fn claude_2_1_286_two_turns_in_lossy_project_directory() {
+    let f = claude();
+    let cwd = f.worktree();
+    assert!(cwd.contains("/.state/"));
+    let slug: String = cwd.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    assert!(slug.contains("--state-"));
+    let dir = f.home.join(".claude/projects").join(slug);
+    fs::create_dir_all(&dir).unwrap();
+    let text = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/telemetry/claude-2.1.286/live-two-turn.jsonl")).unwrap();
+    let lines: Vec<String> = text.lines().map(|line| {
+        let mut v: Value = serde_json::from_str(line).unwrap();
+        // Free-text sentinels exercise every sanitized subtree in the real skeleton.
+        v = serde_json::from_str(&v.to_string().replace("<str>", "CLAUDE_SECRET_LIVE")).unwrap();
+        if v.get("cwd").is_some() { v["cwd"] = json!(cwd); }
+        if v.get("version").is_some() { v["version"] = json!("2.1.286"); }
+        if v.get("timestamp").is_some() {
+            v["timestamp"] = json!(jiff::Timestamp::from_millisecond(f.decided + 1000).unwrap().to_string());
+        }
+        v.to_string()
+    }).collect();
+    fs::write(dir.join("ID000.jsonl"), format!("{}\n", lines.join("\n"))).unwrap();
+    assert_eq!(f.cli("collect").0["collected"]["records"], 2);
+    assert_eq!(f.binding(), ("bound".into(), Some(f.attempt.clone())));
+    f.cli_args(&["accounting", "sync"]);
+    let ledger = f.cli_args(&["accounting", "entries"]).0;
+    let entries = ledger["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    for (output, write, read) in [(87, 6928, 0), (41, 151, 6928)] {
+        let e = entries.iter().find(|e| e["normalized"]["output_tokens"] == output).unwrap();
+        assert_eq!(e["model"], "claude-haiku-4-5-20251001");
+        assert_eq!(e["normalized"]["new_input_tokens"], 10);
+        assert_eq!(e["normalized"]["cache_write_tokens"], write);
+        assert_eq!(e["normalized"]["cache_read_tokens"], read);
+    }
+    let db = f.sidecar();
+    for kind in ["queue-operation", "attachment", "atis-latch", "last-prompt", "cost-state", "mode"] {
+        assert!(db.query_row("SELECT count(*) FROM source_observations WHERE json_extract(payload,'$.line_type')=?1 AND json_extract(payload,'$.unmapped_count')>0", [kind], |r| r.get::<_, i64>(0)).unwrap() > 0);
+    }
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "entries"]).0["entries"].as_array().unwrap().len(), 2);
+    // A distinct cwd with the same lossy slug must not inherit the binding.
+    let collision = cwd.replace("/.state/", "/_state/");
+    let collision_slug: String = collision.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    assert_eq!(dir.file_name().unwrap().to_str().unwrap(), collision_slug);
+    fs::write(dir.join("collision.jsonl"), format!("{}\n", json!({"type":"user", "sessionId":"collision", "cwd":collision,
+        "version":"2.1.286", "timestamp":jiff::Timestamp::from_millisecond(f.decided + 1000).unwrap().to_string(),
+        "message":{"content":"CLAUDE_SECRET_COLLISION"}}))).unwrap();
+    f.cli("collect");
+    assert_eq!(f.sidecar().query_row("SELECT binding FROM rollout_sources WHERE session_id='claude-code:collision'", [], |r| r.get::<_, String>(0)).unwrap(), "unbound");
+    assert_eq!(attempt_usage(&f)["records"], 2);
+    no_secrets(&f);
 }

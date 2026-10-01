@@ -187,8 +187,14 @@ fn own_stdout(bytes: &[u8]) -> Vec<Value> {
             let source = v.get("usage").or_else(|| v.pointer("/payload/thread_token_usage")).unwrap_or(&Value::Null);
             let usage = counters(source);
             let unknown: Vec<_> = source.as_object().into_iter().flat_map(|o| o.keys()).filter(|k| !COUNTERS.contains(&k.as_str()) && !["cache_read_input_tokens", "cache_creation_input_tokens"].contains(&k.as_str())).cloned().collect();
+            let model = v.get("model").and_then(Value::as_str).or_else(|| {
+                // A multi-model result has no single authoritative model.
+                v.get("modelUsage").and_then(Value::as_object)
+                    .filter(|models| models.len() == 1)
+                    .and_then(|models| models.keys().next().map(String::as_str))
+            }).filter(|s| s.len() <= 128 && s.chars().all(|c| c.is_ascii_alphanumeric() || "-._/:".contains(c)) && !s.contains(MARKER));
             (!usage.as_object().unwrap().is_empty())
-                .then(|| json!({"counters":usage,"unmapped_keys":unknown,"model":v.get("model").and_then(Value::as_str).filter(|s| s.len() <= 128 && s.chars().all(|c| c.is_ascii_alphanumeric() || "-._/:".contains(c)) && !s.contains(MARKER))}))
+                .then(|| json!({"counters":usage,"unmapped_keys":unknown,"model":model}))
         })
         .collect()
 }

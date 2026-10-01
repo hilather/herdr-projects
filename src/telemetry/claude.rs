@@ -2,7 +2,7 @@
 //! from canonical Claude attempts; no default owner home is ever discovered.
 use super::*;
 
-pub const FIXTURE_VERSIONS: &[&str] = &["2.1.3"];
+pub const FIXTURE_VERSIONS: &[&str] = &["2.1.3", "2.1.286"];
 
 pub(super) fn walk(root: &Path, out: &mut Vec<PathBuf>) {
     if !root.parent().is_some_and(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()))
@@ -39,7 +39,7 @@ pub fn capabilities() -> Value {
 
 pub fn allowlist() -> Vec<(String, sanitize::Class)> {
     use sanitize::Class::*;
-    [("session_id", Id), ("timestamp", Text), ("version", Text), ("line_type", Tag), ("model", Text), ("message_id", Id),
+    [("session_id", Id), ("timestamp", Text), ("version", Text), ("line_type", Tag), ("model", Id), ("message_id", Id),
         ("isSidechain", Bool), ("input_tokens", Number), ("output_tokens", Number), ("cache_creation_input_tokens", Number),
         ("cache_read_input_tokens", Number), ("tool_use_ids", IdList), ("tool_names", IdList), ("tool_result_ids", IdList),
         ("tool_result_errors", Number), ("unmapped_count", Number), ("unmapped_keys", IdList)].into_iter().map(|(k, c)| (k.to_owned(), c)).collect()
@@ -56,7 +56,7 @@ fn unmapped(raw: &Value, prefix: &str, known: &[&str], out: &mut Vec<String>, co
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn record_line(tx: &Transaction, ledger: &ingest::Ledger, at: u64, line: &[u8], file: &Path, key: &str, home: &str,
+pub(super) fn record_line(tx: &Transaction, ledger: &ingest::Ledger, at: u64, line: &[u8], _file: &Path, key: &str, home: &str,
     worktrees: &str, cursor: &mut Cursor, now: i64, done: &mut Collected) -> Result<bool> {
     let Ok(raw) = serde_json::from_slice::<Value>(line) else { return Ok(false) };
     let Some(kind) = raw["type"].as_str() else { return Ok(false) };
@@ -65,9 +65,9 @@ pub(super) fn record_line(tx: &Transaction, ledger: &ingest::Ledger, at: u64, li
     let timestamp = raw["timestamp"].as_str();
     if cursor.session.is_none() {
         let (Some(session), Some(cwd), Some(version)) = (id(&raw, "sessionId"), raw["cwd"].as_str(), raw["version"].as_str()) else { return Ok(true) };
-        // Require the exact documented project slug; never infer a cwd from a filename.
-        if Path::new(cwd).is_relative() || cwd.split('/').any(|p| p == "." || p == "..")
-            || file.parent().and_then(Path::file_name).and_then(|s| s.to_str()) != Some(cwd.replace('/', "-").as_str()) { return Ok(false); }
+        // Project slugs are lossy (every non-alphanumeric becomes a dash).
+        // Walk all project directories and bind only from the reported absolute cwd.
+        if Path::new(cwd).is_relative() || cwd.split('/').any(|p| p == "." || p == "..") { return Ok(false); }
         let version = field(&json!({"version": version}), "version", sanitize::Class::Text);
         let meta = json!({"type": "session_meta", "payload": {"id": format!("claude-code:{session}"), "cwd": cwd,
             "timestamp": timestamp, "cli_version": format!("claude-code/{}", version.as_str().unwrap_or("unknown")),
@@ -95,7 +95,11 @@ pub(super) fn record_line(tx: &Transaction, ledger: &ingest::Ledger, at: u64, li
     unmapped(usage, "message.usage.", &["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"], &mut unknown, &mut unmapped_count);
     if !matches!(kind, "assistant" | "user" | "summary" | "system") { unknown.push(format!("type:{kind}")); unmapped_count += 1; }
     let mut payload = json!({"session_id": session, "timestamp": timestamp, "version": raw["version"], "line_type": kind,
-        "model": field(message, "model", sanitize::Class::Text), "message_id": id(message, "id"), "isSidechain": raw["isSidechain"].as_bool(),
+        // Preserve the certified model identifier, which the generic long-token
+        // masker otherwise redacts. All other model strings keep excerpt rules.
+        "model": field(message, "model", if message["model"].as_str() == Some("claude-haiku-4-5-20251001") {
+            sanitize::Class::Id
+        } else { sanitize::Class::Text }), "message_id": id(message, "id"), "isSidechain": raw["isSidechain"].as_bool(),
         "tool_use_ids": [], "tool_names": [], "tool_result_ids": [], "tool_result_errors": 0});
     for counter in ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"] {
         payload[counter] = field(usage, counter, sanitize::Class::Number);

@@ -413,7 +413,12 @@ Cards (gaps that stop those questions being answered):
     usage (input/output/cache tokens), model, tool calls and results
     (metadata only), subagents and compaction. Claude Code is already a
     product worker kind, so this is first among the native adapters.
-    Metadata-only synthetic conformance covers 2.1.3 (`fixture`); live
+    Metadata-only conformance covers 2.1.3 and the sanitized real 2.1.286
+    two-turn skeleton (`fixture`). LC3 discovers lossy project directory names
+    under recorded execution homes and binds from absolute line cwd, including
+    dot-containing attempt worktrees. Assistant message ids dedupe usage;
+    cost-state snapshots remain keys-only diagnostics. Stdout modelUsage keys
+    supply the live harness model when explicit model is absent; live
     certification remains a separate owner-gated step (contracts-collection.md DG4b).
   - **Done (DG4c; OTLP 0002): Gemini CLI local files.** Fixture-certified
     0.62.0 SDK outfile conversion through DG4a, bounded incremental cursors,

@@ -1376,9 +1376,12 @@ per-attempt token binding; launchers still set the environment explicitly.
 Owner decision DG4 supersedes the former Codex-only product scope. Adapter
 `claude-code`, interface `session_jsonl`, reads only execution homes retained
 by canonical attempts whose effective profile kind is `claude`. It discovers
-`<execution_home>/.claude/projects/<cwd with / replaced by ->/*.jsonl`;
+`<execution_home>/.claude/projects/<project>/*.jsonl`;
 there is no fallback to the operator's HOME and no live probe. A source's
-reported absolute cwd must match that exact project slug. Binding uses A1's
+reported absolute cwd is authoritative. Claude Code 2.1.286 replaces every
+non-alphanumeric character in the absolute cwd with `-` (including dots and
+underscores); this encoding is lossy. Discovery scans all project directories
+and never infers cwd from their names. Binding uses A1's
 home digest, worktree attempt, decision time and active/revoked/predates
 revision rules; harness kinds must agree. No guessed binding is possible.
 
@@ -1394,10 +1397,18 @@ home-redacted source/digested source identity as Codex), version, model,
 API message id, the four native token counts, sidechain flag, tool-use ids
 and names, tool-result links and reported error booleans. The native envelope
 `claude-code.claude_line.v1` stores flattened sanitized metadata, tool id/name
-lists and error counts. Line-type counts and unknown field/type counts are
+lists and error counts. The exact fixture-certified model identifier
+`claude-haiku-4-5-20251001` is preserved as an identifier rather than redacted
+by the generic long-token text rule; other model strings retain excerpt rules.
+Line-type counts and unknown field/type counts are
 obtained from these envelopes; unmapped entries retain **keys only** (up to
 128 names per line, plus the full unmapped count). Unknown
-subtrees are not traversed. Prompts, text, thinking, input, result content,
+subtrees are not traversed. The 2.1.286 `queue-operation`, `attachment`,
+`atis-latch`, `last-prompt`, `cost-state` and `mode` types remain unmapped,
+with keys/type names only. Their content, lastPrompt, attachment bodies and
+free text are discarded. `cost-state.modelUsage` is not collected: cumulative
+snapshots overlap assistant usage and add no independent accounting source.
+Prompts, text, thinking, input, result content,
 `toolUseResult` and summary text are never persisted or hashed. Conformance
 plants `CLAUDE_SECRET_*` strings in every forbidden category and scans the
 sidecar including WAL/SHM after collection and replay.
@@ -1435,7 +1446,7 @@ Claude usage. Cache-read/write counters and normalized ledger entries are
 ready for DG2's M10 producer (M10 is absent on this base branch).
 
 `collectors capabilities --json` adds a version-aware `claude-code` table.
-**2.1.3 is fixture-only**, with no live-certified version or field. Versions
+**2.1.3 and 2.1.286 are fixture-only**, with no live-certified version or field. Versions
 outside the fixture set retain metadata and envelopes, but usage counters
 are rejected as `cli_version_uncertified`; their attempt totals are unknown.
 Fixture acceptance is explicit in the adapter table and tool metrics. Live
@@ -1448,7 +1459,15 @@ claimed.
 End-to-end conformance: `tests/telemetry_claude.rs` drives public admission
 and store workflows, then collection/usage/accounting/report CLI entry
 points over synthetic `tests/fixtures/telemetry/claude-code/session.jsonl`
-in temporary execution homes. It covers exact token totals, split-message
+in temporary execution homes. The sanitized real 2.1.286 two-turn skeleton
+(`tests/fixtures/telemetry/claude-2.1.286/live-two-turn.jsonl`) also exercises
+dot-containing attempt worktrees, bound collection, two message-id-deduped
+ledger records, cache creation 6,928/151, cache read 0/6,928, input 10/10 and
+output 87/41, replay and forbidden-content scans. The live harness reads a
+single modelUsage model key from stdout when no explicit model is reported,
+while preserving reported_counters before normalization. No recorded-live
+registry entry is changed; live acceptance awaits the steward's rerun.
+It covers exact token totals, split-message
 deduplication, tool failures, parent sidechain attribution, unknown keys,
 privacy scans, partial lines, truncation replay, unbound/early sessions,
 uncertified versions and unchanged Codex totals alongside Claude. It also
