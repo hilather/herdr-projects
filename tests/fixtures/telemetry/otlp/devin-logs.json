@@ -1,0 +1,232 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "devin-local"
+            }
+          },
+          {
+            "key": "service.version",
+            "value": {
+              "stringValue": "3000.11.3 (9c803229faa4)"
+            }
+          },
+          {
+            "key": "os.type",
+            "value": {
+              "stringValue": "linux"
+            }
+          },
+          {
+            "key": "host.arch",
+            "value": {
+              "stringValue": "x86_64"
+            }
+          },
+          {
+            "key": "user.id",
+            "value": {
+              "stringValue": "DEVIN_SECRET_USER"
+            }
+          },
+          {
+            "key": "herdr.attempt_id",
+            "value": {
+              "stringValue": "@ATTEMPT@"
+            }
+          }
+        ]
+      },
+      "scopeLogs": [
+        {
+          "scope": {
+            "name": "ai.devin.local.events"
+          },
+          "logRecords": [
+            {
+              "timeUnixNano": "1771088000123456000",
+              "severityNumber": 9,
+              "body": {
+                "stringValue": "DEVIN_SECRET_CONTENT"
+              },
+              "attributes": [
+                {
+                  "key": "event.name",
+                  "value": {
+                    "stringValue": "api_request"
+                  }
+                },
+                {
+                  "key": "session.id",
+                  "value": {
+                    "stringValue": "DEVIN_SECRET_SESSION"
+                  }
+                },
+                {
+                  "key": "prompt.id",
+                  "value": {
+                    "stringValue": "DEVIN_SECRET_PROMPT"
+                  }
+                },
+                {
+                  "key": "request_id",
+                  "value": {
+                    "stringValue": "req-synthetic-1"
+                  }
+                },
+                {
+                  "key": "model",
+                  "value": {
+                    "stringValue": "synthetic-model"
+                  }
+                },
+                {
+                  "key": "duration_ms",
+                  "value": {
+                    "intValue": "250"
+                  }
+                },
+                {
+                  "key": "input_tokens",
+                  "value": {
+                    "intValue": "100"
+                  }
+                },
+                {
+                  "key": "output_tokens",
+                  "value": {
+                    "intValue": "20"
+                  }
+                },
+                {
+                  "key": "cache_read_tokens",
+                  "value": {
+                    "intValue": "30"
+                  }
+                },
+                {
+                  "key": "cache_creation_tokens",
+                  "value": {
+                    "intValue": "5"
+                  }
+                },
+                {
+                  "key": "prompt",
+                  "value": {
+                    "stringValue": "DEVIN_SECRET_CONTENT"
+                  }
+                }
+              ]
+            },
+            {
+              "timeUnixNano": "1771088000123456000",
+              "severityNumber": 9,
+              "body": {
+                "stringValue": "DEVIN_SECRET_CONTENT"
+              },
+              "attributes": [
+                {
+                  "key": "event.name",
+                  "value": {
+                    "stringValue": "tool_result"
+                  }
+                },
+                {
+                  "key": "session.id",
+                  "value": {
+                    "stringValue": "DEVIN_SECRET_SESSION"
+                  }
+                },
+                {
+                  "key": "prompt.id",
+                  "value": {
+                    "stringValue": "DEVIN_SECRET_PROMPT"
+                  }
+                },
+                {
+                  "key": "tool_name",
+                  "value": {
+                    "stringValue": "exec"
+                  }
+                },
+                {
+                  "key": "tool_use_id",
+                  "value": {
+                    "stringValue": "DEVIN_SECRET_TOOLUSE"
+                  }
+                },
+                {
+                  "key": "success",
+                  "value": {
+                    "boolValue": true
+                  }
+                },
+                {
+                  "key": "tool_input",
+                  "value": {
+                    "stringValue": "DEVIN_SECRET_CONTENT"
+                  }
+                },
+                {
+                  "key": "tool_input_size_bytes",
+                  "value": {
+                    "intValue": "42"
+                  }
+                },
+                {
+                  "key": "tool_result_size_bytes",
+                  "value": {
+                    "intValue": "7"
+                  }
+                }
+              ]
+            },
+            {
+              "timeUnixNano": "1771088000123456000",
+              "severityNumber": 9,
+              "body": {
+                "stringValue": "DEVIN_SECRET_CONTENT"
+              },
+              "attributes": [
+                {
+                  "key": "event.name",
+                  "value": {
+                    "stringValue": "user_prompt"
+                  }
+                },
+                {
+                  "key": "session.id",
+                  "value": {
+                    "stringValue": "DEVIN_SECRET_SESSION"
+                  }
+                },
+                {
+                  "key": "prompt.id",
+                  "value": {
+                    "stringValue": "DEVIN_SECRET_PROMPT"
+                  }
+                },
+                {
+                  "key": "prompt_length",
+                  "value": {
+                    "intValue": "9"
+                  }
+                },
+                {
+                  "key": "prompt",
+                  "value": {
+                    "stringValue": "DEVIN_SECRET_CONTENT"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

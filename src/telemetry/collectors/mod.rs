@@ -334,6 +334,8 @@ fn capabilities(project: &Path) -> Result<Value> {
     for (adapter, reason) in [
         ("cursor-agent", "stable_local_usage_format_not_evident"),
         ("otlp:cursor-agent", "protobuf_traces_only_no_usable_logs_or_metrics"),
+        // Devin 3000.11.3 (DG4k): sessions DB nests usage in content-bearing JSON.
+        ("devin", "local_usage_schema_not_established"),
     ] {
         let fields: Vec<Value> = ["input_tokens", "output_tokens", "cost", "tool_calls", "errors"]
             .into_iter()

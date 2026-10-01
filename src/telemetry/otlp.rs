@@ -113,13 +113,20 @@ const MAPPINGS: &[(&str, &str, &str, &[&str])] = &[
     ("grok", "grok_code.turn.count", "usage", &["outcome", "model"]),
     ("grok", "grok_code.tool.usage", "tool", &["tool_name", "outcome"]),
     ("grok", "grok_code.error.count", "tool", &["error_category", "model"]),
+    ("devin", "api_request", "usage", &["model", "request_id", "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "duration_ms"]),
+    ("devin", "devin.token.usage", "usage", &["type", "model"]),
+    ("devin", "tool_result", "tool", &["tool_name", "success"]),
 ];
+
+/// Devin CLI 3000.11.3 (DG4k): the reviewed `--version` token and resource service.
+const DEVIN_VERSION: &str = "3000.11.3";
+const DEVIN_SERVICE: &str = "devin-local";
 
 const GROK_LIVE_FIELDS: &[&str] = &["model", "input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens", "cache_creation_tokens"];
 
 pub fn capabilities() -> Vec<Value> {
     let mut out = Vec::new();
-    for harness in ["claude-code", "gemini-cli", "grok", "muse", "codex"] {
+    for harness in ["claude-code", "gemini-cli", "grok", "muse", "devin", "codex"] {
         let mut fields = Vec::new();
         for (_, name, _, attrs) in MAPPINGS.iter().filter(|m| m.0 == harness) {
             for field in attrs.iter().copied().chain(if name.ends_with(".usage") || name.ends_with("token_usage") || (harness == "grok" && *name != "grok_code.api_request") {
@@ -161,6 +168,12 @@ pub fn capabilities() -> Vec<Value> {
             let cap = out.last_mut().unwrap();
             cap["fixture_versions"] = json!(["1.4.0-R4161.1"]);
             cap["accepted_versions"] = json!(["1.4.0-R4161.1"]);
+            cap["native_source"] = json!({"certified":"none", "reason":"local_usage_schema_not_established"});
+        }
+        if harness == "devin" {
+            let cap = out.last_mut().unwrap();
+            cap["fixture_versions"] = json!([DEVIN_VERSION]);
+            cap["accepted_versions"] = json!([DEVIN_VERSION]);
             cap["native_source"] = json!({"certified":"none", "reason":"local_usage_schema_not_established"});
         }
         if harness == "grok" {
@@ -306,15 +319,18 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
         ensure!(resource.is_object(), "invalid resource group");
         let ra = attributes(resource.get("resource").unwrap_or(&json!({})))?;
         let service = ra.get("service.name").and_then(Value::as_str).unwrap_or("");
-        let harness = if service == "grok-cli" { "grok" } else if service == "tbh" { "muse" } else { service };
+        let harness = match service { "grok-cli" => "grok", "tbh" => "muse", DEVIN_SERVICE => "devin", other => other };
         let service_version = ra.get("service.version").and_then(Value::as_str);
         let cli_version = if harness == "grok" {
             // A present client version is authoritative, including an unknown version.
             ra.get("client.version").map(|v| v.as_str()).unwrap_or_else(|| {
                 service_version.map(|v| v.split_whitespace().next().unwrap_or(""))
             })
+        } else if harness == "devin" {
+            // `--version` prints `<semver> (<build>)`; only the leading semver is identity.
+            service_version.map(|v| v.split_whitespace().next().unwrap_or(""))
         } else { service_version };
-        let known = matches!(service, "claude-code" | "gemini-cli" | "grok-cli" | "tbh");
+        let known = matches!(service, "claude-code" | "gemini-cli" | "grok-cli" | "tbh" | DEVIN_SERVICE);
         let adapter = if known {
             format!("otlp:{harness}")
         } else if harness == "codex" {
@@ -346,6 +362,10 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                 // bodies are discarded at decode, so Grok/Muse use eventName.
                 let name = if metrics {
                     entry["name"].as_str()
+                } else if harness == "devin" {
+                    // Devin's body may be message content: the name comes from the
+                    // `event.name` attribute (or eventName) only, never the body.
+                    ea.get("event.name").and_then(Value::as_str).or_else(|| entry["eventName"].as_str())
                 } else {
                     entry["eventName"]
                         .as_str()
@@ -353,6 +373,11 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                         .or_else(|| ea.get("event.name").and_then(Value::as_str))
                 }
                 .unwrap_or("");
+                // Devin event names are not proven to carry a product prefix; accept
+                // the reviewed unprefixed names and the two plausible exporter prefixes.
+                let name = if harness == "devin" && !metrics {
+                    name.strip_prefix("ai.devin.local.").or_else(|| name.strip_prefix("devin.")).unwrap_or(name)
+                } else { name };
                 let unsupported = metrics
                     && (entry.get("exponentialHistogram").is_some() || entry.get("summary").is_some());
                 if metrics {
@@ -366,7 +391,8 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                     .iter()
                     .find(|m| !unsupported && known && m.0 == harness && m.1 == name && metrics == (name.ends_with(".usage") || name.ends_with("token_usage") || (m.0 == "grok" && m.1 != "grok_code.api_request"))
                         && (harness != "grok" || cli_version == Some("1.0.46"))
-                        && (harness != "muse" || cli_version == Some("1.4.0-R4161.1")));
+                        && (harness != "muse" || cli_version == Some("1.4.0-R4161.1"))
+                        && (harness != "devin" || cli_version == Some(DEVIN_VERSION)));
                 let points = if unsupported {
                     // One keys-only diagnostic per instrument; never inspect unsupported points.
                     vec![json!({})]
@@ -386,7 +412,7 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                     let mapping = mapping.filter(|m| {
                         !m.1.ends_with("token.usage")
                             || attrs.get("type").and_then(Value::as_str).is_some_and(|s| {
-                                if harness == "claude-code" {
+                                if harness == "claude-code" || harness == "devin" {
                                     matches!(s, "input" | "output" | "cacheRead" | "cacheCreation")
                                 } else if harness == "grok" {
                                     matches!(s, "input" | "output" | "reasoning" | "cache_read" | "cache_creation")
@@ -408,6 +434,21 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                     if harness == "muse" {
                         payload["cli_version"] = if cli_version == Some("1.4.0-R4161.1") { json!("1.4.0-R4161.1") } else { Value::Null };
                         if cli_version != Some("1.4.0-R4161.1") {
+                            payload["mapping_certified"] = json!("none");
+                            payload["reason"] = json!("cli_version_uncertified");
+                        }
+                    }
+                    if harness == "devin" {
+                        if cli_version == Some(DEVIN_VERSION) {
+                            // Only the reviewed build-string shape may leave the exporter.
+                            if let Some(build) = service_version.filter(|v| {
+                                v.strip_prefix(DEVIN_VERSION).and_then(|r| r.strip_prefix(" ("))
+                                    .and_then(|r| r.strip_suffix(')'))
+                                    .is_some_and(|b| b.len() == 12 && b.chars().all(|c| c.is_ascii_hexdigit()))
+                            }) { payload["service_build"] = json!(build); }
+                        }
+                        payload["cli_version"] = if cli_version == Some(DEVIN_VERSION) { json!(DEVIN_VERSION) } else { Value::Null };
+                        if cli_version != Some(DEVIN_VERSION) {
                             payload["mapping_certified"] = json!("none");
                             payload["reason"] = json!("cli_version_uncertified");
                         }
@@ -441,7 +482,7 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                         for field in *fields {
                             if let Some(raw) = attrs.get(*field) {
                                 let safe = match *field {
-                                    "stop_reason" | "model" | "tool_name" | "function_name" | "error_category" | "outcome" | "gen_ai.request.model" | "gen_ai.provider.name" => identifier(raw),
+                                    "stop_reason" | "model" | "request_id" | "tool_name" | "function_name" | "error_category" | "outcome" | "gen_ai.request.model" | "gen_ai.provider.name" => identifier(raw),
                                     "token_type" => raw.as_str().filter(|s| matches!(*s, "total" | "input" | "cached_input" | "output")).map(|s| json!(s)),
                                     "type" => raw
                                         .as_str()

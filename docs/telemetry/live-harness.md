@@ -1,7 +1,7 @@
 # Steward live certification procedure
 
 `tests/telemetry_live.rs` provides ignored, paid workflows for Claude Code,
-Grok Build CLI, Muse and a newer Codex. Only the steward runs these outside
+Grok Build CLI, Muse, Devin and a newer Codex. Only the steward runs these outside
 the worker sandbox. No certification status changes automatically.
 
 Prepare a fresh private directory (0700) for each run. Place a private 0600
@@ -16,6 +16,7 @@ CODEX_HOME and GROK_HOME inside that prepared home. Prepare `runtime` as 0700.
 | Claude Code | none: owner decision 2026-10-01, a long-lived `claude setup-token` token in a private 0600 file outside the home, passed via `HERDR_LIVE_TOKEN_FILE` + `HERDR_LIVE_TOKEN_ENV=CLAUDE_CODE_OAUTH_TOKEN` (the owner's OAuth credentials are never copied, so refresh-token rotation cannot sign them out) | TODO confirm noninteractive prompt, `--output-format json`, tools disabled and resume-last flags |
 | Grok | none: owner decision 2026-10-01, an xAI API key in a private 0600 file via `HERDR_LIVE_TOKEN_FILE` + `HERDR_LIVE_TOKEN_ENV=XAI_API_KEY` (never copy `~/.grok/auth.json`: its OAuth refresh tokens rotate) | TODO confirm headless prompt, usage summary output and resume-last flags |
 | Muse | none: owner decision 2026-10-01, `HERDR_LIVE_ENV=XDG_CONFIG_HOME=<owner's ~/.config>` uses the login in place (no copy, so refreshes stay in one file; the release binary ignores the launcher's `MUSE_AUTH_PATH`), with sessions and data still in the throwaway home; run the installed release binary directly, not the self-updating launcher | TODO confirm headless prompt, numeric usage JSON and whether resume exists |
+| Devin | none by default: `devin auth login` is interactive; the steward supplies a private login in the throwaway home (never copy owner `~/.local/share/devin` or `~/.config/devin` in) and an API-key variable via `HERDR_LIVE_TOKEN_*` if Devin documents one; run the installed `3000.11.3` binary directly | TODO confirm `-p`/`--print` prompt (or `-- <prompt>`), `--permission-mode` that disables tools, `--respect-workspace-trust false`, and `-c`/`--continue` for turn two; stdout carries no usage JSON |
 | Codex | `.codex/auth.json` | TODO confirm `exec --json`, selected model, tool restrictions and `exec resume --last` for installed version |
 
 The steward must resolve TODOs using known deployment documentation before
@@ -129,3 +130,23 @@ outer event ids once per path session. Input includes explicit cache read/write
 counts, output includes reasoning; combined cached_tokens and repeated
 attribution events are excluded. Native fixture certification precedes the
 steward's live ledger reconciliation; public-build OTLP export may be disabled.
+
+DG4k: `devin_live` (e.g. `HERDR_LIVE_ARGS='-p {prompt} --permission-mode auto'`)
+sets the DG4h receiver, bearer header and `OTEL_RESOURCE_ATTRIBUTES`, and writes
+`otel.enabled=true` (prompt/tool logging disabled) to the home's
+`.config/devin/config.json` only if absent. Version is `devin --version`'s semver
+(`3000.11.3`; the parenthesized build `9c803229faa4` is diagnostics). Devin's
+stdout has no usage JSON, so set `HERDR_LIVE_USAGE_FILES` to the fresh
+`sessions.db`/`cli_sessions.db` path(s) relative to the home (find them yourself
+after a run: the harness never walks the home). The harness reads only numeric
+leaves of `sessions.metadata` (`input_tokens`/`output_tokens`/
+`cache_read_tokens`/`cache_creation_tokens`/cache/total aliases; other numeric
+keys are reported as `unmapped_keys`, never `message_nodes`). Devin is
+fixture-only and outside the ledger, so `ledger_totals` are the exact-bound
+`api_request` rows and `metric_reconciliation` sums DELTA `devin.token.usage`.
+TODOs: confirm export is enabled by the config key (else add the real key),
+exporter event names/prefix, whether input is cache-inclusive, and whether
+`sessions.metadata` carries a stable usage schema; a stable one justifies a
+native `devin` adapter (bound by `sessions.working_directory`, sessions read
+only from recorded `devin`-kind execution homes). Recording a live report and
+adding it to the certification registry remains a separate reviewed change.

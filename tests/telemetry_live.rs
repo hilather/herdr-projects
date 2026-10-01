@@ -228,6 +228,48 @@ fn own_files(kind: &str, home: &Path) -> Vec<Value> {
         scan(&home.join(".local/share/muse/sessions"),0,&mut out,&mut std::collections::BTreeSet::new());
         return out;
     }
+    if kind == "devin" {
+        // DG4k: Devin 3000.11.3 keeps cumulative usage in `sessions.metadata`
+        // (JSON, field names unestablished). Exact fresh DB paths come from the
+        // steward; only numeric leaves of that one column are read, never
+        // `message_nodes` or any other content-bearing column.
+        fn leaves(v: &Value, out: &mut Vec<(String, u64)>) {
+            match v {
+                Value::Object(o) => for (k, v) in o {
+                    match v.as_u64() { Some(n) => out.push((k.clone(), n)), None => leaves(v, out) }
+                },
+                Value::Array(a) => a.iter().for_each(|v| leaves(v, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for name in std::env::var("HERDR_LIVE_USAGE_FILES").unwrap_or_default().lines() {
+            let path = Path::new(name);
+            assert!(path.components().all(|c| matches!(c, std::path::Component::Normal(_))) && !fs::symlink_metadata(home.join(path)).unwrap().file_type().is_symlink());
+            assert!(matches!(path.file_name().and_then(|s| s.to_str()), Some("sessions.db" | "cli_sessions.db")), "only the sessions database may be read");
+            let db = rusqlite::Connection::open_with_flags(home.join(path), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            let mut rows = db.prepare("SELECT metadata FROM sessions WHERE hidden=0 AND metadata IS NOT NULL").unwrap();
+            for text in rows.query_map([], |r| r.get::<_, String>(0)).unwrap().flatten() {
+                let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
+                let mut found = Vec::new();
+                leaves(&v, &mut found);
+                let (mut c, mut unknown) = (serde_json::Map::new(), Vec::new());
+                for (key, n) in found {
+                    let target = match key.as_str() {
+                        "input_tokens" | "input" => "input_tokens",
+                        "output_tokens" | "output" => "output_tokens",
+                        "cache_read_tokens" | "cacheRead" => "cached_input_tokens",
+                        "cache_creation_tokens" | "cacheCreation" => "cache_write_input_tokens",
+                        "total_tokens" => "total_tokens",
+                        _ => { unknown.push(key); continue }
+                    };
+                    *c.entry(target).or_insert(json!(0)) = json!(c.get(target).and_then(Value::as_u64).unwrap_or(0) + n);
+                }
+                if !c.is_empty() { out.push(json!({"counters":c,"unmapped_keys":unknown,"model":null})); }
+            }
+        }
+        return out;
+    }
     let mut paths = Vec::new();
     if kind == "codex" {
         fn sessions(dir: &Path, paths: &mut Vec<PathBuf>) {
@@ -336,6 +378,9 @@ fn live(kind: &str) {
         for dir in [
             ".claude",
             ".grok",
+            ".devin",
+            ".config/devin",
+            ".local/share/devin",
             ".config/muse",
             ".codex",
             ".gemini",
@@ -410,7 +455,7 @@ fn live(kind: &str) {
     let mut receiver = None;
     let mut endpoint = None;
     let mut attempt_token = None;
-    if matches!(kind, "grok" | "muse") {
+    if matches!(kind, "grok" | "muse" | "devin") {
         let minted = herdr_projects::telemetry::otlp::mint_attempt_token(&f.project, &f.attempt, 600).unwrap();
         attempt_token = Some(minted["token"].as_str().unwrap().to_owned());
         let mut c = command(Path::new(BIN), &f.tmp.path().join("home"), f.tmp.path());
@@ -444,7 +489,6 @@ fn live(kind: &str) {
                 "OTEL_EXPORTER_OTLP_HEADERS",
                 format!("Authorization=Bearer {}", attempt_token.as_ref().unwrap()),
             )
-            .env("GROK_EXTERNAL_OTEL", "1")
             .env("OTEL_METRICS_EXPORTER", "otlp")
             .env("OTEL_LOGS_EXPORTER", "otlp")
             .env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
@@ -457,12 +501,23 @@ fn live(kind: &str) {
             .env("OTEL_LOG_ASSISTANT_RESPONSES", "false")
             .env("OTEL_LOG_TOOL_DETAILS", "false")
             .env("OTEL_LOG_TOOL_CONTENT", "false");
+            if kind == "grok" { c.env("GROK_EXTERNAL_OTEL", "1"); }
+            if kind == "devin" {
+                // Devin enables export from `otel` in the user config
+                // (`~/.config/devin/config.json`, otherwise unestablished); write it
+                // in the disposable home only, never over a steward-prepared file.
+                let dir = f.home.join(".config/devin");
+                fs::create_dir_all(&dir).unwrap();
+                let config = json!({"otel":{"enabled":true,"disable_user_prompt_logging":true,"disable_tool_logging":true}});
+                let _ = fs::OpenOptions::new().write(true).create_new(true).open(dir.join("config.json"))
+                    .and_then(|mut file| std::io::Write::write_all(&mut file, config.to_string().as_bytes()));
+            }
         }
         own.extend(own_stdout(&run(c, f.tmp.path(), &format!("turn-{n}"))));
     }
     drop(receiver);
     let file_usage = if kind == "grok" { Vec::new() } else { own_files(kind, &f.home) };
-    if kind == "muse" || !file_usage.is_empty() {
+    if kind == "muse" || kind == "devin" || !file_usage.is_empty() {
         own = file_usage;
     }
     if matches!(kind, "claude" | "grok") {
@@ -497,6 +552,18 @@ fn live(kind: &str) {
         }
     }
     let otlp = f.cli_args(&["otlp", "records"]).0;
+    if kind == "devin" {
+        // Devin 3000.11.3 is fixture-only: nothing reaches the ledger, so its own
+        // session counters reconcile against the exact-bound `api_request` rows.
+        totals.clear();
+        for record in otlp.as_array().into_iter().flatten().filter(|r| r["attempt_id"] == f.attempt
+            && r["binding"] == "exact" && r["native_name"] == "api_request") {
+            for (key, source) in [("input_tokens", "input_tokens"), ("output_tokens", "output_tokens"),
+                ("cached_input_tokens", "cache_read_tokens"), ("cache_write_input_tokens", "cache_creation_tokens")] {
+                if let Some(n) = record["attributes"][source].as_u64() { *totals.entry(key.into()).or_default() += n; }
+            }
+        }
+    }
     let mut metric_totals = BTreeMap::<String, u64>::new();
     if kind == "grok" {
         for record in otlp.as_array().into_iter().flatten().filter(|r|
@@ -515,6 +582,16 @@ fn live(kind: &str) {
             if let Some(n) = record["value"].as_u64() {
                 *metric_totals.entry(key.into()).or_default() += n;
             }
+        }
+    }
+    if kind == "devin" {
+        // DELTA `devin.token.usage` exports reconcile against the request rows.
+        for record in otlp.as_array().into_iter().flatten().filter(|r| r["attempt_id"] == f.attempt && r["binding"] == "exact"
+            && r["native_name"] == "devin.token.usage" && r["aggregationTemporality"] == 1) {
+            let key = match record["attributes"]["type"].as_str() {
+                Some("input") => "input_tokens", Some("cacheRead") => "cached_input_tokens",
+                Some("cacheCreation") => "cache_write_input_tokens", Some("output") => "output_tokens", _ => continue };
+            if let Some(n) = record["value"].as_u64() { *metric_totals.entry(key.into()).or_default() += n; }
         }
     }
     let metric_differences: BTreeMap<_, _> = metric_totals.iter().map(|(key, n)| (
@@ -620,7 +697,7 @@ fn live(kind: &str) {
         "usage_records":records,"otlp_usage_records":otlp_counts,"ledger_totals":totals,"usage_totals":totals,"harness_usage":if own.is_empty(){json!("not_reported")}else{json!(own)},
         "differences":differences,"metric_reconciliation":{"totals":metric_totals,"differences":metric_differences},"unmapped_keys":keys,"binding_outcome":if quarantined{"quarantined"}else if bound{"bound"}else{"unbound"},
         "privacy":{"marker":MARKER,"sidecar_hits":hits},"attempt_query_observed":attempts["attempts"].as_array().is_some(),
-        "binding_query_observed":!bindings.is_null(),"certification_changed":false,"evidence_state":if bound && !own.is_empty() && (kind != "grok" || !records.is_empty()) && metric_differences.values().all(|v| *v == 0) && differences.values().all(|v| v == &json!(0)) && hits == 0 {"review_required"} else {"incomplete"}});
+        "binding_query_observed":!bindings.is_null(),"certification_changed":false,"evidence_state":if bound && !own.is_empty() && (kind != "grok" || !records.is_empty()) && (kind != "devin" || !totals.is_empty()) && metric_differences.values().all(|v| *v == 0) && differences.values().all(|v| v == &json!(0)) && hits == 0 {"review_required"} else {"incomplete"}});
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = fs::OpenOptions::new()
@@ -659,6 +736,11 @@ fn grok_live() {
 #[ignore = "steward-only paid live run"]
 fn muse_live() {
     live("muse");
+}
+#[test]
+#[ignore = "steward-only paid live run"]
+fn devin_live() {
+    live("devin");
 }
 #[test]
 #[ignore = "steward-only paid live run"]

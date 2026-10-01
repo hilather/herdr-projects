@@ -636,6 +636,77 @@ fn muse_installed_contract_is_version_gated_and_content_free() {
     }
 }
 
+#[test]
+fn devin_3000_11_3_contract_is_version_gated_bound_and_content_free() {
+    let f = Fixture::reserved();
+    let logs = payload(&f, "devin-logs");
+    let metrics = payload(&f, "devin-metrics");
+    assert_eq!(otlp::ingest(&f.project, "/v1/logs", &logs).unwrap(), 3);
+    assert_eq!(otlp::ingest(&f.project, "/v1/metrics", &metrics).unwrap(), 6);
+    assert_eq!(otlp::ingest(&f.project, "/v1/logs", &logs).unwrap(), 0);
+    assert_eq!(otlp::ingest(&f.project, "/v1/metrics", &metrics).unwrap(), 0);
+    let (rows, _) = f.cli_args(&["otlp", "records"]);
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 9);
+    assert!(rows.iter().all(|r| r["adapter"] == "otlp:devin" && r["attempt_id"] == f.attempt && r["binding"] == "exact"
+        && r["cli_version"] == "3000.11.3" && r["service_build"] == "3000.11.3 (9c803229faa4)" && r["certified"] == "fixture"));
+    // Fixture evidence never enters accounting: no request authority is declared.
+    assert!(rows.iter().all(|r| r.get("usage_authority").is_none()));
+    let request = rows.iter().find(|r| r["native_name"] == "api_request").unwrap();
+    assert_eq!(request["kind"], "usage");
+    assert_eq!(request["attributes"], json!({"model":"synthetic-model","request_id":"req-synthetic-1","input_tokens":100,"output_tokens":20,
+        "cache_read_tokens":30,"cache_creation_tokens":5,"duration_ms":250}));
+    let tool = rows.iter().find(|r| r["native_name"] == "tool_result").unwrap();
+    assert_eq!((tool["kind"].clone(), tool["attributes"].clone()), (json!("tool"), json!({"tool_name":"exec","success":true})));
+    let mut tokens: Vec<_> = rows.iter().filter(|r| r["native_name"] == "devin.token.usage")
+        .map(|r| (r["attributes"]["type"].as_str().unwrap(), r["value"].as_i64().unwrap(), r["unit"].as_str().unwrap(), r["aggregationTemporality"].as_i64().unwrap())).collect();
+    tokens.sort();
+    assert_eq!(tokens, vec![("cacheCreation", 5, "tokens", 1), ("cacheRead", 30, "tokens", 1), ("input", 100, "tokens", 1), ("output", 20, "tokens", 1)]);
+    // Prompts, session/user identity and unreviewed instruments keep keys only.
+    let prompt = rows.iter().find(|r| r["kind"] == "unmapped" && r["unmapped_attribute_keys"].to_string().contains("prompt_length")).unwrap();
+    assert!(prompt.get("attributes").is_none() && prompt.get("native_name").is_none());
+    // Identical key-less diagnostics (session count, active time) collapse by digest.
+    assert_eq!(rows.iter().filter(|r| r["kind"] == "unmapped").count(), 3);
+    // Prefixed event names (unproven exporter spelling) map identically; other versions are diagnostics.
+    let prefixed = String::from_utf8(logs.clone()).unwrap().replace("\"api_request\"", "\"devin.api_request\"");
+    assert_eq!(otlp::ingest(&f.project, "/v1/logs", prefixed.as_bytes()).unwrap(), 0);
+    let future = String::from_utf8(logs.clone()).unwrap().replace("3000.11.3 (9c803229faa4)", "3000.12.0 (ffffffffffff)");
+    assert_eq!(otlp::ingest(&f.project, "/v1/logs", future.as_bytes()).unwrap(), 3);
+    let unbound = String::from_utf8(logs.clone()).unwrap().replace(&f.attempt, "not-an-attempt");
+    assert_eq!(otlp::ingest(&f.project, "/v1/logs", unbound.as_bytes()).unwrap(), 3);
+    let mut missing: Value = serde_json::from_slice(&metrics).unwrap();
+    missing["resourceMetrics"][0]["resource"]["attributes"].as_array_mut().unwrap().retain(|a| a["key"] != "herdr.attempt_id");
+    assert_eq!(otlp::ingest(&f.project, "/v1/metrics", &serde_json::to_vec(&missing).unwrap()).unwrap(), 6);
+    let all = otlp::records(&f.project).unwrap();
+    let all = all.as_array().unwrap();
+    assert!(all.iter().filter(|r| r["reason"] == "cli_version_uncertified").all(|r| r["kind"] == "unmapped" && r["cli_version"].is_null() && r.get("service_build").is_none()));
+    assert_eq!(all.iter().filter(|r| r["reason"] == "cli_version_uncertified").count(), 3);
+    assert_eq!(all.iter().filter(|r| r["binding"] == "unknown_attempt" && r["attempt_id"].is_null()).count(), 3);
+    assert_eq!(all.iter().filter(|r| r["binding"] == "unbound" && r["attempt_id"].is_null()).count(), 6);
+    privacy_scan(&f, &["DEVIN_SECRET_CONTENT", "DEVIN_SECRET_USER", "DEVIN_SECRET_SESSION", "DEVIN_SECRET_PROMPT", "DEVIN_SECRET_TOOLUSE"]);
+    let (capabilities, _) = f.cli_args(&["collectors", "capabilities", "--json"]);
+    let adapters = capabilities["adapters"].as_array().unwrap();
+    let cap = adapters.iter().find(|a| a["adapter"] == "otlp:devin").unwrap();
+    assert_eq!((cap["fixture_versions"].clone(), cap["accepted_versions"].clone(), cap["certified_versions"].clone()), (json!(["3000.11.3"]), json!(["3000.11.3"]), json!([])));
+    assert_eq!(cap["native_source"], json!({"certified":"none","reason":"local_usage_schema_not_established"}));
+    assert!(cap["fields"].as_array().unwrap().iter().filter(|f| f["available"] == true).all(|f| f["certified"] == "fixture"));
+    assert!(adapters.iter().all(|a| a["adapter"] == "devin" || a["adapter"].as_str().unwrap().starts_with("otlp:") || !a["adapter"].to_string().contains("devin")));
+}
+
+#[test]
+fn devin_protobuf_export_matches_json_rows() {
+    let f = Fixture::reserved();
+    for (fixture, metrics, expected) in [("devin-logs", false, 3), ("devin-metrics", true, 6)] {
+        let root: Value = serde_json::from_slice(&payload(&f, fixture)).unwrap();
+        let endpoint = if metrics { "/v1/metrics" } else { "/v1/logs" };
+        assert_eq!(otlp::ingest_protobuf(&f.project, endpoint, &pb_request(&root, metrics)).unwrap(), expected);
+        let before = otlp::records(&f.project).unwrap();
+        assert_eq!(otlp::ingest(&f.project, endpoint, &serde_json::to_vec(&root).unwrap()).unwrap(), 0);
+        assert_eq!(otlp::records(&f.project).unwrap(), before);
+    }
+    privacy_scan(&f, &["DEVIN_SECRET_CONTENT", "DEVIN_SECRET_USER"]);
+}
+
 // Independent fixture encoder: OTLP field numbers from the public wire contract.
 fn pb_varint(mut n: u64) -> Vec<u8> {
     let mut out = Vec::new();

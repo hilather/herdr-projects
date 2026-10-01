@@ -921,8 +921,9 @@ fn accounting_fields_match_the_adapter_certificate() {
     let adapters = capabilities["adapters"].as_array().unwrap();
     let names: Vec<&str> = adapters.iter().map(|a| a["adapter"].as_str().unwrap()).collect();
     assert_eq!(names[0], "codex", "{names:?}");
-    assert!(names[1..].iter().all(|n| *n == "claude-code" || *n == "gemini-cli" || *n == "opencode" || *n == "cursor-agent" || *n == "muse" || n.starts_with("otlp:")), "only declared adapters besides Codex: {names:?}");
+    assert!(names[1..].iter().all(|n| *n == "claude-code" || *n == "gemini-cli" || *n == "opencode" || *n == "cursor-agent" || *n == "muse" || *n == "devin" || n.starts_with("otlp:")), "only declared adapters besides Codex: {names:?}");
     assert!(names.contains(&"otlp:grok"), "Grok fixture adapter must be advertised: {names:?}");
+    assert!(names.contains(&"otlp:devin") && names.contains(&"devin"), "Devin adapters must be advertised: {names:?}");
     // Recorded live evidence registry. Adding an adapter/version requires a
     // reviewed report, not merely a successful invocation of the live test.
     let recorded_live = [("codex", "0.154.0", "docs/telemetry/certificate-live.md"),
@@ -945,6 +946,7 @@ fn accounting_fields_match_the_adapter_certificate() {
     for (name, reason) in [
         ("cursor-agent", "stable_local_usage_format_not_evident"),
         ("otlp:cursor-agent", "protobuf_traces_only_no_usable_logs_or_metrics"),
+        ("devin", "local_usage_schema_not_established"),
     ] {
         let adapter = adapters.iter().find(|a| a["adapter"] == name).unwrap();
         assert_eq!(adapter["interface"], "none");

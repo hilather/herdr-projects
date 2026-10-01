@@ -1,0 +1,202 @@
+{
+  "resourceMetrics": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "devin-local"
+            }
+          },
+          {
+            "key": "service.version",
+            "value": {
+              "stringValue": "3000.11.3 (9c803229faa4)"
+            }
+          },
+          {
+            "key": "os.type",
+            "value": {
+              "stringValue": "linux"
+            }
+          },
+          {
+            "key": "host.arch",
+            "value": {
+              "stringValue": "x86_64"
+            }
+          },
+          {
+            "key": "user.id",
+            "value": {
+              "stringValue": "DEVIN_SECRET_USER"
+            }
+          },
+          {
+            "key": "herdr.attempt_id",
+            "value": {
+              "stringValue": "@ATTEMPT@"
+            }
+          }
+        ]
+      },
+      "scopeMetrics": [
+        {
+          "scope": {
+            "name": "ai.devin.local"
+          },
+          "metrics": [
+            {
+              "name": "devin.token.usage",
+              "unit": "tokens",
+              "sum": {
+                "aggregationTemporality": 1,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "attributes": [
+                      {
+                        "key": "type",
+                        "value": {
+                          "stringValue": "input"
+                        }
+                      },
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "synthetic-model"
+                        }
+                      }
+                    ],
+                    "asInt": "100",
+                    "startTimeUnixNano": "1771087000000000000",
+                    "timeUnixNano": "1771088000123456000"
+                  },
+                  {
+                    "attributes": [
+                      {
+                        "key": "type",
+                        "value": {
+                          "stringValue": "output"
+                        }
+                      },
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "synthetic-model"
+                        }
+                      }
+                    ],
+                    "asInt": "20",
+                    "startTimeUnixNano": "1771087000000000000",
+                    "timeUnixNano": "1771088000123456000"
+                  },
+                  {
+                    "attributes": [
+                      {
+                        "key": "type",
+                        "value": {
+                          "stringValue": "cacheRead"
+                        }
+                      },
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "synthetic-model"
+                        }
+                      }
+                    ],
+                    "asInt": "30",
+                    "startTimeUnixNano": "1771087000000000000",
+                    "timeUnixNano": "1771088000123456000"
+                  },
+                  {
+                    "attributes": [
+                      {
+                        "key": "type",
+                        "value": {
+                          "stringValue": "cacheCreation"
+                        }
+                      },
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "synthetic-model"
+                        }
+                      }
+                    ],
+                    "asInt": "5",
+                    "startTimeUnixNano": "1771087000000000000",
+                    "timeUnixNano": "1771088000123456000"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "devin.session.count",
+              "unit": "{session}",
+              "sum": {
+                "aggregationTemporality": 1,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "attributes": [],
+                    "asInt": "1",
+                    "startTimeUnixNano": "1771087000000000000",
+                    "timeUnixNano": "1771088000123456000"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "devin.lines_of_code.count",
+              "unit": "{line}",
+              "sum": {
+                "aggregationTemporality": 1,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "attributes": [
+                      {
+                        "key": "type",
+                        "value": {
+                          "stringValue": "added"
+                        }
+                      },
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "synthetic-model"
+                        }
+                      }
+                    ],
+                    "asInt": "12",
+                    "startTimeUnixNano": "1771087000000000000",
+                    "timeUnixNano": "1771088000123456000"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "devin.active_time.total",
+              "unit": "s",
+              "sum": {
+                "aggregationTemporality": 1,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "attributes": [],
+                    "asInt": "33",
+                    "startTimeUnixNano": "1771087000000000000",
+                    "timeUnixNano": "1771088000123456000"
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
