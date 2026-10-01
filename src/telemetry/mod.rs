@@ -11,6 +11,7 @@ pub mod ingest;
 pub mod maintenance;
 pub mod metrics;
 pub mod outcome;
+pub mod operating;
 pub mod otlp;
 mod gemini;
 pub mod panel;
@@ -39,7 +40,7 @@ macro_rules! lane {
     ($module:ident) => { Lane { stream: $module::STREAM, migrations: $module::MIGRATIONS, metrics: $module::metrics, tick: $module::tick } };
 }
 
-pub const LANES: [Lane; 8] = [lane!(collectors), lane!(accounting), lane!(quality), lane!(review), lane!(policies), lane!(analytics), lane!(health), lane!(otlp)];
+pub const LANES: [Lane; 9] = [lane!(collectors), lane!(accounting), lane!(quality), lane!(review), lane!(policies), lane!(operating), lane!(analytics), lane!(health), lane!(otlp)];
 
 /// A read-only connection that writes and creates nothing (contracts §0 "Reads").
 /// Fields drop in order: the connection closes before the lock is released.

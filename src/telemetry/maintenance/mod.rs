@@ -92,6 +92,8 @@ pub struct Class {
 
 /// `retention.v1`: doc 09's defaults, one row per sidecar table group and on-disk artefact.
 pub const CLASSES: &[Class] = &[
+    Class { id: "sidecar.operating_intervals", store: "telemetry.db", scope: "operating_intervals, operating_clock, operating_gaps", default_days: None, basis: "source_of_truth", destructive: true,
+        action: Action::Retain, age_from: "end_unix_ms", requires: "kept: ticker observations cannot be replayed; included in full sidecar backups" },
     Class { id: "sidecar.otlp", store: "telemetry.db", scope: "otlp_records, gemini_file_cursors", default_days: None, basis: "source_of_truth", destructive: true,
         action: Action::Retain, age_from: "observed_unix_ms", requires: "kept: exporters may not replay; included in full sidecar backups" },
     Class { id: "secret.otlp_tokens", store: "<config_dir>/otlp-<project-digest>.token", scope: "per-project bearer tokens", default_days: None, basis: "source_of_truth", destructive: true,

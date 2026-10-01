@@ -717,3 +717,146 @@ fn candidate_verdict(db: &rusqlite::Connection, task: &str, candidate: &str, pol
             VALUES(?1,?1,?2,?3,?3,'sha1',?4,?4,'linux-unshare-user-pid-mount-v1',0,?5)", rusqlite::params![run, submission, OID, digest, at]).unwrap();
     }
 }
+
+/// Public sidecar producer API plus CLI queries/revisions/export over real
+/// canonical acceptances. Endpoints are independent hand-computed facts.
+#[test]
+fn operating_throughput_clips_intervals_and_preserves_revisions() {
+    use herdr_projects::telemetry::operating;
+    let p = Planted::new();
+    worked_example(&p);
+    let canonical = p.state_bytes();
+    // [1000,2000) + [2500,3000): 1500 ms, two acceptances (2000,2600).
+    operating::observe(&p.project,"run-a",true,1,1000,1000).unwrap();
+    operating::observe(&p.project,"run-a",true,1,2000,1000).unwrap();
+    operating::observe(&p.project,"run-a",false,2,2100,1000).unwrap();
+    operating::observe(&p.project,"run-a",true,3,2500,1000).unwrap();
+    operating::observe(&p.project,"run-a",true,3,3000,1000).unwrap();
+    let args = ["--metric","M03","--from","1000","--to","3000"];
+    let m = p.query(&args);
+    assert_eq!((&m["numerator"],&m["operating_ms"],&m["denominator"],&m["value"]),
+        (&json!(2),&json!(1500),&json!("1500/3600000"),&json!("7200000/1500")));
+    assert_eq!(m["coverage"]["state"],"partial");
+    assert_eq!(m["coverage"]["reasons"]["observation_gaps"],2);
+    assert_eq!(m["censored"]["open_intervals"],0,"bounded endpoint has no extrapolated tail");
+    let clipped = p.query(&["--metric","M03","--from","1500","--to","2600"]);
+    assert_eq!((&clipped["numerator"],&clipped["operating_ms"],&clipped["value"]),(&json!(1),&json!(600),&json!("3600000/600")));
+    let zero = p.query(&["--metric","M03","--from","2100","--to","2500"]);
+    assert_eq!((&zero["value"],&zero["reason"]),(&Value::Null,&json!("zero_operating_hours")));
+    assert!(p.fail(&["compare","--metric","M03","--json"]).contains("comparison_unsupported"));
+    assert_eq!(p.query(&["--metric","M03","--by","task_class"])["reason"],"dimension_unsupported");
+    p.json(&["analytics","refresh","--metric","M03","--from","1000","--to","3000"]);
+    let recorded = p.query(&["--metric","M03","--from","1000","--to","3000","--as-of-seq","1000000"]);
+    let revision = recorded["projection"]["revision"].as_i64().unwrap().to_string();
+    let pinned = p.query(&["--metric","M03","--from","1000","--to","3000","--as-of-seq",&revision]);
+    // Restart opens a new interval; a >3-cadence outage never fills wall time.
+    operating::observe(&p.project,"run-b",true,3,3500,1000).unwrap();
+    operating::observe(&p.project,"run-b",true,3,4000,1000).unwrap();
+    operating::observe(&p.project,"run-b",true,3,8000,1000).unwrap();
+    let db = herdr_projects::telemetry::sidecar::open(&p.project,false).unwrap().unwrap();
+    assert_eq!(db.query_row("SELECT count(*) FROM operating_intervals",[],|r|r.get::<_,i64>(0)).unwrap(),4);
+    assert_eq!(db.query_row("SELECT sum(end_unix_ms-start_unix_ms) FROM operating_intervals",[],|r|r.get::<_,i64>(0)).unwrap(),2000);
+    drop(db);
+    let live = p.query(&["--metric","M03"]);
+    assert_eq!((&live["operating_ms"],&live["value"],&live["censored"]["open_intervals"]),(&json!(2000),&json!("7200000/2000"),&json!(1)));
+    assert_eq!(p.json(&["report","--json"])["metrics"]["M03"]["value"],live["value"]);
+    assert_eq!(canonical,p.state_bytes());
+    p.json(&["analytics","refresh","--metric","M03","--from","1000","--to","9000"]);
+    p.json(&["analytics","refresh","--metric","M13"]); // maintain the central report body
+    let future=p.query(&["--metric","M03","--from","1000","--to","9000","--as-of-seq","1000000"]);
+    let future_revision=future["projection"]["revision"].as_i64().unwrap().to_string();
+    operating::observe(&p.project,"run-b",true,3,9000,1000).unwrap();
+    assert_eq!(p.json(&["report","--json"])["metrics"]["M03"]["value"],"7200000/3000","a maintained central report must read fresh operating endpoints before refresh");
+    p.json(&["analytics","refresh","--metric","M03","--from","1000","--to","9000"]);
+    assert_eq!(p.query(&["--metric","M03","--from","1000","--to","9000"])["value"],"7200000/3000","sidecar-only observations invalidate tracked M03");
+    let old_future=p.query(&["--metric","M03","--from","1000","--to","9000","--as-of-seq",&future_revision]);
+    assert_eq!(old_future["value"],"7200000/2000");
+    assert_eq!(old_future["projection"]["content_digest"],future["projection"]["content_digest"]);
+    let db = p.db();
+    integrate(&db,"t3",2700); // late authoritative evidence in the pinned window
+    db.execute_batch("INSERT INTO task_contracts(task_id,contract_revision,project_store,expected_head,repository,base_oid,object_format,route,raw_bytes,raw_digest,installed_seq) SELECT task_id,2,project_store,expected_head,repository,base_oid,object_format,route,raw_bytes,raw_digest,installed_seq FROM task_contracts WHERE task_id='t1';").unwrap();
+    let later_submission=hex("later-t1-submission");
+    let later_result=hex("later-t1-result");
+    db.execute("INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,artifact_manifest,claimed_checks,created_unix_ms)
+        SELECT ?1,project_store,?1,payload_digest,payload,task_id,2,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,artifact_manifest,claimed_checks,2790 FROM result_submissions WHERE task_id='t1'",[&later_submission]).unwrap();
+    db.execute("INSERT INTO verified_results(result_id,run_id,submission_id,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,created_unix_ms)
+        SELECT ?1,?1,?2,commit_oid,tree_oid,object_format,policy_digest,receipt_digest,isolation,memory_fence,2800 FROM verified_results WHERE submission_id IN (SELECT submission_id FROM result_submissions WHERE task_id='t1')",
+        rusqlite::params![later_result,later_submission]).unwrap();
+    drop(db);
+    let canonical = p.state_bytes();
+    assert_eq!(p.query(&["--metric","M03","--from","2000","--to","2100"])["numerator"],1,"correction preserves original acceptance occurrence");
+    assert_eq!(p.query(&["--metric","M03","--from","2800","--to","3000"])["numerator"],0,"correction is not new work");
+    p.json(&["analytics","refresh","--metric","M03","--from","1000","--to","3000"]);
+    assert_eq!(p.query(&args)["value"],"10800000/1500");
+    let old = p.query(&["--metric","M03","--from","1000","--to","3000","--as-of-seq",&revision]);
+    for key in ["value","coverage","detail","source_watermarks"] { assert_eq!(old[key],pinned[key],"pinned {key}"); }
+    assert_eq!(old["projection"]["content_digest"],pinned["projection"]["content_digest"]);
+    assert_eq!(p.query(&["--metric","M03","--from","1000","--to","3000","--as-of-seq",&revision])["value"],pinned["value"]);
+    let rebuild = p.json(&["analytics","rebuild","--verify"]);
+    assert_eq!(rebuild["identical"],true,"{rebuild}");
+    let export = String::from_utf8(p.raw(&["export","--metric","M03","--from","1000","--to","3000","--as-of-seq",&revision])).unwrap();
+    assert!(export.contains("7200000/1500"),"{export}");
+    assert_eq!(canonical,p.state_bytes());
+}
+
+/// Actual foreground ticker over an isolated empty canonical project. Three
+/// Active passes merge; public pause/resume splits, and a fresh process has a
+/// fresh interval. Assert cadence bounds, never an exact wall-clock duration.
+#[test]
+fn ticker_records_operating_passes_pause_resume_and_restart() {
+    use herdr_projects::domain::ProjectState;
+    use std::time::{Duration,Instant};
+    struct Ticker(std::process::Child);
+    impl Drop for Ticker { fn drop(&mut self) { let _=self.0.kill(); let _=self.0.wait(); } }
+    let p = Planted::new();
+    fs::write(p.project.join("PROJECT.md"),"operating time fixture").unwrap();
+    fs::write(p.project.join(".state/format.json"),"{}").unwrap();
+    let start = || Ticker(Command::new(BIN).env_clear().env("HOME",p.tmp.path().join("home")).env("PATH","/usr/bin:/bin")
+        .env("HERDR_BIN_PATH","/bin/false").env("HERDR_PROJECTS_TELEMETRY_COLLECT_SECS","0")
+        .args(["--root",p.root.to_str().unwrap(),"ticker","run"])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap());
+    let persisted = || -> Option<(i64,i64,i64,bool)> {
+        let db = rusqlite::Connection::open_with_flags(p.project.join(".state/telemetry.db"),rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+        db.query_row("SELECT (SELECT count(*) FROM operating_intervals),first_unix_ms,last_unix_ms,active FROM operating_clock WHERE singleton=1",[],
+            |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).ok()
+    };
+    let wait = |ticker: &mut Ticker, ready: &dyn Fn((i64,i64,i64,bool))->bool| {
+        let deadline=Instant::now()+Duration::from_secs(55);
+        loop {
+            if let Some(row)=persisted() && ready(row) {return row;}
+            assert!(Instant::now()<deadline && ticker.0.try_wait().unwrap().is_none(),"ticker observation timeout: {}",fs::read_to_string(p.root.join(".ticker.log")).unwrap_or_default());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let state = |state| {
+        let mut store=SqliteStore::open(&p.project.join(".state/state.db")).unwrap();
+        let head=store.read_snapshot(None).unwrap().head;
+        let revision=store.project_control().unwrap().unwrap().revision;
+        store.set_project_state(head,revision,state,jiff::Timestamp::now().as_millisecond(),None).unwrap();
+    };
+    state(ProjectState::Active);
+    let mut ticker=start();
+    let (_,first,_,_)=wait(&mut ticker,&|row|row.0==1);
+    let (_,_,third,_)=wait(&mut ticker,&|row|row.2-first>=29_000);
+    assert!((29_000..=45_000).contains(&(third-first)),"three pass cadence: {}",third-first);
+    state(ProjectState::Paused);
+    wait(&mut ticker,&|row|!row.3);
+    let db=rusqlite::Connection::open(p.project.join(".state/telemetry.db")).unwrap();
+    let duration:i64=db.query_row("SELECT sum(end_unix_ms-start_unix_ms) FROM operating_intervals",[],|r|r.get(0)).unwrap();
+    assert!((29_000..=45_000).contains(&duration));
+    drop(db);
+    state(ProjectState::Active);
+    wait(&mut ticker,&|row|row.0==2 && row.3);
+    fs::write(p.root.join(".ticker.stop"),b"").unwrap();
+    assert!(ticker.0.wait().unwrap().success());
+    fs::remove_file(p.root.join(".ticker.stop")).unwrap();
+    let mut restarted=start();
+    wait(&mut restarted,&|row|row.0==3);
+    fs::write(p.root.join(".ticker.stop"),b"").unwrap();
+    assert!(restarted.0.wait().unwrap().success());
+    let db=rusqlite::Connection::open(p.project.join(".state/telemetry.db")).unwrap();
+    assert_eq!(db.query_row("SELECT count(DISTINCT session) FROM operating_intervals",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+    assert_eq!(db.query_row("SELECT count(*) FROM operating_intervals WHERE close_reason='open'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    let after:i64=db.query_row("SELECT sum(end_unix_ms-start_unix_ms) FROM operating_intervals",[],|r|r.get(0)).unwrap();
+    assert!(after>=duration && after<=duration+16_000,"stop/restart never extrapolates a tail: {duration} -> {after}");
+}

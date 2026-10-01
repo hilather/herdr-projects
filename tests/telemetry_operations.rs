@@ -125,6 +125,7 @@ fn retention_classes_are_declared_with_doc09_defaults() {
     assert_eq!(row("sidecar.attention_samples"), (json!(90), "prune".into(), "source_of_truth".into(), true));
     assert_eq!(row("sidecar.health_evaluations"), (json!(90), "prune".into(), "derivable".into(), false));
     assert_eq!(row("sidecar.analytics_revisions"), (json!(365), "prune".into(), "derivable".into(), false));
+    assert_eq!(row("sidecar.operating_intervals"), (Value::Null, "retain".into(), "source_of_truth".into(), true));
     assert_eq!(row("sidecar.accounting_imports"), (Value::Null, "retain".into(), "source_of_truth".into(), true));
     assert_eq!(row("sidecar.valuation_history"), (Value::Null, "retain".into(), "source_of_truth".into(), true));
     assert_eq!(row("ops.tombstones"), (json!(400), "listed_not_pruned".into(), "source_of_truth".into(), true));
@@ -426,6 +427,9 @@ fn backup_restore_reapplies_tombstones_and_never_writes_canonical_state() {
     // Without any deletion, a restore keeps every native identity: collecting
     // again dedupes, nothing is new usage and nothing is quarantined.
     let g = collected();
+    let observed = unix_ms();
+    herdr_projects::telemetry::operating::observe(&g.project,"backup-run",true,1,observed-1000,1000).unwrap();
+    herdr_projects::telemetry::operating::observe(&g.project,"backup-run",true,1,observed,1000).unwrap();
     let before = g.report();
     let out = g.tmp.path().join("backup-2");
     json_of(&g, &["backup", "create", "--out", out.to_str().unwrap()]);
@@ -433,6 +437,9 @@ fn backup_restore_reapplies_tombstones_and_never_writes_canonical_state() {
     let report = json_of(&g, &["backup", "restore", "--from", out.to_str().unwrap()]);
     assert_eq!((report["rows"]["codex_usage"].clone(), report["orphans"].clone()), (json!(2), json!(0)));
     assert_eq!(g.usage(), usage);
+    assert_eq!(report["rows"]["operating_intervals"],1);
+    assert_eq!(report["rows"]["operating_clock"],1);
+    assert_eq!(g.report()["metrics"]["M03"],before["metrics"]["M03"],"durable operating facts survive restore");
     let (again, _) = g.cli("collect");
     assert_eq!((again["collected"]["records"].clone(), g.count("codex_quarantine")), (json!(0), 0));
     assert_eq!(again["attempts"][0]["usage"], json!({"input_tokens": 1500, "cached_input_tokens": 500, "cache_write_input_tokens": 0,

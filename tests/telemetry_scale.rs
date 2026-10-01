@@ -1804,3 +1804,47 @@ fn scale_9_analytics_refresh() {
     assert!(violations.is_empty(), "{violations:?}");
     assert_eq!(canonical_digest(&d), canonical);
 }
+
+/// DG3 produced-signal scale sample, separate from the unchanged load oracle.
+/// Seed one observed interval spanning the generator's accepted transitions,
+/// then measure real CLI query/report/refresh with a hand-computed tasks/hour.
+#[test]
+#[ignore = "100k M03 operating observations; on-disk SCALE_DATA required"]
+fn scale_10_operating_throughput() {
+    let dir=data_dir();
+    let d=Dataset::load(&dir);
+    let canonical=canonical_digest(&d);
+    let load0=load_average();
+    let from=d.producers.proxies.iter().map(|p|p.at).min().unwrap()-1000;
+    // Generator receipts occur 1000 ms after each proxy's timestamp.
+    let to=d.producers.proxies.iter().map(|p|p.at).max().unwrap()+2000;
+    let operating_ms=to-from;
+    telemetry::operating::observe(&d.project,"dg3-scale-fixture",true,1,from,operating_ms).unwrap();
+    telemetry::operating::observe(&d.project,"dg3-scale-fixture",true,1,to,operating_ms).unwrap();
+    let expected=format!("{}/{}",d.producers.proxies.len() as i128*3_600_000,i128::from(operating_ms));
+    let (from,to)=(from.to_string(),to.to_string());
+    let mut queries=Vec::new();
+    let mut reports=Vec::new();
+    let mut refreshes=Vec::new();
+    for _ in 0..env_usize("SCALE_REPEATS",3) {
+        let query=telemetry(&d,&["query","--metric","M03","--from",&from,"--to",&to,"--json"]).ok();
+        let body=query.json();
+        let m=&body["results"][0];
+        assert_eq!(m["value"],expected);
+        assert_eq!(m["numerator"],d.producers.proxies.len());
+        assert_eq!(m["operating_ms"],operating_ms);
+        assert_eq!(m["coverage"]["state"],"complete");
+        queries.push(query.wall_ms);
+        let report=telemetry(&d,&["report","--json"]).ok();
+        assert_eq!(report.json()["metrics"]["M03"]["value"],expected);
+        reports.push(report.wall_ms);
+        refreshes.push(telemetry(&d,&["analytics","refresh","--metric","M03","--from",&from,"--to",&to]).ok().wall_ms);
+    }
+    assert_eq!(telemetry(&d,&["analytics","rebuild","--verify"]).ok().json()["identical"],true);
+    let violations=usage_gates(&d);
+    write_results(&dir,"operating-throughput",&json!({"scale":d.scale,"query_ms":dist(&queries),"report_ms":dist(&reports),"refresh_ms":dist(&refreshes),
+        "accepted":d.producers.proxies.len(),"operating_ms":operating_ms,"expected":expected,"loadavg_start":load0,"loadavg_end":load_average(),
+        "violations":violations,"canonical_unchanged":canonical==canonical_digest(&d)}));
+    assert!(violations.is_empty(),"{violations:?}");
+    assert_eq!(canonical,canonical_digest(&d));
+}

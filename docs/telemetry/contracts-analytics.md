@@ -30,7 +30,7 @@ Native definitions added by TM4.1 (the certified `slice-v1` ones stay
 servable by name): `M01.cohort-v1` accepted tasks, `M02.cohort-v1`
 acceptance rate, `M06.cohort-v1` lead-time p95 (nearest rank, ms, accepted
 tasks with both times; failed/open counted, never given a time),
-`M07.cohort-v1` attempt amplification. Absent producers: M03, M05, M10, M19.
+`M07.cohort-v1` attempt amplification. Absent producers: M05, M10, M19.
 M49 (`M49.v1`, central provider) is produced by the replay suite ([contracts-replay.md](contracts-replay.md)).
 `M07.cohort-v1` attempt amplification. Absent producers: M03, M05, M19,
 M30. M49 (`M49.v1`, central provider) is produced by the replay suite ([contracts-replay.md](contracts-replay.md)).
@@ -121,7 +121,7 @@ Plan doc 07 §1. `T`/`A` evidence is exactly contracts §6 (`metrics::task_evide
   `excluded.replay_candidate`, shown when non-zero). The central report's
   M02 `excluded` and M07 `excluded` carry `replay_candidate` always, and its
   `tasks` summary counts them as `replay_candidates` outside `T`.
-- **`activity_window`**: events in the window; lane definitions only
+- **`activity_window`**: events in the window; native M03/M30 and lane definitions
   (`since_only`: `--from` is the lane's `--since`).
 - Dimensions for native definitions: `route`, `task_class` (latest
   classification, else `unclassified`), `agent_kind` (the attempts' effective
@@ -172,6 +172,52 @@ use canonical indexes. Reports reuse central task evidence and maintain the
 M30 body in the validated central-provider aggregate; stale or missing bodies
 fall back to the identical evaluator without a second rich lifecycle load.
 
+
+### DG3: observed accepted throughput (M03)
+
+Registry v4 adds `M03.operating-v1`; historical absent `M03.v1` remains
+servable. Unique authoritative task acceptances are placed by their first
+acceptance evidence time in `[from,to)`; retries and additional receipts never
+count again, and replay candidates remain excluded. Query, report, export and
+aggregate revisions share this evaluator. Configuration comparison remains
+`comparison_unsupported`: the project operating denominator cannot be
+attributed to configuration arms from available observations.
+
+Sidecar stream `operating` version 1 stores `operating_intervals`,
+`operating_clock` and `operating_gaps`. The ticker telemetry worker observes
+canonical Active/paused state and control epoch on each available ticker pass
+(nominal 15 seconds), before expensive collection. It also observes paused
+projects and runs with collection disabled. Adjacent Active observations from
+the same run/control epoch extend one `[start,end)` interval. A gap longer
+than **N=3** nominal passes closes at the last observed endpoint; restart,
+control-epoch changes and pause/resume split intervals. No failed/missed pass
+is extrapolated. Short pause/resume between observations changes the canonical
+control epoch and therefore breaks continuity too. State reads and all sidecar
+writes run on the telemetry thread, never the controller. A busy worker misses
+a sample instead of creating an unbounded queue; the next observation detects
+the gap. Crash/stop tails remain censored. No post-stop wall time is counted.
+
+M03 unions and clips recorded endpoints to the window, counts acceptance
+transitions independently (including those in observation gaps), and returns
+the exact unreduced rational `accepted * 3600000 / operating_ms` tasks/hour.
+`denominator` is the rational operating hours `operating_ms/3600000`.
+Zero hours return null / `zero_operating_hours`; no observations return null /
+`operating_hours_not_recorded`. Missing acceptance times, recorded gaps,
+windows extending before/after observations, and unbounded tails make coverage
+partial, with explicit reasons and `censored.open_intervals`; none become
+complete by dropping unobserved time. No categorical dimension or denominator
+drill-down is available. M03 watermarks include the sidecar; mutation frontiers
+invalidate its revisions on interval/gap/clock changes. Reports read fresh M03
+separately from the maintained central body, whose other metrics do not depend
+on operating observations; ticker heartbeats do not invalidate M13/M40 caches.
+Fixed windows are
+reproducible; as-of reads use immutable revision bodies.
+
+Retention class `sidecar.operating_intervals` retains all three tables without
+a TTL: they are durable source facts that native rollouts cannot reproduce.
+Full sidecar backups include them, with table row counts in the inventory.
+Restores retain those observations; a new ticker run records restart coverage
+rather than extending a restored open tail.
 
 ## 4. Aggregate revisions (stream `analytics`, version 3)
 ## 4. Aggregate revisions (stream `analytics`, version 4)

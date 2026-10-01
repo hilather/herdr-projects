@@ -316,6 +316,11 @@ fn lane_core(body: Value) -> Value {
 /// Evaluate one cell live: `(core, lineage)`. Deterministic in the sources.
 pub fn evaluate(sources: &mut Sources, cell: &Cell) -> Result<(Value, Lineage)> {
     if let Some((reason, diagnostic)) = cell.unsupported() { return Ok((unavailable_core(reason, diagnostic), Lineage::new())); }
+    if cell.metric.id == "M03" {
+        let mut core=crate::telemetry::operating::evaluate(sources.project,cell.from,cell.to)?;
+        core["detail"]=core.clone();
+        return Ok((core,Lineage::new()));
+    }
     match cell.version.provider {
         Provider::Native => {
             sources.load_tasks()?;
@@ -413,7 +418,7 @@ fn envelope(cell: &Cell, core: Value, projection: Value, watermarks: &Value, obs
         "projection": projection, "observation_cutoff_unix_ms": observation_cutoff});
     if let (Value::Object(out), Value::Object(core)) = (&mut out, core) { for (k, v) in core { out.entry(k).or_insert(v); } }
     let sidecar = &watermarks["sidecar"];
-    out["source_watermarks"] = if native { json!({"canonical": watermarks["canonical"]}) } else { watermarks.clone() };
+    out["source_watermarks"] = if native && cell.metric.id != "M03" { json!({"canonical": watermarks["canonical"]}) } else { watermarks.clone() };
     let (lag, lag_reason) = if native { (json!(0), Value::Null) } else {
         match sidecar["last_collect_unix_ms"].as_i64() {
             Some(at) => (json!(observation_cutoff - at), Value::Null),
@@ -540,6 +545,9 @@ struct Auth<'a> { keys: &'a Keyring, project: String, now: i64 }
 #[allow(clippy::too_many_arguments)]
 fn drill_page(db: Option<&rusqlite::Connection>, cell: &Cell, result: &Value, source: std::result::Result<(Lineage, String, Option<i64>), i64>, bucket: &str,
     request: &Request, request_digest: &str, auth: &Auth) -> Result<Value> {
+    if cell.metric.id == "M03" {
+        return Ok(json!({"status": "unavailable", "reason": "drill_unsupported", "detail": "project operating hours have no task denominator lineage"}));
+    }
     if cell.version.provider != Provider::Native || result["status"] == "unavailable" {
         return Ok(json!({"status": "unavailable", "reason": "drill_unsupported", "detail": "lane metrics drill down through their lane's ledger commands"}));
     }

@@ -50,6 +50,7 @@ column named in `age_from`).
 | Class | Store | Default | Basis | Action |
 | --- | --- | --- | --- | --- |
 | `sidecar.normalized_sessions` | `telemetry.db`, per native session: `claude_messages`, `claude_tool_results`, `opencode_messages`, `opencode_tools`, `codex_*`, `rollout_*`, `collect_offsets`, `codex_tool_sources`, `source_bindings`, `source_observations`, `ingest_quarantine`, `coverage_gaps`, `source_cursors`, `usage_entries`, `usage_dispositions`, `model_segments`, `quota_window_observations`, `session_graph_nodes` | 90 d | derivable from the native rollout (tombstoned: never again) | prune, destructive |
+| `sidecar.operating_intervals` | `operating_intervals`, `operating_clock`, `operating_gaps` | no TTL | source of truth (ticker observations) | retain; full sidecar backup |
 | `sidecar.attention_samples` | `attention_samples` | 90 d | source of truth (sampled live, R4) | prune, destructive |
 | `sidecar.health_evaluations` | `health_evaluations` | 90 d | derivable | prune |
 | `sidecar.analytics_revisions` | superseded `analytics_revisions`, their `analytics_lineage` and `analytics_workspace_metrics`; `analytics_workspace_comparisons` outside the window (latest kept) | 365 d | derivable | prune (the current revision of every cell is kept) |
@@ -114,6 +115,7 @@ may only be shortened.
 ```text
 $ herdr-projects telemetry demo maintenance classes
 retention.v1
+sidecar.operating_intervals retain - source_of_truth destructive
 sidecar.otlp retain - source_of_truth destructive
 secret.otlp_tokens external_lifecycle - source_of_truth destructive
 sidecar.normalized_sessions prune 90d derivable_from_native_source destructive
@@ -324,6 +326,7 @@ $ herdr-projects telemetry demo backup create --out <tmp>/backup-2026-09-30
     "codex": <version>,
     "health": <version>,
     "ingest": <version>,
+    "operating": <version>,
     "otlp": <version>,
     "policies": <version>,
     "quality": <version>
@@ -415,6 +418,9 @@ $ herdr-projects telemetry demo backup restore --from <tmp>/backup-2026-09-30
     "health_evaluations": 0,
     "opencode_messages": 0,
     "opencode_tools": 0,
+    "operating_clock": 0,
+    "operating_gaps": 0,
+    "operating_intervals": 0,
     "otlp_records": 0,
     "provider_charges": 0,
     "rate_cards": 0,
@@ -428,6 +434,7 @@ $ herdr-projects telemetry demo backup restore --from <tmp>/backup-2026-09-30
     "codex": <version>,
     "health": <version>,
     "ingest": <version>,
+    "operating": <version>,
     "otlp": <version>,
     "policies": <version>,
     "quality": <version>

@@ -61,6 +61,9 @@ pub(crate) fn central(project: &Path, since: Option<i64>) -> Result<(BTreeMap<St
                     let replay = replay_tasks(&state)?;
                     metrics.insert("M30".to_owned(), super::analytics::lifecycle::first_candidate_report(&state, &evidence, &replay, since)?);
                 }
+                // Operating facts change every ticker pass. Read M03 separately
+                // so they neither stale this body nor invalidate M13/M40 caches.
+                metrics.insert("M03".to_owned(),super::operating::evaluate(project,since,None)?);
                 return Ok((metrics, tasks));
             }
         }
@@ -94,6 +97,7 @@ pub(crate) fn central_uncached(project: &Path, since: Option<i64>, aggregates: b
     }
     let cohort: Vec<&Attempt> = attempts.iter().filter(|a| terminal.contains(a.task.as_str())).collect();
     let mut metrics = BTreeMap::new();
+    metrics.insert("M03", super::operating::evaluate_evidence(project,&tasks,&replay,since,None)?);
     if first_candidates { metrics.insert("M30", super::analytics::lifecycle::first_candidate_report(&db, &tasks, &replay, since)?); }
     metrics.insert("M02", ratio("M02", accepted, terminal.len(), json!({"excluded": {"open": open, "outside_window": outside, "replay_candidate": replayed}})));
     metrics.insert("M07", ratio("M07", cohort.len(), accepted, json!({"attempts_without_decision": cohort.iter().filter(|a| a.decided.is_none()).count(),

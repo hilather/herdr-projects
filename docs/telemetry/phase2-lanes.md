@@ -368,6 +368,11 @@ Cards (gaps that stop those questions being answered):
 - **DG3 M03 accepted throughput** lacks operating hours
   (`operating_hours_not_recorded`). Record the ticker's active intervals per
   project (it already publishes pass metrics) as the denominator.
+- **DG3 M03 accepted throughput — done.** Registry v4 `M03.operating-v1`
+  uses durable ticker-observed Active intervals in operating stream 1. Query,
+  report, export and revisions share exact tasks/hour; pauses, restarts, gaps
+  and censored tails remain explicit. Configuration comparisons are unsupported
+  because project hours have no arm attribution. See contracts-analytics.md DG3.
 - **DG4 Harness coverage (owner decision, 2026-09-30).** "Codex only"
   governs our build and test work, not product scope. The telemetry must
   support all the common agent harnesses. Approach: a generic OTLP receiver

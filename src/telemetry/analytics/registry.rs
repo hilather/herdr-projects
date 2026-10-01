@@ -157,7 +157,7 @@ pub const METRICS: &[Metric] = &[
     m!("M01", "accepted_tasks", Lifecycle, "tasks", [native("M01.cohort-v1", TA, "task_terminal_time")], "fixture", QUERY, None),
     m!("M02", "task_acceptance_rate", Lifecycle, "ratio", [native("M02.cohort-v1", TA, "task_terminal_time"),
         central("M02.slice-v1", T, "attempt_decided_at_or_after_since")], "certified-fixture", CORE, None),
-    m!("M03", "accepted_throughput", Lifecycle, "tasks_per_hour", [absent("M03.v1", A, "operating_hours_not_recorded")], "absent", "no producer", None),
+    m!("M03", "accepted_throughput", Lifecycle, "tasks_per_hour", [Version { dimensions: &[], ..native("M03.operating-v1", A, "task_acceptance_time_and_observed_operating_intervals") }, absent("M03.v1", A, "operating_hours_not_recorded")], "fixture", "tests/telemetry_query.rs (DG3)", Some("project operating time; observation gaps and open tails are censored")),
     m!("M04", "cost_per_accepted_task", Cost, "currency_per_task", [lane("accounting", "M04.cost-v1", T, "attempt_decided_at_or_after_since")], "certified-fixture", CORE, Some("R1 fixture-only rate cards; R5 shadow budget")),
     m!("M05", "tokens_per_accepted_task", Lifecycle, "tokens_per_task", [absent("M05.v1", T, "no_producer")], "absent", "no producer", None),
     m!("M06", "task_lead_time_p95", Lifecycle, "milliseconds", [native("M06.cohort-v1", T, "task_terminal_time")], "fixture", QUERY, None),

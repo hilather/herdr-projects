@@ -1977,6 +1977,110 @@ Benchmark data is removed before commit. Files: `src/telemetry/sidecar.rs`,
 `migrations/telemetry/accounting/repair_compact_capture.sql`,
 `tests/telemetry_accounting.rs`, and this certificate.
 
+### 4.16 DG3: observed operating hours and M03 (100k only)
+
+Branch `telemetry/dg3-m03`, base `663e7aa`, 2026-10-01. This addresses the
+operating-hours producer gap in L7. **Pending the steward's serial 1M
+certification.** No 1M run, live agent, provider, owner data directory or running
+Herdr service was used. Registry v4 adds `M03.operating-v1`; operating stream 1
+retains interval/clock/gap source facts and includes them in backup inventories.
+
+The telemetry worker observes every canonical project on each available ticker
+pass (nominal 15 s), including paused projects and when collection is disabled.
+Consecutive Active endpoints in one run/control epoch merge. Pause/resume,
+restart or a gap longer than **N=3** passes closes the previous prefix; open
+tails are censored and never extrapolated. M03 clips and unions integer-ms
+intervals and counts each currently authoritative task once at its original
+acceptance time. Later receipts/corrections are not new work. The exact ratio
+is `accepted * 3600000 / operating_ms`; zero or unknown hours remain null with
+a reason. Reports use fresh M03 separately from maintained central bodies so
+operating heartbeats neither stale M03 nor invalidate M13/M40 caches.
+Configuration comparisons remain unsupported because project hours have no
+observed attribution to configuration arms.
+
+**Reproduction and scope.** Built before and after with
+`cargo test --release --locked --offline -j 3 --features state-store --test telemetry_scale --no-run`.
+One deterministic disk-backed dataset lived entirely under `$PWD/bench-data/`
+(including `TMPDIR=$PWD/bench-data/tmp`), with `SCALE_EVENTS=100000`,
+`SCALE_ACTIVE=64`, `SCALE_REPEATS=3`, `SCALE_PER_ROUND=1`, seed 5100 and 10,000
+canonical tasks. Generate and ingest ran once: 106,517 observations, 58,084,538
+logical fixture bytes (53,725,168 rollout bytes). Preserved pre-change binaries
+and rebuilt post-change binaries ran `scale_2_queries` then
+`scale_9_analytics_refresh` serially with `SCALE_TAG=dg3-before|dg3-after`.
+Post-change migration/cache warming occurred outside timed samples; canonical
+rows and rollouts stayed identical. These paired measurements deliberately
+precede adding operating observations, so they measure compatibility and
+no-observation overhead, not an M03 speedup. One bench process ran at a time;
+cargo builds and other tests did not overlap measurement.
+
+| Surface, ms (p50 / p95) | Before | After |
+| --- | ---: | ---: |
+| Report | 438.64 / 466.51 | 310.35 / 403.28 |
+| M02 terminal cohort | 464.83 / 560.60 | 345.33 / 383.07 |
+| M08 lane usage | 57.95 / 59.70 | 30.40 / 45.42 |
+| M13 coverage | 77.33 / 127.77 | 51.26 / 62.63 |
+| Pane, in process | 111.12 / 139.26 | 85.47 / 128.78 |
+| Digest section, in process | 86.62 / 90.20 | 68.76 / 85.25 |
+| Analytics refresh | 915.78 / 1030.92 | 970.30 / 986.76 |
+
+All four results files quote these load averages (1 / 5 / 15 minutes):
+
+| Phase | Start | End |
+| --- | --- | --- |
+| Queries before | 6.49 / 6.96 / 5.45 | 6.79 / 6.95 / 5.51 |
+| Queries after | 5.06 / 5.89 / 6.71 | 4.86 / 5.75 / 6.63 |
+| Refresh before | 7.45 / 7.11 / 5.61 | 7.45 / 7.11 / 5.61 |
+| Refresh after | 4.74 / 5.69 / 6.60 | 4.76 / 5.68 / 6.59 |
+
+Refresh peak RSS was 80,320 → 79,240 KiB; both phases had
+zero usage-gate violations and unchanged canonical digests. The after query
+run had lower short-term load, so faster surface samples are not evidence of
+a causal speedup. Refresh p50 increased while p95 decreased. At 100k, after
+M02/report p95s are below doc 10's provisional 500 ms aggregate target, and
+pane/digest are below their 250/100 ms targets. This is three samples, not
+doc 10's five repeated load runs or authoritative 1M evidence; existing L3/L4
+remain open. The M03 change does not claim to fix those costs.
+
+**Produced operating signal.** After the paired run,
+`scale_10_operating_throughput` uses the public producer API to plant a single
+observed interval spanning the fixture's accepted transitions, then runs real
+CLI query/report/refresh three times and verifies the hand-computed M03.
+This is a produced-signal scale sample, not a live ticker capacity certificate.
+The real isolated ticker E2E separately checks three observed passes within
+29–45 s, pause/resume splitting, and a second process opening a new interval;
+assertions use cadence bounds rather than exact wall-clock durations.
+
+The fixture has 5,942 unique accepted tasks and 2,574,895,800 observed ms
+(one interval); the exact result is `21391200000/2574895800` tasks/hour.
+All three bounded queries returned complete coverage and that exact value;
+unbounded reports returned the same value with a censored tail. Query p50/p95
+was 83.55/86.78 ms, report 342.86/343.34 ms, and M03 refresh
+996.41/1427.07 ms. Load start/end (1 / 5 / 15 min) was
+`5.12 / 5.71 / 6.59` / `5.19 / 5.70 / 6.58`. Full tracked-cell
+`analytics rebuild --verify` was identical, usage violations were zero and the
+canonical digest remained unchanged. This fixture duration is planted source
+evidence, not a measurement of actual elapsed ticker running time.
+
+**Correctness.** The unchanged `scale_gates_hold_under_load` passes: exact
+accounting totals, one acceptance per record, reproducible as-of answers,
+byte-identical rebuilds and untouched canonical digest. New E2E workflows use
+CLI/public store/producer APIs for clipping, zero hours, outages, restart,
+correction deduplication, sidecar-only restatement, fresh reports, old pinned
+values/coverage/watermarks/digests, exports, retention and backup/restore.
+The requested 15 suites returned 182 passed, 13 ignored and four sandbox-only
+socket failures (`attempts_show_attention_summary`,
+`attention_intervals_union_and_censor`,
+`recommendations_and_notices_change_no_canonical_state_and_no_dispatch`,
+`thread_start_records_the_dispatch_reason_and_the_sidebar_suffix`): each failed
+at Unix socket bind with `Operation not permitted`. After narrowing cache
+dependencies, query/operations/scale passed again (30 passed, 13 ignored).
+An initial load-gate writer encountered transient SQLite `database is locked`;
+the unchanged gate passed on subsequent focused and full runs, with no timeout
+or assertion relaxed. Clippy reported no warnings in changed lines (existing
+warnings elsewhere remain). Bench datasets and preserved binaries were removed
+before committing. L1–L6 and L8 remain unchanged; 100k samples on this shared
+host do not establish authoritative 1M performance.
+
 ## 5. Inefficiencies found and fixed
 
 The first measurement (same generator, same host) missed the query and
@@ -2212,7 +2316,7 @@ owner. None is hidden by loosening the target.
   Incremental page reclamation is enabled on new stores. Indefinitely retained
   valuation/latest history, active attempts and holds still prevent a universal
   growth bound. The original 1M result remains the last certified one.
-- **L7: workload gaps — addressed for produced signals at 100k by P6;
+- **L7: workload gaps — addressed for produced signals at 100k by P6 and DG3;
   pending the steward's 1M certification.** §2 declares the added 5,942 CI
   quality/proxy observations, 329 integration outcomes and 320 waiting-state
   samples with byte sizes. §4.6 records the same-dataset before/after surface
@@ -2223,7 +2327,11 @@ owner. None is hidden by loosening the target.
   round (light p95 9.33–9.52 s), while later rounds are 2.42–2.90 s;
   shared-worker pass latency remains an L2 performance limitation. The shared workstation remains noisy;
   the 100k query comparison is inconclusive for performance changes, and this
-  card makes no claim to fix L1–L6 or to certify live capacity.
+  card makes no claim to fix L1–L6 or to certify live capacity. DG3 adds durable
+  observed operating intervals and M03 in §4.16, with 100k paired surface costs
+  and a separate planted operating-signal sample. Report p95 was 466.51 →
+  403.28 ms; refresh p95 was 1030.92 → 986.76 ms (different shared-host
+  loads; no causal speedup claim). Its 1M certification is pending.
 - **L8: simulated capacity is not live capacity.** See the opening. Planted
   attempts and generated rollouts certify the telemetry path's behaviour at
   these volumes on this host, nothing about live workers or providers.
