@@ -1612,3 +1612,162 @@ steward must run these outside the sandbox. The requested
 `cargo clippy --locked --offline -j 3 --features state-store --all-targets`
 completed successfully with no warnings on changed lines (existing warnings
 elsewhere remain).
+## DG4d: OpenCode native SQLite sessions (fixture certification)
+
+### Installed-format evidence
+
+Read-only evidence is the installed Bun program
+`/home/brewerm/.local/share/mise/installs/opencode/latest/opencode`, extracted
+with `strings -n 8`; the embedded version declaration is `var n="1.18.34"`.
+No agent was invoked and no owner session/config directory was inspected.
+
+Embedded schema fragments (program field/type names only):
+
+```text
+AssistantMessage: role: Literal("assistant"), modelID, providerID,
+  time: Struct({created, completed: optional}), cost: Finite,
+  tokens: Struct({total: optional(Finite), input: Finite, output: Finite,
+    reasoning: Finite, cache: Struct({read: Finite, write: Finite})})
+Session.Message.Assistant: type: Literal("assistant"), model, content,
+  cost: Finite.pipe(optional), tokens: Struct({input, output, reasoning,
+    cache: Struct({read, write})}).pipe(optional), time: {created, completed}
+Session.Message.Assistant.Tool: type: Literal("tool"), id, name, state, time
+ToolState.Completed: status: Literal("completed")
+ToolState.Error: status: Literal("error"), error
+message: id primaryKey, session_id, time_created, time_updated, data: json
+part: id primaryKey, message_id, session_id, time_created, time_updated, data: json
+session_message: id primaryKey, session_id, type, seq, time_created, time_updated, data: json
+```
+
+The storage migration copies `storage/session/info/*.json` into
+`session/<project>/*.json`, `storage/session/message/<session>/*.json` into
+`message/<session>/*.json`, and `storage/session/part/<session>/<message>/*.json`
+into `part/<message>/*.json`. These are legacy migrations, not evidence of
+current writes. Current code selects `Path.data/opencode.db` for `latest`,
+`beta`, `prod`, or the disable-channel flag; other channels use
+`opencode-<channel>.db`, and `OPENCODE_DB` can override it. Current v1 writes
+strip `id,sessionID` into `message.data` and `id,messageID,sessionID` into
+`part.data`; the v2 projector writes `session_message` from an encoded
+`Session.Message`, stripping `id,type`. The adapter reads these SQLite
+projections, never the event log, auth tables or legacy directory trees.
+
+Normalization evidence: `V=K(Y-Z-J)` and
+`z={total:Q.usage.totalTokens,input:V,output:K(W-H),reasoning:H,cache:{read:Z,write:J}}`
+where `Y` is reported input, `Z` cache reads, `J` cache writes, `W` reported
+output and `H` reasoning. Thus native input is new input and native output
+is visible output. Normalized input adds cache read/write; normalized output
+adds reasoning. The reported native `tokens.total` is not summed separately.
+
+### Discovery, binding and allowlist
+
+Adapter `opencode`, interface `session_sqlite`, discovers only
+`<recorded execution_home>/.local/share/opencode/opencode.db` of canonical
+`opencode`-kind attempts. No worker kind is added; E2E plants retained attempt
+records without invoking an agent. There is no HOME/XDG/config override,
+channel DB discovery, symlink traversal or owner-home fallback. Source SQLite
+opens read-only/query-only with a consistent read transaction. Unknown table
+layouts fail instead of being guessed. Session identity is `opencode:<id>`;
+source identity hashes database path plus native session id. Exact binding
+uses the existing execution-home digest, recorded cwd/worktree attempt,
+decision-time and active/revoked/predates rules, with matching harness kind.
+Unmatched and early sessions stay unbound and never enter attempt totals.
+
+The allowlist is session/message/part ids, qualified version, session creation
+time, cwd for binding (home-redacted in storage), model/provider ids,
+input/output/reasoning/cache-read/cache-write counts, nonnegative finite
+reported numeric cost, message creation/completion times, tool names,
+recognized pending/running/completed/error status and its error boolean.
+Cost retains the reported number without currency inference or repricing.
+Error strings/objects, text, reasoning text, tool input/output/content,
+structured output, prompts, snapshots and file contents are never stored or
+hashed. Message and tool-part queries extract only allowlisted metadata in SQLite;
+Rust never receives the forbidden values. Original native assistant JSON
+length is bounded at 16 MiB and charged against the byte budget.
+No raw payloads are spooled or logged.
+
+Only completed assistant messages with integer completion timestamps contribute
+usage. Absent/fractional/negative/oversized token counts stay unknown. An
+unfinished message waits until its native completion is recorded. Per-message
+identity and source revisions allow incremental ingestion and idempotent replay;
+The first observation owns immutable message metadata/cost; the revision tracks
+the last examined native update. A changed usage payload at an existing ordinal enters existing quarantine,
+never an additional ledger charge. Parts can update independently of messages.
+Source reads share the CLI/tick byte budget; metadata commits with usage in
+one sidecar transaction per session. The ingest envelope sequence and legacy
+`source_cursors.byte_offset` represent message ordinals for this SQLite adapter,
+not claimed file byte positions. Message timestamps encode epoch milliseconds
+(the embedded `Finite.decodeTo(DateTimeUtc)` encoder calls `toEpochMillis`). Large rows exceeding the pass allowance
+wait for a larger allowance. Native v1 and v2 message ids share one namespace
+so the same message projected twice is counted once.
+
+### Storage, accounting and capabilities
+
+Ingest **0011** adds `opencode_messages` (identity, ordinal, native revision,
+model/provider, reported cost and times) and `opencode_tools` (message/part
+links, names, statuses/error flags and times). Both belong to
+`sidecar.normalized_sessions`, follow session retention/tombstones, and are
+included in full sidecar backups and backup row inventories. Accounting
+**0014** preserves the existing ledger while admitting source `opencode` and
+normalization `opencode-v1`; its derived ledger remains `follows_sources`.
+There is no canonical schema change. The legacy `codex_usage` table stores
+normalized usage, with adapter-qualified session and ledger identities.
+
+M08/M09 include exactly bound fixture-version usage; reasoning is measured
+for OpenCode. M16/M17 count distinct native tool parts and recognize only
+completed/error as terminal outcomes. Pending/running are pending calls,
+never successes. These semantics are fixture-certified; no approval decision,
+shell exit code, quota, currency, child binding or M18 duration is inferred.
+
+`collectors capabilities --json` accepts **1.18.34**, **fixture only**.
+Other versions retain metadata while counters are rejected as
+`cli_version_uncertified`. Every non-Codex adapter remains at most fixture,
+never live. Real-session certification remains a separate owner-gated step.
+
+### DG4a mapping and end-to-end coverage
+
+The binary includes `experimental.openTelemetry`, described as
+`Enable OpenTelemetry spans for AI SDK calls (using the 'experimental_telemetry' flag)`,
+and `experimental_telemetry:{isEnabled:...experimental?.openTelemetry,
+functionId:"session.llm",tracer,...}`. OTel dependencies and
+`OTEL_EXPORTER_OTLP_ENDPOINT/HEADERS` occur in the program. This establishes
+span support, not a certified log/metric exporter mapping. DG4a receives JSON
+logs/metrics and does not receive traces. OpenCode's DG4a mapping is **none**;
+no invented OTLP event-name fixture is provided.
+
+`tests/telemetry_opencode.rs` uses public collection, usage, accounting,
+capabilities, backup and maintenance CLI entry points on isolated synthetic
+SQLite projects; `tests/fixtures/telemetry/opencode/assistant.json` plants
+privacy canaries. Assertions cover literal token rows, cost, tool outcomes,
+completion/replay, unbound/early/uncertified sources, backup inventory,
+retention/tombstones and zero secret hits including sidecar WAL/SHM. Existing
+Claude/Codex suites and the non-Codex certification rule remain in place.
+
+### DG4d sandbox validation
+
+The required 19-suite telemetry invocation (`--locked --offline -j 3`,
+`TMPDIR=$PWD/target/tmp`, `--no-fail-fast`) completed: 187 passed, 13 failed,
+11 ignored. Five stale ingest-version assertions and the backup inventory
+transcript were updated for ingest 11/accounting 14 and the added tables;
+focused reruns passed **conformance 21/21** and **operations 13/13**.
+Final OpenCode coverage passed **4/4**, including changed-message quarantine
+and version recertification. `scale_gates_hold_under_load` saw a concurrent
+SQLite `database is locked` race in the broad run, then passed **1/1** when
+rerun alone. No lock-policy change was made for that transient failure.
+
+The six remaining failures are solely sandbox socket permission failures
+(`Operation not permitted`); the steward must run these outside the sandbox:
+
+| Suite | Test |
+|---|---|
+| `telemetry` | `attempts_show_attention_summary` |
+| `telemetry_accounting` | `attention_intervals_union_and_censor` |
+| `telemetry_health` | `recommendations_and_notices_change_no_canonical_state_and_no_dispatch` |
+| `telemetry_otlp` | `http_auth_limits_malformed_and_replay` |
+| `telemetry_otlp` | `http_request_rate_is_bounded` |
+| `telemetry_workspace` | `thread_start_records_the_dispatch_reason_and_the_sidebar_suffix` |
+
+The requested `cargo clippy --locked --offline -j 3 --features state-store
+--all-targets` completed successfully. Existing unrelated warnings remain;
+there are no diagnostics in changed lines. Live certification, custom XDG/
+channel database paths and an OpenCode DG4a log/metric mapping remain outside
+this fixture-certified adapter's supported surface.

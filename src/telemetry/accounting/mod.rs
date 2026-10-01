@@ -32,7 +32,8 @@ pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/ac
     include_str!("../../../migrations/telemetry/accounting/0010_charges_fx.sql"),
     include_str!("../../../migrations/telemetry/accounting/0011_quota_window_lookup.sql"),
     include_str!("../../../migrations/telemetry/accounting/0012_incremental_sync.sql"),
-    include_str!("../../../migrations/telemetry/accounting/0013_claude_code.sql")];
+    include_str!("../../../migrations/telemetry/accounting/0013_claude_code.sql"),
+    include_str!("../../../migrations/telemetry/accounting/0014_opencode.sql")];
 
 /// `herdr-projects telemetry <slug> accounting ...`
 #[derive(clap::Subcommand)]

@@ -17,7 +17,8 @@ pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/in
     include_str!("../../../migrations/telemetry/ingest/0007_codex_followups.sql"),
     include_str!("../../../migrations/telemetry/ingest/0008_codex_live_run2.sql"),
     include_str!("../../../migrations/telemetry/ingest/0009_turn_terminations.sql"),
-    include_str!("../../../migrations/telemetry/ingest/0010_claude_code.sql")];
+    include_str!("../../../migrations/telemetry/ingest/0010_claude_code.sql"),
+    include_str!("../../../migrations/telemetry/ingest/0011_opencode.sql")];
 
 /// `herdr-projects telemetry <slug> collectors ...`
 #[derive(clap::Subcommand)]
@@ -305,6 +306,7 @@ fn capabilities(project: &Path) -> Result<Value> {
     let mut adapters = super::otlp::capabilities();
     adapters.push(super::gemini::capabilities());
     adapters.insert(0, super::codex::claude::capabilities());
+    adapters.insert(0, super::codex::opencode::capabilities());
     adapters.insert(0, json!({"adapter": "codex", "interface": "rollout_jsonl", "certified_versions": super::codex::CERTIFIED,
         "uncertified_version": "cli_version_uncertified", "fields": out, "profiles": super::codex::profile_versions(project)?}));
     Ok(json!({"adapters": adapters}))

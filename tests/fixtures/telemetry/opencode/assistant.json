@@ -1,0 +1,20 @@
+{
+  "role": "assistant",
+  "modelID": "fixture-model",
+  "providerID": "fixture-provider",
+  "model": {"id": "fixture-model", "providerID": "fixture-provider"},
+  "time": {"created": 0},
+  "cost": 0.125,
+  "tokens": {"input": 100, "output": 20, "reasoning": 5, "cache": {"read": 30, "write": 10}},
+  "text": "OPENCODE_SECRET_TEXT",
+  "structured": {"secret": "OPENCODE_SECRET_STRUCTURED"},
+  "error": {"message": "OPENCODE_SECRET_MESSAGE_ERROR"},
+  "content": [
+    {"type": "text", "text": "OPENCODE_SECRET_CONTENT"},
+    {"type": "reasoning", "text": "OPENCODE_SECRET_REASONING"},
+    {"type": "tool", "id": "synthetic-tool", "name": "fixture-tool",
+     "state": {"status": "error", "input": {"secret": "OPENCODE_SECRET_INPUT"},
+               "content": [{"text": "OPENCODE_SECRET_OUTPUT"}], "error": "OPENCODE_SECRET_ERROR"},
+     "time": {"created": 0, "completed": 1}}
+  ]
+}

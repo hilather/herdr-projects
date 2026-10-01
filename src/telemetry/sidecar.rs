@@ -164,6 +164,10 @@ pub fn report(project: &Path) -> Result<Value> {
         let mut row = json!({"session_id": session, "binding": binding, "attempt_id": attempt, "cli_version": version,
             "certified": super::codex::accepted_version(&version), "records": records, "accepted": accepted, "quarantined": quarantined,
             "cwd": cwd, "originator": originator, "source": source, "reevaluation": reevaluation});
+        if originator.as_deref() == Some("opencode") {
+            row["adapter"] = json!("opencode");
+            row["certification"] = json!(if super::codex::accepted_version(&version) { "fixture" } else { "none" });
+        }
         if originator.as_deref() == Some("claude-code") {
             row["adapter"] = json!("claude-code");
             row["certification"] = json!(if super::codex::accepted_version(&version) { "fixture" } else { "none" });

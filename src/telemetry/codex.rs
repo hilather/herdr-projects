@@ -15,6 +15,8 @@ use super::{ingest, sanitize};
 pub(crate) mod claude;
 #[path = "gemini_native.rs"]
 pub(crate) mod gemini;
+#[path = "opencode.rs"]
+pub(crate) mod opencode;
 
 /// Codex versions certified by a live run (docs/telemetry/codex-live-0.154.0.md).
 pub const CERTIFIED: &[&str] = &["0.154.0"];
@@ -29,6 +31,7 @@ pub fn certified(version: &str) -> bool {
 
 /// Adapter-qualified versions keep fixture Claude acceptance separate from live Codex certification.
 pub fn accepted_version(version: &str) -> bool {
+    if let Some(v) = version.strip_prefix("opencode/") { return opencode::FIXTURE_VERSIONS.contains(&v); }
     version.strip_prefix("claude-code/").map_or_else(|| certified(version), |v| claude::FIXTURE_VERSIONS.contains(&v))
 }
 
@@ -84,7 +87,7 @@ impl CanonicalAttempt {
         self.kind.as_deref() == Some("codex")
     }
 
-    pub fn supported(&self) -> bool { self.codex() || matches!(self.kind.as_deref(), Some("claude" | "gemini")) }
+    pub fn supported(&self) -> bool { self.codex() || matches!(self.kind.as_deref(), Some("claude" | "gemini" | "opencode")) }
 
     pub(super) fn gemini_home(&self) -> Option<&str> {
         (self.kind.as_deref() == Some("gemini") && self.version.as_deref() == Some("0.62.0")).then_some(self.home.as_deref()).flatten()
@@ -275,7 +278,7 @@ pub fn collect(project: &Path, budget: Budget, create: bool) -> Result<Option<Co
     terminated_turns(&db, &attempts)?;
     for home in &homes {
         let mut files = Vec::new();
-        if !attempts.iter().any(|a| matches!(a.kind.as_deref(), Some("claude" | "gemini")) && a.home.as_ref() == Some(home)) || attempts.iter().any(|a| a.codex() && a.home.as_ref() == Some(home)) {
+        if !attempts.iter().any(|a| matches!(a.kind.as_deref(), Some("claude" | "gemini" | "opencode")) && a.home.as_ref() == Some(home)) || attempts.iter().any(|a| a.codex() && a.home.as_ref() == Some(home)) {
             walk(&Path::new(home).join(".codex/sessions"), 0, &mut files);
         }
         if attempts.iter().any(|a| a.kind.as_deref() == Some("claude") && a.home.as_ref() == Some(home)) {
@@ -283,6 +286,9 @@ pub fn collect(project: &Path, budget: Budget, create: bool) -> Result<Option<Co
         }
         let native = gemini::discover(home, &attempts, &worktrees);
         files.extend(native.keys().cloned());
+        if attempts.iter().any(|a| a.kind.as_deref() == Some("opencode") && a.home.as_ref() == Some(home)) {
+            opencode::collect(&mut db, home, &worktrees, &tombstones, &mut remaining, &mut done)?;
+        }
         files.sort();
         seen.extend(files.iter().map(|file| digest(file.as_os_str().as_encoded_bytes())));
         for file in files {
@@ -1385,7 +1391,7 @@ fn bind(db: &mut Connection, attempts: &[CanonicalAttempt]) -> Result<()> {
             let rule1 = |h: &Option<String>| h.as_ref().is_some_and(|h| digest(h.as_bytes()) == home);
             let (mut matches, mut refused) = (Vec::new(), None);
             for a in cwd_attempt.as_deref().and_then(|id| by_id.get(id)).into_iter().flatten().copied() {
-                let source_kind = match originator.as_deref() { Some("claude-code") => "claude", Some("gemini-cli") => "gemini", _ => "codex" };
+                let source_kind = match originator.as_deref() { Some("claude-code") => "claude", Some("gemini-cli") => "gemini", Some("opencode") => "opencode", _ => "codex" };
                 if a.kind.as_deref() != Some(source_kind) { continue; }
                 let Some(at) = at.filter(|at| a.decided_unix_ms.is_some_and(|decided| *at >= decided)) else { continue };
                 match &a.binding {

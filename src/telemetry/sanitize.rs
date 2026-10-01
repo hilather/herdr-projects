@@ -36,6 +36,7 @@ pub fn codex_allowlist(kind: &str) -> Option<Vec<(String, Class)>> {
     Some(match kind {
         "gemini_line" => super::codex::gemini::allowlist(),
         "claude_line" => super::codex::claude::allowlist(),
+        "opencode_message" => super::codex::opencode::allowlist(),
         "session_meta" => fields(&[("id", Id), ("timestamp", Text), ("cwd", Path), ("cli_version", Text), ("originator", Text), ("source", Tag),
             ("model_provider", Text), ("forked_from_id", Id), ("subagent_kind", Tag), ("subagent_detail", Text), ("subagent_parent_thread_id", Id), ("subagent_depth", Number),
             ("parent_thread_id", Id), ("session_id", Id), ("thread_source", Tag),

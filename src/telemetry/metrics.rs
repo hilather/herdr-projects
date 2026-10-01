@@ -93,8 +93,8 @@ pub(crate) fn central(project: &Path, since: Option<i64>) -> Result<(BTreeMap<St
 /// start) and M13 over terminated attempts decided in the window.
 fn usage_metrics(sidecar: Option<&Connection>, attempts: &[Attempt], since: Option<i64>, in_window: &dyn Fn(&Attempt) -> bool, metrics: &mut BTreeMap<&str, Value>) -> Result<()> {
     let terminated: Vec<&Attempt> = attempts.iter().filter(|a| TERMINAL.contains(&a.state.as_str()) && in_window(a)).collect();
-    let adapter_absent = terminated.iter().filter(|a| a.kind.as_deref().is_some_and(|k| !matches!(k, "codex" | "claude"))).count();
-    let codex: Vec<&&Attempt> = terminated.iter().filter(|a| matches!(a.kind.as_deref(), Some("codex" | "claude"))).collect();
+    let adapter_absent = terminated.iter().filter(|a| a.kind.as_deref().is_some_and(|k| !matches!(k, "codex" | "claude" | "opencode"))).count();
+    let codex: Vec<&&Attempt> = terminated.iter().filter(|a| matches!(a.kind.as_deref(), Some("codex" | "claude" | "opencode"))).collect();
     let Some(db) = sidecar else {
         for id in ["M08", "M09", "M15"] { metrics.insert(id, metric(id, json!({"value": unavailable("no_certified_source")}))); }
         metrics.insert("M13", metric("M13", json!({"value": unavailable("collection_not_run"), "adapter_absent": adapter_absent})));

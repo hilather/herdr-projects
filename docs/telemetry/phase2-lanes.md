@@ -394,10 +394,15 @@ Cards (gaps that stop those questions being answered):
     live certification and Gemini worker launch support are separate cards.
     Synthetic privacy, replay, binding, upgrade, backup and retention E2E
     coverage: contracts-collection.md DG4c.
-  - **DG4d OpenCode native adapter.** Local session storage; multi-provider,
-    so the model/provider fields matter for M15.
-  - **DG4e Grok.** The owner uses it (first wave). First step: confirm which
-    Grok CLI harness the owner runs and what it records locally or over OTel.
+  - **Done (DG4d; ingest 0011, accounting 0014): OpenCode native adapter.**
+    Metadata-only native SQLite v1/v2 messages and tools from recorded OpenCode
+    attempt execution homes; 1.18.34 fixture-only, exact binding, deduplicated
+    ledger usage, numeric reported costs and session retention/backup.
+    OTel spans exist but DG4a log/metric mapping is none. Multi-provider, so
+    the model/provider fields matter for M15.
+  - **DG4e Grok.** The owner uses it (first wave). Identified 2026-10-01: xAI's
+    official Grok Build CLI (`@xai-official/grok` 1.0.46 alpha, a native binary in
+    an npm package). Next: establish what it records locally or over OTel.
     Then the OTLP mapping or a native adapter.
   - **DG4f second wave:** Cursor (`cursor-agent`), GitHub Copilot CLI, Amp,
     Aider. OTLP mapping where the harness supports it; otherwise a native

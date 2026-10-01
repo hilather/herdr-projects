@@ -73,7 +73,7 @@ fn derive_scoped(db: &Connection, scoped: bool) -> Result<Vec<Entry>> {
         let (session, ordinal, first): (String, i64, String) = (r.get(0)?, r.get(1)?, r.get(2)?);
         let (accepted, reason, quarantined): (bool, Option<String>, bool) = (r.get(5)?, r.get(6)?, r.get(13)?);
         let native = [r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?];
-        let normalized = normalize(native, session.starts_with("claude-code:"));
+        let normalized = normalize(native, session.starts_with("claude-code:") || session.starts_with("opencode:"));
         let (response, digest): (Option<String>, String) = (r.get(3)?, r.get(14)?);
         let (disposition, reason) = match (quarantined, accepted, normalized) {
             (true, ..) => ("conflict", Some("payload_digest_mismatch".to_owned())),
@@ -91,7 +91,7 @@ fn derive_scoped(db: &Connection, scoped: bool) -> Result<Vec<Entry>> {
             let (disposition, reason) = if quarantined { (disposition, reason.clone()) } else { ("duplicate", None) };
             provenance.push((other?, disposition, reason));
         }
-        entries.push(Entry { id: format!("{}:{session}:{ordinal}", if session.starts_with("claude-code:") { "claude-code" } else { "codex" }), session, basis: "delta", scope: "request", precedence: 1, position: ordinal,
+        entries.push(Entry { id: format!("{}:{session}:{ordinal}", source(&session)), session, basis: "delta", scope: "request", precedence: 1, position: ordinal,
             response_id: r.get(3)?, model: r.get(4)?, native, normalized, provenance });
     }
     // Cumulative thread totals (secondary basis, reconciliation only): per
@@ -105,7 +105,7 @@ fn derive_scoped(db: &Connection, scoped: bool) -> Result<Vec<Entry>> {
         let (session, path, position, usage): (String, String, i64, String) = (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?);
         let usage: Value = serde_json::from_str(&usage)?;
         let native = NATIVE.map(|k| usage[k].as_i64());
-        let normalized = normalize(native, session.starts_with("claude-code:"));
+        let normalized = normalize(native, session.starts_with("claude-code:") || session.starts_with("opencode:"));
         let mark = high.as_ref().filter(|h| h.0 == session).map(|h| h.1);
         let (disposition, reason) = match (normalized.map(|n| n[6]), mark) {
             (None, _) => ("unresolved", Some("invariant_violation")),
@@ -152,8 +152,8 @@ pub fn sync(db: &mut Connection) -> Result<Value> {
         tx.prepare_cached("INSERT INTO usage_entries(entry_id,source,session_id,basis,scope,normalization_version,precedence,position,response_id,model,native,
             input_tokens,cache_read_tokens,new_input_tokens,cache_write_tokens,output_tokens,reasoning_tokens,total_tokens)
             VALUES(?1,?18,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)")?
-                .execute(params![e.id, e.session, e.basis, e.scope, if e.session.starts_with("claude-code:") { "claude-code-v1" } else { NORMALIZATION }, e.precedence, e.position, e.response_id, e.model, native.to_string(),
-                n[0], n[1], n[2], n[3], n[4], n[5], n[6], if e.session.starts_with("claude-code:") { "claude-code" } else { "codex" }])?;
+                .execute(params![e.id, e.session, e.basis, e.scope, if e.session.starts_with("opencode:") { "opencode-v1" } else if e.session.starts_with("claude-code:") { "claude-code-v1" } else { NORMALIZATION }, e.precedence, e.position, e.response_id, e.model, native.to_string(),
+                n[0], n[1], n[2], n[3], n[4], n[5], n[6], source(&e.session)])?;
         for (path, disposition, reason) in &e.provenance {
             tx.prepare_cached("INSERT INTO usage_dispositions(entry_id,path_digest,disposition,reason) VALUES(?1,?2,?3,?4)")?
                 .execute(params![e.id, path, disposition, reason])?;
@@ -239,4 +239,8 @@ pub(crate) fn status(db: &Connection) -> Result<Option<Value>> {
     Ok(db.query_row("SELECT sequence,watermark,invalidated,last_mode,last_reason FROM accounting_stream WHERE singleton=1 AND last_mode IS NOT NULL", [], |r|
         Ok(json!({"sequence": r.get::<_, i64>(0)?, "watermark": r.get::<_, i64>(1)?, "invalidated": r.get::<_, Option<String>>(2)?,
             "mode": r.get::<_, Option<String>>(3)?, "rebuild_reason": r.get::<_, Option<String>>(4)?}))).optional()?)
+}
+
+fn source(session: &str) -> &'static str {
+    if session.starts_with("opencode:") { "opencode" } else if session.starts_with("claude-code:") { "claude-code" } else { "codex" }
 }
