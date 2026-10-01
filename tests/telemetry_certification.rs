@@ -908,14 +908,23 @@ fn candidate_group_cost_includes_every_arm() {
 /// Adapter certificate (contracts-collection.md A3, codex-live-0.154.0*.md):
 /// every source field the accounting families read is collected, in the unit
 /// the ledger assumes, and certified live, or its limitation is declared.
-/// Only Codex has a collector (owner decision 3: none for Claude, Devin,
-/// OTLP); an uncertified Codex version is never summed.
+/// Codex is the only live-certified collector. Since the 2026-09-30 owner
+/// decision (harness coverage, phase2-lanes.md DG4) the OTLP receiver adds
+/// `otlp:<harness>` adapters, but those are fixture-certified at most, so no
+/// other adapter may claim a `live` field. An uncertified Codex version is
+/// never summed.
 #[test]
 fn accounting_fields_match_the_adapter_certificate() {
     let f = Fixture::new();
     let capabilities = f.cli_args(&["collectors", "capabilities", "--json"]).0;
     let adapters = capabilities["adapters"].as_array().unwrap();
-    assert_eq!(adapters.iter().map(|a| a["adapter"].clone()).collect::<Vec<_>>(), [json!("codex")], "no other adapter is collected");
+    let names: Vec<&str> = adapters.iter().map(|a| a["adapter"].as_str().unwrap()).collect();
+    assert_eq!(names[0], "codex", "{names:?}");
+    assert!(names[1..].iter().all(|n| n.starts_with("otlp:")), "only OTLP adapters besides Codex: {names:?}");
+    for other in &adapters[1..] {
+        let live: Vec<&Value> = other["fields"].as_array().into_iter().flatten().filter(|f| f["certified"] == "live").collect();
+        assert!(live.is_empty(), "{} must not claim live-certified fields: {live:?}", other["adapter"]);
+    }
     let codex = &adapters[0];
     assert_eq!(codex["certified_versions"], json!(["0.154.0"]));
     let field = |kind: &str, name: &str| codex["fields"].as_array().unwrap().iter().find(|x| x["kind"] == kind && x["field"] == name).cloned()
