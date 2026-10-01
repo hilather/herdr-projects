@@ -1,7 +1,7 @@
 //! The usage ledger (docs/telemetry/contracts-accounting.md §1–§2): entries
 //! normalized from the Codex sidecar tables, read by SQL only, with one
 //! disposition per entry and rollout that observed it.
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -171,8 +171,8 @@ pub fn sync(db: &mut Connection) -> Result<Value> {
     // racing sync invalidates the plan, and the next read snapshot recomputes it.
     // All ledger, graph, quota, aggregate and watermark writes remain atomic.
     let (tx, plan) = loop {
-        let plan = prepare_sync(db)?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let plan = prepare_sync(db).context("prepare accounting replay")?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).context("acquire accounting writer")?;
         if sync_frontier(&tx)? == plan.frontier
             && crate::telemetry::analytics::inputs::generations(&tx)? == plan.generations {
             break (tx, plan);

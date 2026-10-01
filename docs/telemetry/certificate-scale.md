@@ -29,7 +29,7 @@ for either. This is not a certification of an OTLP transport.
 | --- | --- |
 | Source | branch `telemetry/tm51-scale-certification` from `main` `20a763f`, plus the fixes in §5 |
 | Build | `cargo test --release --locked --offline -j 3 --features state-store --test telemetry_scale --no-run` (rustc 1.98.0), system SQLite 3.53.4 |
-| Stores | canonical `SCHEMA = 67`; sidecar streams `codex` 3, `ingest` 9, `accounting` 13, `quality` 2, `analytics` 3, `health` 1, `policies` 1 |
+| Stores | canonical `SCHEMA = 67`; sidecar streams `codex` 3, `ingest` 10, `accounting` 14, `quality` 2, `analytics` 3, `health` 1, `policies` 1 |
 | CPU / memory | Intel Core i7-8750H, 6 cores / 12 threads, 62 GiB RAM, zram swap |
 | Disk | Intel SSDPEKNW010T8 NVMe, LUKS, btrfs (`compress=zstd:3`). Every dataset lived under `bench-data/` on this disk, never on the RAM-backed `/tmp` |
 | OS | Linux 7.2.3-arch1-3 |
@@ -764,7 +764,7 @@ warnings remain. Temporary instrumentation, wrappers and all `bench-data/`
 datasets were removed before the final commit.
 ## 4.10 P2 aggregate reads and incremental analytics (pending steward's 1M certification)
 
-Branch `perf/incremental-analytics`, accounting stream **13**, analytics
+Branch `perf/incremental-analytics`, accounting stream **14**, analytics
 stream **3**. This addresses L3 and analytics' portion of L4. Only the
 100k/64 dataset was measured; no 1M run was performed.
 
@@ -955,7 +955,7 @@ on changed lines (existing warnings remain elsewhere).
 Branch `perf/incremental-analytics`, rebased onto main `033e93b` (P3/P3b/P3c).
 **Pending the steward's serial 1M certification.** Analytics migrations are
 now `0001_aggregate_revisions`, `0002_workspace_projections`, then
-`0003_input_frontiers`: current analytics stream **3**, accounting **13**.
+`0003_input_frontiers`: current analytics stream **3**, accounting **14**.
 The original P2 measurements in §4.10 predate this workspace merge.
 
 Providers that independently open canonical/sidecar readers now share pinned
@@ -1188,6 +1188,99 @@ remain. No new crate or source process spawn. Temporary instrumentation and all
 `bench-data/` datasets are removed before committing.
 
 
+### 4.13 P2d: Claude-aware aggregates after DG4b (100k only)
+
+Rebased P2/P2b/P2c onto `origin/main` at `ded2cd9`, preserving DG4b's
+native Claude adapter and #196's fixture-only rule for every non-Codex
+adapter. Main owns accounting `0013_claude_code.sql`; read aggregates are
+`0014_read_aggregates.sql`, accounting stream **14**, ingest stream **10**.
+The migration/version pins and Stores row agree.
+
+Claude usage already enters the shared ledger and native usage tables, so
+usage/native/source totals retain the full derivation's acceptance,
+coverage, provenance, reasoning-unavailable and termination rules. The tool
+summary now merges Claude execution/outcome counts, unknown outcomes and
+sidechain counts, including when cached session rows replace raw rows.
+Claude message/tool-result mutations advance the accounting frontier, queue
+both old and new session identities when appropriate, and invalidate the
+analytics tools dependency. Retention preserves main's `claude_messages` and
+`claude_tool_results` purge and removes session/path aggregates with them;
+remaining summaries validate their generation stamps.
+
+The native Claude synthetic transcript and planted terminal attempt exercise
+public CLI reads before sync, after incremental sync and after a forced full
+ledger derivation. M08/M09, M15/M16/M17/M18, report/after-termination, tools,
+and cost values/coverage/digests agree. Repricing preserves cost bytes and
+M12/M14 bodies. A tool-only outcome correction invalidates summaries without
+another usage record. `analytics rebuild --verify` reports identical and
+rebuild preserves snapshot bytes. The mixed Codex/Claude workflow and Claude
+retention workflow also pass. No fixture reads source files; no new crate or
+source process spawn. Main's exact metric expectations remain intact except
+for the required accounting version pins.
+
+**Same disk dataset, 100k events / 64 active / 10,000 attempts / eight homes,
+seed 5100, three repeats. Pending the steward's serial 1M certification.**
+Built each release with §1's `--locked --offline -j 3 --features state-store
+--test telemetry_scale --no-run`, then ran `scale_2_queries` and
+`scale_9_analytics_refresh` serially with `SCALE_EVENTS=100000`,
+`SCALE_ACTIVE=64`, `SCALE_REPEATS=3`, `SCALE_PER_ROUND=1`, tags `p2d-before`
+and `p2d-after`. All data stayed under `$PWD/bench-data/`; no other benchmark
+or build overlapped timing. The before binary contains the rebased P2c
+implementation, prior to these Claude and contention follow-ups. Before the
+after samples, the fixture's accounting version was reset to 13 to replay the
+corrected, idempotent 0014 migration, then public sync/refresh settled its
+projections outside timing. Sources were neither regenerated nor collected.
+
+| Surface | Before p50 / p95 ms | After p50 / p95 ms |
+| --- | ---: | ---: |
+| M08 lane usage | 33.44 / 56.74 | 24.65 / 38.20 |
+| M13 coverage | 50.95 / 105.53 | 61.02 / 61.30 |
+| Report | 247.15 / 254.19 | 365.54 / 422.02 |
+| Cost view | 90.67 / 98.79 | 138.63 / 172.01 |
+| Analytics refresh | 2,146.90 / 2,219.66 | 882.43 / 885.00 |
+
+Refresh peak RSS is 78,024 → 78,224 KiB (76.2 → 76.4 MiB). Both refresh
+results contain `violations: []` and `canonical_unchanged: true`. Load
+averages (1/5/15 minutes, start → end), from the results files:
+
+| Phase | Before load | After load |
+| --- | --- | --- |
+| Queries | 6.80/10.31/8.86 → 8.93/10.35/8.92 | 9.10/11.47/10.29 → 6.78/10.74/10.08 |
+| Refresh | 8.93/10.35/8.92 → 9.34/10.41/8.95 | 6.78/10.74/10.08 → 6.87/10.69/10.07 |
+
+These are noisy shared-host samples, not a general speedup claim: report and
+cost p95 increased. The scale fleet remains Codex-only; Claude correctness is
+fixture-only, not a live or 100k Claude certification. No 1M run was made.
+
+Rebase contention reproduction initially exposed bounded-run SQLite BUSY
+failures (accounting and analytics writer acquisition). Unchanged collector
+prefixes now skip writer acquisition for completed turns and open turns
+still below the existing idle deadline, rechecked after the cursor read;
+idle, missing-cursor, replacement and explicit-replay paths retain the atomic
+writer path. Termination receipts still reconcile around collection. A
+snapshot-wide Claude-table emptiness probe also replaces one probe per Codex
+session. Existing idle/replacement/replay checks and the extended public
+collection workflow pass. Errors identify the affected writer; no retry or
+busy-timeout limit was increased. The final reproduction runs ten unchanged
+scale gates beside twelve full `telemetry_operations` cargo runs, all
+**0 failures**, without recompilation in the loops. Load start/end was
+5.61/8.90/9.07 → 6.02/6.74/8.04. This local result closes neither L1's
+controller-latency target nor a universal contention bound.
+
+All 18 `tests/telemetry*.rs` suites ran with `TMPDIR=$PWD/target/tmp`,
+`RUST_TEST_THREADS=1`, `--locked --offline -j 3 --features state-store
+--no-fail-fast`: **192 passed, 12 ignored**, six socket-only failures. Unix
+bind EPERM affects `attempts_show_attention_summary`,
+`attention_intervals_union_and_censor`,
+`recommendations_and_notices_change_no_canonical_state_and_no_dispatch` and
+`thread_start_records_the_dispatch_reason_and_the_sidebar_suffix`; TCP
+loopback EPERM affects `http_auth_limits_malformed_and_replay` and
+`http_request_rate_is_bounded`. No other final failure. The unmodified scale
+gate passes in the full suite, all ten contention runs and the final release
+run, retaining exact totals, one acceptance, pinned as-of reproducibility,
+byte-identical rebuild and canonical digest checks. Clippy reports no warning
+in changed lines. Benchmark datasets are deleted before commit.
+
 ## 5. Inefficiencies found and fixed
 
 The first measurement (same generator, same host) missed the query and
@@ -1324,6 +1417,11 @@ owner. None is hidden by loosening the target.
   23.38/37.79/260.81 → 26.80/38.21/241.99 ms; pending the steward's
   1M certification** (§4.11; query load before 1.52 → 1.72, after
   1.37 → 1.30). No read-speedup claim on these shared-host samples.
+  **P2d preserves Claude-equivalent maintained reads after DG4b. At
+  100k/64, M08/M13/report/cost p95 56.74/105.53/254.19/98.79 →
+  38.20/61.30/422.02/172.01 ms; refresh 2,219.66 → 885.00 ms,
+  pending the steward's 1M certification** (§4.13, phase load averages
+  included). Report/cost increased; no general speedup claim or L3 closure.
   Owners: accounting lane, analytics (TM4.1).
 - **L4: the ticker's telemetry pass exceeds the 256 MiB envelope at 10,000
   bindings.** The collector itself stays within it (58–115 MB) and its byte

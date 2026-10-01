@@ -143,6 +143,16 @@ fn codex_and_claude_native_sources_keep_separate_identity() {
     let old_usage = &usage["attempts"].as_array().unwrap().iter().find(|a| a["attempt_id"] == old).unwrap()["usage"];
     assert_eq!(old_usage["input_tokens"], 1500);
     assert_eq!(attempt_usage(&f)["input_tokens"], 382);
+    let observed = f.report();
+    assert_eq!(observed["metrics"]["M08"]["value"], 1882);
+    f.cli_args(&["accounting", "sync"]);
+    let aggregated = f.report();
+    for id in ["M08", "M09", "M15", "M16", "M17", "M18"] {
+        assert_eq!(aggregated["metrics"][id], observed["metrics"][id], "mixed adapters {id}");
+    }
+    f.cli_args(&["query", "--metric", "M08,M09,M16,M17,M18", "--json"]);
+    f.cli_args(&["analytics", "refresh"]);
+    assert_eq!(f.cli_args(&["analytics", "rebuild", "--verify"]).0["identical"], true);
     no_secrets(&f);
 }
 
@@ -171,8 +181,16 @@ fn native_claude_backup_restore_retention_and_tombstones() {
     assert_eq!(f.count("claude_messages"), 0);
     assert_eq!(f.count("claude_tool_results"), 0);
     assert_eq!(f.count("codex_usage"), 0);
+    for table in ["accounting_usage_totals", "accounting_native_totals",
+        "accounting_source_summary", "accounting_tool_summary"] {
+        assert_eq!(f.count(table), 0, "retention must purge {table}");
+    }
     f.cli("collect");
     assert_eq!(f.count("claude_messages"), 0);
+    f.cli_args(&["accounting", "sync"]);
+    let purged = f.report();
+    assert_eq!(purged["metrics"]["M08"]["value"]["reason"], "no_certified_source");
+    assert_eq!(purged["metrics"]["M16"]["coverage"]["sessions"], 0);
     f.cli_args(&["backup", "restore", "--from", backup.to_str().unwrap(), "--force"]);
     assert_eq!(f.count("claude_messages"), 0);
     assert_eq!(f.count("claude_tool_results"), 0);
@@ -218,4 +236,70 @@ fn unreported_claude_tool_outcome_is_unknown_in_its_own_scope() {
     assert_eq!(metric["by_scope"]["claude-code"]["unknown"]["executions"], 1);
     assert_eq!(metric["by_scope"]["command_execution"]["unknown"]["executions"], 0);
     no_secrets(&f);
+}
+
+#[test]
+fn claude_aggregate_reads_match_replay_and_verified_rebuild() {
+    let f = claude();
+    // A terminal planted attempt also exercises the maintained diagnostic.
+    f.cancel_reserved();
+    let terminated = unix_ms();
+    rusqlite::Connection::open(f.project.join(".state/state.db")).unwrap().execute(
+        "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.worker_terminated',?1,2,1,?2)",
+        rusqlite::params![f.attempt, json!({"version": 1, "attempt": f.attempt,
+            "cause": "cancellation", "observed_unix_ms": terminated}).to_string()]).unwrap();
+    transcript(&f, SID, &f.worktree(), "2.1.3", terminated + 1000);
+    f.cli("collect");
+    let reads = || {
+        let report = f.report();
+        let metrics: Vec<Value> = ["M08", "M09", "M15", "M16", "M17", "M18"]
+            .iter().map(|id| report["metrics"][id].clone()).collect();
+        (metrics, report["after_termination"].clone(),
+            f.cli_args(&["accounting", "tools", "--json"]).0,
+            f.cli_args(&["view", "cost", "--json"]).0["rows"].as_array().unwrap().iter()
+                .map(|r| json!({"metric_id": r["metric_id"], "value": r["value"],
+                    "coverage": r["coverage"], "status": r["status"], "basis": r["basis"],
+                    "digest": r["projection"]["content_digest"]})).collect::<Vec<_>>())
+    };
+    let replay = reads();
+    assert_eq!(replay.0[0]["value"], 382);
+    assert_eq!(replay.0[1]["value"], 25);
+    assert_eq!(replay.0[3]["executed"]["by_scope"]["claude-code"], 3);
+    assert_eq!(replay.0[3]["collaboration"]["sidechain_turns"], 2);
+    assert_eq!(replay.0[4]["value"], "2/3");
+    assert_eq!(replay.1.as_array().unwrap().len(), 1);
+    f.cli_args(&["accounting", "sync"]);
+    for table in ["accounting_usage_totals", "accounting_native_totals",
+        "accounting_source_summary", "accounting_tool_summary"] {
+        assert_eq!(f.count(table), 1, "Claude must populate {table}");
+    }
+    assert_eq!(reads(), replay, "maintained reads equal original derivation");
+    f.cli_args(&["accounting", "reprice"]);
+    let cost = f.cli_args(&["accounting", "cost", "--json"]).1;
+    let cost_metrics = (f.report()["metrics"]["M12"].clone(), f.report()["metrics"]["M14"].clone());
+
+    f.cli_args(&["query", "--metric", "M08,M09,M12,M14,M16,M17,M18", "--json"]);
+    f.cli_args(&["analytics", "refresh"]);
+    let pinned = f.cli_args(&["analytics", "snapshot"]).1;
+    assert_eq!(f.cli_args(&["analytics", "rebuild", "--verify"]).0["identical"], true);
+    f.cli_args(&["analytics", "rebuild"]);
+    assert_eq!(f.cli_args(&["analytics", "snapshot"]).1, pinned);
+    // A tool-only fixture correction must invalidate both the read summary
+    // and analytics dependency even without another usage record.
+    f.sidecar().execute("UPDATE claude_tool_results SET is_error=NULL WHERE call_id='call-2'", []).unwrap();
+    let corrected = reads();
+    assert_eq!(corrected.0[4]["value"], "2/2");
+    assert_eq!(corrected.0[4]["by_scope"]["claude-code"]["unknown"]["executions"], 1);
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(reads(), corrected);
+    let ledger = f.cli_args(&["accounting", "entries"]).1;
+    // Removing the public projection marker forces the full sync derivation.
+    f.sidecar().execute("DELETE FROM usage_ledger", []).unwrap();
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "entries"]).1, ledger);
+    assert_eq!(reads(), corrected);
+    assert_eq!(f.cli_args(&["accounting", "cost", "--json"]).1, cost);
+    assert_eq!((f.report()["metrics"]["M12"].clone(), f.report()["metrics"]["M14"].clone()), cost_metrics);
+    f.cli_args(&["analytics", "refresh"]);
+    assert_eq!(f.cli_args(&["analytics", "rebuild", "--verify"]).0["identical"], true);
 }

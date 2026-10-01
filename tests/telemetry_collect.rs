@@ -232,6 +232,15 @@ fn idle_rollout_without_final_event_records_a_coverage_gap() {
     assert_eq!(gaps(&f), []);
     assert_eq!(final_event(&f), serde_json::json!({"state": "open", "turn_id": "turn-2"}));
     assert_eq!(report["attempts"][0]["usage"], usage);
+    let progressing = ledger(&f);
+    for _ in 0..3 {
+        let (report, _) = f.cli("collect");
+        assert_eq!(report["collected"]["bytes"], 0);
+        assert_eq!(report["attempts"][0]["usage"], usage);
+        assert_eq!(final_event(&f), serde_json::json!({"state": "open", "turn_id": "turn-2"}));
+        assert_eq!(gaps(&f), []);
+        assert_eq!(ledger(&f), progressing);
+    }
     // Unmodified for 9 minutes: still open. For 11: missing, with nothing new to read.
     age(&path, 540);
     f.cli("collect");

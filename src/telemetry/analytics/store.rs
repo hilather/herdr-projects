@@ -6,7 +6,7 @@
 use super::lifecycle::{Lineage, Row};
 use super::query::{self, Cell, Sources};
 use super::registry::{self, Provider};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -118,7 +118,7 @@ fn append(project: &Path, evaluated: &[Evaluated], watermarks: &Value, now: i64)
     let watermarks = serde_json::to_string(watermarks)?;
     // Evaluated bodies, lineage and rendering projections are already serialized.
     // Only the latest-revision decisions and their writes need the writer lock.
-    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).context("acquire analytics writer")?;
     let previous: Option<String> = tx.query_row("SELECT body FROM analytics_workspace_comparisons ORDER BY revision DESC LIMIT 1", [], |r| r.get(0)).optional()?;
     if previous.as_deref() != Some(body.as_str()) {
         tx.execute("INSERT INTO analytics_workspace_comparisons(body,recorded_unix_ms) VALUES(?1,?2)", rusqlite::params![body, now])?;
@@ -174,7 +174,7 @@ pub fn refresh(project: &Path, extra: Option<Cell>) -> Result<Value> {
     let mut sources = Sources::new(project)?;
     if canonical_before != sources.canonical_inputs {
         let keys = cells.iter().map(Cell::key).collect::<Vec<_>>();
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).context("acquire analytics writer")?;
         let locked = std::time::Instant::now();
         let now = jiff::Timestamp::now().as_millisecond();
         for (cell, key) in cells.iter().zip(&keys) { track_cell(&tx, cell, key, now)?; }
@@ -218,7 +218,7 @@ pub fn refresh(project: &Path, extra: Option<Cell>) -> Result<Value> {
         }
         // A separate writer reads the live generations, never the pinned snapshot.
         // Revalidate even skipped cells: a racing mutation must leave them due.
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).context("acquire analytics writer")?;
         let locked = std::time::Instant::now();
         let current = super::inputs::generations(&tx)?.unwrap_or_default();
         let canonical = super::inputs::canonical_current(project)?;
@@ -246,7 +246,7 @@ pub fn refresh(project: &Path, extra: Option<Cell>) -> Result<Value> {
             super::inputs::stamp(group, &sources.canonical_inputs, &sources.input_generations), serde_json::to_string(body)?)))
         .collect::<Result<Vec<_>>>()?;
     drop(snapshot);
-    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).context("acquire analytics writer")?;
     let locked = std::time::Instant::now();
     let current = super::inputs::generations(&tx)?.unwrap_or_default();
     let canonical = super::inputs::canonical_current(project)?;
@@ -318,7 +318,7 @@ pub fn rebuild(project: &Path, verify: bool) -> Result<Value> {
     let appended = if verify { json!([]) } else { append(project, &evaluated, &watermarks, jiff::Timestamp::now().as_millisecond())?["appended"].clone() };
     if !verify {
         let Some(mut db) = crate::telemetry::sidecar::open(project, false)? else { return Ok(unavailable("collection_not_run")); };
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).context("acquire analytics writer")?;
         // append evaluated the current comparison using the same estimator;
         // recreate its rendering row while retaining its recorded provenance.
         let latest: Option<(i64, String, i64)> = tx.query_row("SELECT revision,body,recorded_unix_ms FROM analytics_workspace_comparisons ORDER BY revision DESC LIMIT 1", [],

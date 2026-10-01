@@ -97,7 +97,7 @@ pub(crate) fn stamp(group: &str, canonical: &Value, generations: &BTreeMap<Strin
         "charges" => table.starts_with("provider_") || table.starts_with("valuation"),
         "budget" => table.starts_with("valuation") || table == "rollout_sources",
         "tools" => table.starts_with("codex_tool") || table.starts_with("codex_agent") || table.starts_with("codex_mcp") || table == "codex_exec_items"
-            || table == "codex_turn_aborts" || table.starts_with("rollout_") || table == "attention_samples" || table == "accounting_tool_summary",
+            || table == "codex_turn_aborts" || table.starts_with("claude_") || table.starts_with("rollout_") || table == "attention_samples" || table == "accounting_tool_summary",
         _ => true,
     };
     let selected: BTreeMap<&str, i64> = generations.iter().filter(|(t, _)| relevant(t)).map(|(t, s)| (t.as_str(), *s)).collect();

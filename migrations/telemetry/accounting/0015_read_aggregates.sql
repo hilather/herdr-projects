@@ -165,3 +165,35 @@ CREATE TABLE IF NOT EXISTS accounting_termination_summary (
  inputs TEXT NOT NULL,
  body TEXT NOT NULL CHECK(json_valid(body))
 ) STRICT;
+
+CREATE TRIGGER IF NOT EXISTS accounting_tools_claude_messages_INSERT AFTER INSERT ON claude_messages BEGIN
+UPDATE accounting_stream SET sequence=sequence+1;
+INSERT INTO accounting_dirty_sessions VALUES(NEW.session_id) ON CONFLICT(session_id) DO NOTHING;
+END;
+
+CREATE TRIGGER IF NOT EXISTS accounting_tools_claude_messages_UPDATE AFTER UPDATE ON claude_messages BEGIN
+UPDATE accounting_stream SET sequence=sequence+1;
+INSERT INTO accounting_dirty_sessions VALUES(OLD.session_id) ON CONFLICT(session_id) DO NOTHING;
+INSERT INTO accounting_dirty_sessions VALUES(NEW.session_id) ON CONFLICT(session_id) DO NOTHING;
+END;
+
+CREATE TRIGGER IF NOT EXISTS accounting_tools_claude_messages_DELETE AFTER DELETE ON claude_messages BEGIN
+UPDATE accounting_stream SET sequence=sequence+1;
+INSERT INTO accounting_dirty_sessions VALUES(OLD.session_id) ON CONFLICT(session_id) DO NOTHING;
+END;
+
+CREATE TRIGGER IF NOT EXISTS accounting_tools_claude_tool_results_INSERT AFTER INSERT ON claude_tool_results BEGIN
+UPDATE accounting_stream SET sequence=sequence+1;
+INSERT INTO accounting_dirty_sessions VALUES(NEW.session_id) ON CONFLICT(session_id) DO NOTHING;
+END;
+
+CREATE TRIGGER IF NOT EXISTS accounting_tools_claude_tool_results_UPDATE AFTER UPDATE ON claude_tool_results BEGIN
+UPDATE accounting_stream SET sequence=sequence+1;
+INSERT INTO accounting_dirty_sessions VALUES(OLD.session_id) ON CONFLICT(session_id) DO NOTHING;
+INSERT INTO accounting_dirty_sessions VALUES(NEW.session_id) ON CONFLICT(session_id) DO NOTHING;
+END;
+
+CREATE TRIGGER IF NOT EXISTS accounting_tools_claude_tool_results_DELETE AFTER DELETE ON claude_tool_results BEGIN
+UPDATE accounting_stream SET sequence=sequence+1;
+INSERT INTO accounting_dirty_sessions VALUES(OLD.session_id) ON CONFLICT(session_id) DO NOTHING;
+END;

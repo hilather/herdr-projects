@@ -797,25 +797,29 @@ fn tail_batch(db: &mut Connection, file: &Path, home: &str, worktrees: &str, all
     let key = digest(file.as_os_str().as_encoded_bytes());
     let Ok(mut handle) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(file) else { return Ok((0, false)) };
     let meta = handle.metadata()?;
-    // Completed, unchanged prefixes have no write work. Observe all cursor
-    // evidence in one read statement; replacement, explicit replay, old ingest
-    // cursors and open turns still take the original atomic writer path.
-    // The file metadata is the same observation used by that path: an append
-    // after this observation is collected on the next pass in either case.
+    // Unchanged prefixes have no write work unless an open turn is idle.
+    // Keep replacement, replay and missing ingest cursors on the atomic path.
+    // Termination receipts are reconciled before and after every collection.
+    // An append after this metadata observation is read on the next pass,
+    // exactly as on the writer path. Recheck the idle deadline after the read.
     if !reread.contains(&key) && meta.len() > 0 {
-        let unchanged: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM collect_offsets c
-            JOIN source_cursors i ON i.source=c.path_digest
+        let unchanged: Option<bool> = db.query_row("SELECT x.last_turn_offset IS NULL OR x.last_turn_completed=1
+            FROM collect_offsets c JOIN source_cursors i ON i.source=c.path_digest
             JOIN rollout_ingest_state x ON x.path_digest=c.path_digest
-            WHERE c.path_digest=?1 AND c.device=?2 AND c.inode=?3 AND c.byte_offset=?4
-            AND (x.last_turn_offset IS NULL OR x.last_turn_completed=1))",
-            params![key, meta.dev() as i64, meta.ino() as i64, meta.len() as i64], |r| r.get(0))?;
-        if unchanged { *span = (meta.len(), meta.len()); return Ok((0, false)); }
+            WHERE c.path_digest=?1 AND c.device=?2 AND c.inode=?3 AND c.byte_offset=?4",
+            params![key, meta.dev() as i64, meta.ino() as i64, meta.len() as i64], |r| r.get(0)).optional()?;
+        let modified = meta.mtime() * 1000 + meta.mtime_nsec() / 1_000_000;
+        if unchanged.is_some_and(|completed| completed
+            || jiff::Timestamp::now().as_millisecond() - modified < ingest::FINAL_EVENT_IDLE_MS) {
+            *span = (meta.len(), meta.len());
+            return Ok((0, false));
+        }
     }
     // Immediate: a concurrent collector (the ticker's and the CLI's) waits for
     // the write lock (busy timeout) instead of failing on a stale read snapshot.
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let stored = tx.query_row("SELECT device,inode,byte_offset,records,rate_limits,model,effort FROM collect_offsets WHERE path_digest=?1", [&key],
-        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))).optional()?;
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))).optional()?;
     let reread_zero = stored.as_ref().is_some_and(|cursor| cursor.2 == 0)
         && tx.query_row("SELECT EXISTS(SELECT 1 FROM rollout_sources WHERE path_digest=?1)", [&key], |r| r.get::<_, bool>(0))?;
     // A byte-zero replay must cover predates-ingest gaps atomically: those

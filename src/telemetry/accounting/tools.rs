@@ -184,6 +184,10 @@ fn sessions(db: &Connection, since: Option<i64>, blocked: &BTreeMap<String, Vec<
         FROM rollout_sources s{scope} ORDER BY s.session_id,s.path_digest"))?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?.collect::<rusqlite::Result<_>>()?;
     let guardians = guardians(db)?;
+    // DG4b's table is present on Codex-only stores too. One snapshot-wide
+    // emptiness check avoids probing it separately for every selected session.
+    let claude_results = exists(db, "claude_tool_results")?
+        && db.query_row("SELECT EXISTS(SELECT 1 FROM claude_tool_results)", [], |r| r.get::<_, bool>(0))?;
     let mut grouped = BTreeMap::<&str, Vec<&Source>>::new();
     for s in &sources { grouped.entry(s.0.as_str()).or_default().push(s); }
     let (mut out, mut excluded) = (Vec::new(), BTreeMap::<String, usize>::new());
@@ -199,7 +203,7 @@ fn sessions(db: &Connection, since: Option<i64>, blocked: &BTreeMap<String, Vec<
             text.map(|text| serde_json::from_str::<Tally>(&text)).transpose()?
         } else { None };
         let tools = if !a6 { Err("predates_collection") } else if sources.iter().any(|s| !s.5) { Err("pending_reread") }
-            else if !a8 { Err("predates_collection") } else if sources.iter().any(|s| !s.7) { Err("pending_reread") } else { Ok(if summary.is_some() { Rows::default() } else { rows(db, id)? }) };
+            else if !a8 { Err("predates_collection") } else if sources.iter().any(|s| !s.7) { Err("pending_reread") } else { Ok(if summary.is_some() { Rows::default() } else { rows(db, id, claude_results)? }) };
         let waits = attempts.iter().filter_map(|a| blocked.get(a)).flatten().copied().collect();
         let guardians = guardians.get(id).cloned().unwrap_or_default();
         let homes = sources.iter().map(|s| s.6.clone()).collect();
@@ -233,7 +237,7 @@ fn guardians(db: &Connection) -> Result<BTreeMap<String, Vec<i64>>> {
 }
 
 /// The A6 and A8 metadata rows of one session (never content: no such column exists).
-fn rows(db: &Connection, session: &str) -> Result<Rows> {
+fn rows(db: &Connection, session: &str, claude_results: bool) -> Result<Rows> {
     let calls = db.prepare("SELECT call_id,call_kind IS NOT NULL,call_kind,name,status,turn_id,called_unix_ms,output_unix_ms FROM codex_tool_calls WHERE session_id=?1
         ORDER BY called_unix_ms IS NULL,called_unix_ms,call_id")?
         .query_map([session], |r| Ok(Call { id: r.get(0)?, recorded: r.get(1)?, kind: r.get(2)?, name: r.get(3)?, status: r.get(4)?, turn: r.get(5)?,
@@ -254,7 +258,7 @@ fn rows(db: &Connection, session: &str) -> Result<Rows> {
     let activities = db.prepare("SELECT item_id,agent_thread_id FROM codex_agent_items WHERE session_id=?1 AND item_type='SubAgentActivity' ORDER BY item_id")?
         .query_map([session], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
     let collab_items = db.query_row("SELECT count(*) FROM codex_agent_items WHERE session_id=?1 AND item_type='CollabAgentToolCall'", [session], |r| r.get(0))?;
-    let claude_results = if exists(db, "claude_tool_results")? {
+    let claude_results = if claude_results {
         db.prepare("SELECT call_id,is_error FROM claude_tool_results WHERE session_id=?1 ORDER BY call_id")?
             .query_map([session], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
     } else { Vec::new() };
@@ -287,6 +291,8 @@ struct Tally {
     opencode_executed: usize,
     opencode_succeeded: usize,
     opencode_failed: usize,
+    #[serde(default)]
+    claude_sidechain_turns: usize,
     claude_executed: usize,
     claude_succeeded: usize,
     claude_failed: usize,
@@ -324,8 +330,8 @@ impl Tally {
         macro_rules! maps { ($($field:ident),*) => { $(for (key, count) in &other.$field { *self.$field.entry(key.clone()).or_default() += count; })* }; }
         counts!(issued,name_unreported,status_unreported,without_output,outputs_without_call,executed,source_unreported,
             attributed_name_unreported,unattributed,succeeded,failed,mcp,mcp_unnamed,mcp_carried,mcp_without_call,mcp_succeeded,mcp_failed,
-            collab_items,negative,accepted_unknown);
-        maps!(by_name,by_status,by_namespace,by_source,attributed,unknown,mcp_unknown,accepted,aborted);
+            collab_items,negative,accepted_unknown,claude_executed,claude_succeeded,claude_failed,claude_sidechain_turns);
+        maps!(by_name,by_status,by_namespace,by_source,attributed,unknown,mcp_unknown,accepted,aborted,claude_unknown);
         for (server, tools) in &other.mcp_by_server {
             for (tool, count) in tools { *self.mcp_by_server.entry(server.clone()).or_default().entry(tool.clone()).or_default() += count; }
         }
@@ -336,6 +342,7 @@ impl Tally {
 
     fn add(&mut self, s: &Session, rows: &Rows) {
         if let Some(summary) = &s.summary { self.merge(summary); return; }
+        if s.id.starts_with("claude-code:") { self.claude_sidechain_turns += rows.activities.len(); }
         let (calls, items) = (&rows.calls, &rows.items);
         let count = |map: &mut BTreeMap<String, usize>, missing: &mut usize, key: &Option<String>| match key {
             Some(key) => *map.entry(key.clone()).or_default() += 1,
@@ -383,8 +390,8 @@ impl Tally {
                 Some(false) => { self.succeeded += 1; self.claude_succeeded += 1; }
                 Some(true) => { self.failed += 1; self.claude_failed += 1; }
                 None => {
-                    *self.unknown.entry("is_error_unreported").or_default() += 1;
-                    *self.claude_unknown.entry("is_error_unreported").or_default() += 1;
+                    *self.unknown.entry("is_error_unreported".to_owned()).or_default() += 1;
+                    *self.claude_unknown.entry("is_error_unreported".to_owned()).or_default() += 1;
                 }
             }
         }
@@ -505,12 +512,10 @@ fn computed(list: &[Session], coverage: &Value) -> BTreeMap<String, Value> {
             "turn_aborts": "live", "namespaces": "live"},
         "coverage": coverage});
     if list.iter().any(|s| s.id.starts_with("claude-code:")) {
-        let sidechain_turns: usize = list.iter().filter(|s| s.id.starts_with("claude-code:")).filter_map(|s| s.tools.as_ref().ok())
-            .map(|r| r.activities.len()).sum();
         m16["executed"]["scope"].as_array_mut().expect("scope array").push(json!("claude-code"));
         m16["executed"]["by_scope"]["claude-code"] = json!(t.claude_executed);
         m16["executed"]["claude_code_basis"] = json!("fixture: distinct tool-result link; attribution by exact call id; outcome from reported is_error");
-        m16["collaboration"]["sidechain_turns"] = json!(sidechain_turns);
+        m16["collaboration"]["sidechain_turns"] = json!(t.claude_sidechain_turns);
         m16["collaboration"]["claude_code_basis"] = json!("fixture: sidechain turns attributed to parent session, child identity unreported");
     }
     if list.iter().any(|s| s.id.starts_with("opencode:")) {
