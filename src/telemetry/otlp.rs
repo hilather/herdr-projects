@@ -335,12 +335,15 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
         for scope in array(resource, if metrics { "scopeMetrics" } else { "scopeLogs" })? {
             for entry in array(scope, if metrics { "metrics" } else { "logRecords" })? {
                 let ea = attributes(entry)?;
-                // Event names come from metadata; log bodies are never inspected.
+                // DG4a: a JSON log body may carry only the event name (Claude Code,
+                // Gemini CLI); it is used as a name and never stored. Protobuf
+                // bodies are discarded at decode, so Grok/Muse use eventName.
                 let name = if metrics {
                     entry["name"].as_str()
                 } else {
                     entry["eventName"]
                         .as_str()
+                        .or_else(|| entry["body"]["stringValue"].as_str())
                         .or_else(|| ea.get("event.name").and_then(Value::as_str))
                 }
                 .unwrap_or("");

@@ -27,7 +27,9 @@
         {
           "logRecords": [
             {
-              "eventName": "claude_code.api_request",
+              "body": {
+                "stringValue": "claude_code.api_request"
+              },
               "timeUnixNano": "1700000000000000000",
               "attributes": [
                 {
@@ -117,7 +119,9 @@
               ]
             },
             {
-              "eventName": "claude_code.tool_result",
+              "body": {
+                "stringValue": "claude_code.tool_result"
+              },
               "timeUnixNano": "1700000000000000001",
               "attributes": [
                 {

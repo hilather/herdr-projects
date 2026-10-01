@@ -1307,8 +1307,10 @@ the existing certified rollout adapter remains its collection path.
 | Gemini `gemini_cli.tool_call` | tool | `function_name`, `success`, `duration_ms` |
 
 Gemini's documented name uses **`api_response`**, not `api.response`;
-the latter is unmapped. Known log names may arrive in `eventName` or
-`event.name`. Log bodies are never inspected or stored. Known sum metrics
+the latter is unmapped. JSON log names resolve in order from `eventName`, top-level
+`body.stringValue`, then the `event.name` attribute (DG4a). The body fallback
+is used only as an event name; bodies are never stored. Protobuf decoding
+discards bodies (DG4h), so those logs require `eventName` or `event.name`. Known sum metrics
 retain their nonnegative value, reviewed unit (empty, USD, token/tokens/{token}), start/end nanosecond timestamps and
 explicit delta/cumulative temporality. Cumulative samples remain snapshots,
 never deltas computed by guessing resets. Both logs and metrics are retained
@@ -1904,7 +1906,9 @@ fixture-certified; the certification registry is not promoted to live.
 
 `grok_code.api_request` logs are the single authoritative usage source.
 The real exporter supplies the event name in protobuf field 12 (`eventName`);
-`event.name` metadata is also accepted. Log bodies are never inspected.
+`event.name` metadata is also accepted. Protobuf bodies are discarded at
+decode without literal exceptions. JSON retains DG4a's name-only
+`body.stringValue` fallback; bodies are never stored.
 Allowlisted fields are model, input/output/reasoning/cache-read/cache-creation
 counts, integer `cost_usd_micros`, duration, stop reason and turn number.
 Invalid counters, inconsistent cache/reasoning subsets and overflow demote only

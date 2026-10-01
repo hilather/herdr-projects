@@ -1330,13 +1330,15 @@ fn http_protobuf_attempt_token_binding_auth_and_project_token_unchanged() {
         ),
         200
     );
+    // LC4 marks eight usage metrics as reconciliation-only; that reason
+    // does not change the project credential's resource-based binding.
     assert_eq!(
         otlp::records(&f.project)
             .unwrap()
             .as_array()
             .unwrap()
             .iter()
-            .filter(|r| r["binding"] == "unknown_attempt" && r.get("reason").is_none())
+            .filter(|r| r["binding"] == "unknown_attempt" && r["attempt_id"].is_null())
             .count(),
         10
     );
@@ -1428,8 +1430,23 @@ fn grok_build_version_fallback_and_request_identity_are_fail_closed() {
         (serde_json::to_vec(&body_only).unwrap(), "application/json"),
         (pb_request(&body_only, false), "application/x-protobuf"),
     ] {
-        otlp::ingest_attempt(&f.project, "/v1/logs", &bytes, content_type, token).unwrap();
-        assert!(otlp::records(&f.project).unwrap().as_array().unwrap().iter().all(|r| r["kind"] == "unmapped"));
+        // DG4a accepts JSON stringValue as a name only. DG4h discards
+        // protobuf bodies, so only that transport must remain unmapped.
+        let body_fixture = Fixture::reserved();
+        let body_token = otlp::mint_attempt_token(&body_fixture.project, &body_fixture.attempt, 600).unwrap();
+        otlp::ingest_attempt(&body_fixture.project, "/v1/logs", &bytes, content_type, body_token["token"].as_str().unwrap()).unwrap();
+        let records = otlp::records(&body_fixture.project).unwrap();
+        let rows = records.as_array().unwrap();
+        if content_type == "application/json" {
+            assert_eq!(rows.iter().filter(|r| r["kind"] == "usage").count(), 1);
+            let usage = rows.iter().find(|r| r["kind"] == "usage").unwrap();
+            assert_eq!(usage["attributes"]["input_tokens"], 15426);
+            assert_eq!(usage["attributes"]["output_tokens"], 14);
+        } else {
+            assert!(rows.iter().all(|r| r["kind"] == "unmapped"));
+        }
+        assert!(rows.iter().all(|r| r.get("body").is_none()));
+        privacy_scan(&body_fixture, &["lc4-planted-secret@example.invalid"]);
     }
     let mut root = original.clone();
     root["resourceLogs"][0]["resource"]["attributes"].as_array_mut().unwrap().retain(|a| a["key"] != "client.version");

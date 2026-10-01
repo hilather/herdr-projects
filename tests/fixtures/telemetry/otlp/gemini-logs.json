@@ -27,7 +27,9 @@
         {
           "logRecords": [
             {
-              "eventName": "gemini_cli.api_response",
+              "body": {
+                "stringValue": "gemini_cli.api_response"
+              },
               "timeUnixNano": "1700000000000000000",
               "attributes": [
                 {
@@ -123,7 +125,9 @@
               ]
             },
             {
-              "eventName": "gemini_cli.tool_call",
+              "body": {
+                "stringValue": "gemini_cli.tool_call"
+              },
               "timeUnixNano": "1700000000000000001",
               "attributes": [
                 {
