@@ -758,6 +758,13 @@ fn pb_request(root: &Value, metrics: bool) -> Vec<u8> {
                             e.extend(pb_field(n, 2, &d));
                         }
                     }
+                    for (key, n) in [("exponentialHistogram", 10), ("summary", 11)] {
+                        if entry.get(key).is_some() {
+                            // A point containing a private attribute; decoder must leave it opaque.
+                            let point = pb_attrs(7, &json!([{"key":"private_point_key","value":{"stringValue":"DG4H_UNSUPPORTED_SECRET"}}]));
+                            e.extend(pb_field(n, 2, &pb_field(1, 2, &point)));
+                        }
+                    }
                 } else {
                     if let Some(t) = entry.get("timeUnixNano") {
                         e.extend(pb_field(
@@ -799,6 +806,85 @@ fn privacy_scan(f: &Fixture, markers: &[&str]) {
         }
     }
 }
+#[test]
+fn mixed_unsupported_metric_types_preserve_usage_and_match_json() {
+    let f = Fixture::reserved();
+    let mut root: Value = serde_json::from_slice(&payload(&f, "grok-metrics")).unwrap();
+    let entries = root["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+        .as_array_mut()
+        .unwrap();
+    entries.retain(|entry| entry["name"] == "grok_code.token.usage");
+    let usage_count = entries.len();
+    for (name, key) in [
+        ("grok_code.turn.ttft", "exponentialHistogram"),
+        ("startup.duration", "summary"),
+    ] {
+        entries.push(json!({"name":name, key:{"dataPoints":[{"attributes":[{"key":"private_point_key","value":{"stringValue":"DG4H_UNSUPPORTED_SECRET"}}]}]}}));
+    }
+    assert_eq!(
+        otlp::ingest_protobuf(&f.project, "/v1/metrics", &pb_request(&root, true)).unwrap(),
+        usage_count + 2
+    );
+    let rows = otlp::records(&f.project).unwrap();
+    assert_eq!(
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["native_name"] == "grok_code.token.usage" && r["kind"] != "unmapped")
+            .count(),
+        usage_count
+    );
+    for name in ["grok_code.turn.ttft", "startup.duration"] {
+        let row = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["native_name"] == name)
+            .unwrap();
+        assert_eq!(row["kind"], "unmapped");
+        assert_eq!(row["reason"], "unsupported_metric_type");
+        assert_eq!(row["unmapped_attribute_keys"], json!([]));
+        assert!(row.get("value").is_none());
+    }
+    assert_eq!(
+        otlp::ingest(
+            &f.project,
+            "/v1/metrics",
+            &serde_json::to_vec(&root).unwrap()
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(otlp::records(&f.project).unwrap(), rows);
+    privacy_scan(&f, &["DG4H_UNSUPPORTED_SECRET", "private_point_key"]);
+    // Absent or conflicting data fields reject atomically in either transport.
+    for invalid in [
+        json!({"name":"missing"}),
+        json!({"name":"conflict","summary":{},"exponentialHistogram":{}}),
+    ] {
+        root["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+            .as_array_mut()
+            .unwrap()
+            .push(invalid);
+        assert!(
+            otlp::ingest(
+                &f.project,
+                "/v1/metrics",
+                &serde_json::to_vec(&root).unwrap()
+            )
+            .is_err()
+        );
+        assert!(
+            otlp::ingest_protobuf(&f.project, "/v1/metrics", &pb_request(&root, true)).is_err()
+        );
+        assert_eq!(otlp::records(&f.project).unwrap(), rows);
+        root["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+    }
+}
+
 #[test]
 fn protobuf_grok_muse_match_json_including_gauge_histogram_and_privacy() {
     let f = Fixture::reserved();

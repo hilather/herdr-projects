@@ -2199,6 +2199,15 @@ and ResourceLogs/ScopeLogs/LogRecord attributes, time and severity number.
 Gauge rows have no temporality; Sum/Histogram require explicit delta/cumulative
 and retain it. Histogram rows carry count and optional sum, never invented
 point values or buckets. Unknown timing/latency names remain unmapped.
+ExponentialHistogram (wire field 10) and Summary (11) are recognized but
+unsupported in both transports. Their points are never traversed; each
+instrument emits one `unmapped` diagnostic with `unsupported_metric_type`,
+a sanitized native name and resource keys only, without point keys or values.
+Mixed exports still store the supported usage rows. Metrics with no data field
+retain JSON's batch rejection behavior; both transports require exactly one
+of Sum, Gauge, Histogram, ExponentialHistogram or Summary and reject conflicting
+data fields atomically. Public-store E2E coverage:
+`mixed_unsupported_metric_types_preserve_usage_and_match_json`.
 
 AnyValue strings, booleans, signed integers and finite doubles normalize as
 JSON does. Arrays and kvlists are recursively validated, then unsupported as
@@ -2284,3 +2293,11 @@ All ten non-socket OTLP tests pass, including new protobuf/token workflows.
 completes with no warnings in changed files/lines; existing unrelated warnings
 remain. `git diff --check` passes. The steward must run socket tests outside
 the sandbox and perform the separate disposable live certification runs.
+
+DG4h-b review fix validation reran `telemetry_otlp`, `telemetry_live`,
+`telemetry_certification` and `telemetry_conformance` with the same offline,
+locked, three-job command and project-local TMPDIR: **45 passed, 3 socket-only
+failures, 4 ignored**. All eleven non-socket OTLP workflows pass, including
+mixed unsupported instruments. The three failures are the OTLP TCP listener
+tests listed above, each failing with `Operation not permitted`; live tests
+remain steward-only. Clippy completes with no warnings in changed files.

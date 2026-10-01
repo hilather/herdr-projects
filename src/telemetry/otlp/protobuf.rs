@@ -30,6 +30,8 @@ fn field(message: &str, n: u64) -> Option<(&'static str, Kind, bool)> {
         ("metric", 5) => ("gauge", Message("gauge"), false),
         ("metric", 7) => ("sum", Message("sum"), false),
         ("metric", 9) => ("histogram", Message("histogram"), false),
+        ("metric", 10) => ("exponentialHistogram", Unsupported, false),
+        ("metric", 11) => ("summary", Unsupported, false),
         ("sum" | "gauge", 1) => ("dataPoints", Message("point"), true),
         ("histogram", 1) => ("dataPoints", Message("hp"), true),
         ("sum" | "histogram", 2) => ("aggregationTemporality", Enum, false),
@@ -183,10 +185,16 @@ fn decode(
     }
     if message == "metric" {
         ensure!(
-            ["sum", "gauge", "histogram"]
-                .iter()
-                .filter(|k| out.contains_key(**k))
-                .count()
+            [
+                "sum",
+                "gauge",
+                "histogram",
+                "exponentialHistogram",
+                "summary"
+            ]
+            .iter()
+            .filter(|k| out.contains_key(**k))
+            .count()
                 == 1,
             "invalid metric data"
         );

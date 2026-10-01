@@ -338,12 +338,24 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                         .or_else(|| ea.get("event.name").and_then(Value::as_str))
                 }
                 .unwrap_or("");
+                let unsupported = metrics
+                    && (entry.get("exponentialHistogram").is_some() || entry.get("summary").is_some());
+                if metrics {
+                    ensure!(
+                        ["sum", "gauge", "histogram", "exponentialHistogram", "summary"]
+                            .iter().filter(|key| entry.get(**key).is_some()).count() == 1,
+                        "invalid metric data"
+                    );
+                }
                 let mapping = MAPPINGS
                     .iter()
-                    .find(|m| known && m.0 == harness && m.1 == name && metrics == (name.ends_with(".usage") || name.ends_with("token_usage") || m.0 == "grok")
+                    .find(|m| !unsupported && known && m.0 == harness && m.1 == name && metrics == (name.ends_with(".usage") || name.ends_with("token_usage") || m.0 == "grok")
                         && (harness != "grok" || cli_version == Some("1.0.46"))
                         && (harness != "muse" || cli_version == Some("1.4.0-R4161.1")));
-                let points = if metrics {
+                let points = if unsupported {
+                    // One keys-only diagnostic per instrument; never inspect unsupported points.
+                    vec![json!({})]
+                } else if metrics {
                     let data = entry
                         .get("sum")
                         .or_else(|| entry.get("gauge"))
@@ -390,6 +402,12 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                         if cli_version != Some("1.0.46") {
                             payload["mapping_certified"] = json!("none");
                             payload["reason"] = json!("cli_version_uncertified");
+                        }
+                    }
+                    if unsupported {
+                        payload["reason"] = json!("unsupported_metric_type");
+                        if let Some(name) = identifier(&json!(name)) {
+                            payload["native_name"] = name;
                         }
                     }
                     if conflict { payload["reason"] = json!("cross_attempt_quarantined"); }
