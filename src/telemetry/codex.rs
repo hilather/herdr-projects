@@ -1367,6 +1367,17 @@ fn terminated_turns(db: &Connection, attempts: &[CanonicalAttempt]) -> Result<()
         FROM rollout_sources s JOIN rollout_ingest_state x ON x.path_digest=s.path_digest
         WHERE s.binding='bound' AND s.attempt_id IS NOT NULL AND x.last_turn_offset IS NOT NULL AND x.last_turn_completed=0")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
+    // A collector with no applicable termination and no retained receipt has
+    // nothing to reconcile. Avoid acquiring the writer merely to delete zero
+    // rows; this is common during concurrent live tails and completed replays.
+    let applicable = open.iter().any(|(_, attempt, _, opened)| {
+        attempts.iter().find(|a| a.id == *attempt).and_then(|a| a.terminated.as_ref())
+            .is_some_and(|(cause, at)| matches!(cause.as_str(), "cancellation" | "completion")
+                && opened.is_none_or(|opened| opened <= *at))
+    });
+    if !applicable && !db.query_row("SELECT EXISTS(SELECT 1 FROM rollout_turn_terminations)", [], |r| r.get::<_, bool>(0))? {
+        return Ok(());
+    }
     let tx = db.unchecked_transaction()?;
     tx.execute("DELETE FROM rollout_turn_terminations", [])?;
     for (key, attempt, offset, opened) in open {
@@ -1402,7 +1413,7 @@ fn bind(db: &mut Connection, attempts: &[CanonicalAttempt]) -> Result<()> {
         let (mut matches, mut refused) = (Vec::new(), None);
         for a in cwd_attempt.as_deref().and_then(|id| by_id.get(id)).into_iter().flatten().copied() {
             let source_kind = match originator.as_deref() { Some("claude-code") => "claude", Some("gemini-cli") => "gemini", Some("opencode") => "opencode", _ => "codex" };
-            if a.kind.as_deref().unwrap_or("codex") != source_kind { continue; }
+            if a.kind.as_deref() != Some(source_kind) { continue; }
             let Some(at) = at.filter(|at| a.decided_unix_ms.is_some_and(|decided| *at >= decided)) else { continue };
             match &a.binding {
                 Binding::Predates if rule1(&a.home) => matches.push((a, "predates_binding")),

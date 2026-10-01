@@ -351,6 +351,7 @@ fn native_chat_metadata_updates_binding_privacy_and_retention() {
         "--json",
     ]);
     assert_eq!(f.count("rollout_sources"), 0);
+    for table in ["accounting_usage_totals", "accounting_native_totals", "accounting_source_summary", "accounting_tool_summary"] { assert_eq!(f.count(table), 0, "retention purges {table}"); }
     f.cli("collect");
     assert_eq!(f.count("rollout_sources"), 0);
     f.cli_args(&[
@@ -487,5 +488,26 @@ fn local_gemini_keeps_codex_and_claude_results_unchanged() {
         otlp::records(&f.project).unwrap().as_array().unwrap().len(),
         7
     );
+    no_secrets(&f);
+}
+
+#[test]
+fn gemini_maintained_reads_match_full_derivation() {
+    let mut f = gemini(true, "0.62.0");
+    let terminated = plant_aggregate_termination(&f);
+    f.decided = terminated;
+    plant(&f);
+    native(&f, &format!("{:x}", Sha256::digest(f.worktree().as_bytes())));
+    f.cli("collect");
+    let observations = otlp::records(&f.project).unwrap();
+    assert_eq!(observations.as_array().unwrap().len(), 7);
+    let replay = aggregate_read_snapshot(&f);
+    // Native Gemini counters retain main's uncertified accounting coverage;
+    // SDK observations remain separate, never fabricated ledger deltas.
+    assert_eq!(replay["metrics"][0]["value"]["reason"], "no_certified_source");
+    assert_eq!(replay["metrics"][0]["coverage"]["excluded"]["cli_version_uncertified"], 1);
+    verify_aggregate_replay(&f, &replay);
+    assert_eq!(f.count("usage_entries"), 0);
+    assert_eq!(otlp::records(&f.project).unwrap(), observations);
     no_secrets(&f);
 }

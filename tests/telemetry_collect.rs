@@ -280,6 +280,10 @@ fn idle_rollout_without_final_event_records_a_coverage_gap() {
     let persisted = ledger(&f);
     f.cli_args(&["accounting", "sync"]);
     let entries = f.cli_args(&["accounting", "entries"]).1;
+    // A completed, unchanged collect has no termination receipt to reconcile.
+    // It must succeed through the CLI even beside an already-held writer.
+    let mut writer = f.sidecar();
+    let lock = writer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
     for _ in 0..3 {
         let (report, _) = f.cli("collect");
         assert_eq!(report["collected"]["files"], 0);
@@ -287,6 +291,7 @@ fn idle_rollout_without_final_event_records_a_coverage_gap() {
         assert_eq!(report["attempts"][0]["usage"], usage);
         assert_eq!(ledger(&f), persisted);
     }
+    lock.commit().unwrap();
     // A producer replacing the file with identical bytes must still replay
     // from zero: the fast path requires the original device and inode.
     let replacement = path.with_extension("replacement");

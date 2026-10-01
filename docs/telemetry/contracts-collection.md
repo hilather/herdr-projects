@@ -1747,7 +1747,7 @@ Claude/Codex suites and the non-Codex certification rule remain in place.
 The required 19-suite telemetry invocation (`--locked --offline -j 3`,
 `TMPDIR=$PWD/target/tmp`, `--no-fail-fast`) completed: 187 passed, 13 failed,
 11 ignored. Five stale ingest-version assertions and the backup inventory
-transcript were updated for ingest 11/accounting 14 and the added tables;
+transcript were updated for ingest 11/accounting 15 and the added tables;
 focused reruns passed **conformance 21/21** and **operations 13/13**.
 Final OpenCode coverage passed **4/4**, including changed-message quarantine
 and version recertification. `scale_gates_hold_under_load` saw a concurrent

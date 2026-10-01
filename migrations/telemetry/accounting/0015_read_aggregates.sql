@@ -197,3 +197,36 @@ CREATE TRIGGER IF NOT EXISTS accounting_tools_claude_tool_results_DELETE AFTER D
 UPDATE accounting_stream SET sequence=sequence+1;
 INSERT INTO accounting_dirty_sessions VALUES(OLD.session_id) ON CONFLICT(session_id) DO NOTHING;
 END;
+
+-- Native tool corrections participate in the same session replay frontier.
+CREATE TRIGGER IF NOT EXISTS accounting_tools_opencode_messages_INSERT AFTER INSERT ON opencode_messages BEGIN
+UPDATE accounting_stream SET sequence=sequence+1;
+INSERT INTO accounting_dirty_sessions VALUES(NEW.session_id) ON CONFLICT(session_id) DO NOTHING;
+END;
+
+CREATE TRIGGER IF NOT EXISTS accounting_tools_opencode_messages_UPDATE AFTER UPDATE ON opencode_messages BEGIN
+UPDATE accounting_stream SET sequence=sequence+1;
+INSERT INTO accounting_dirty_sessions VALUES(OLD.session_id) ON CONFLICT(session_id) DO NOTHING;
+INSERT INTO accounting_dirty_sessions VALUES(NEW.session_id) ON CONFLICT(session_id) DO NOTHING;
+END;
+
+CREATE TRIGGER IF NOT EXISTS accounting_tools_opencode_messages_DELETE AFTER DELETE ON opencode_messages BEGIN
+UPDATE accounting_stream SET sequence=sequence+1;
+INSERT INTO accounting_dirty_sessions VALUES(OLD.session_id) ON CONFLICT(session_id) DO NOTHING;
+END;
+
+CREATE TRIGGER IF NOT EXISTS accounting_tools_opencode_tools_INSERT AFTER INSERT ON opencode_tools BEGIN
+UPDATE accounting_stream SET sequence=sequence+1;
+INSERT INTO accounting_dirty_sessions VALUES(NEW.session_id) ON CONFLICT(session_id) DO NOTHING;
+END;
+
+CREATE TRIGGER IF NOT EXISTS accounting_tools_opencode_tools_UPDATE AFTER UPDATE ON opencode_tools BEGIN
+UPDATE accounting_stream SET sequence=sequence+1;
+INSERT INTO accounting_dirty_sessions VALUES(OLD.session_id) ON CONFLICT(session_id) DO NOTHING;
+INSERT INTO accounting_dirty_sessions VALUES(NEW.session_id) ON CONFLICT(session_id) DO NOTHING;
+END;
+
+CREATE TRIGGER IF NOT EXISTS accounting_tools_opencode_tools_DELETE AFTER DELETE ON opencode_tools BEGIN
+UPDATE accounting_stream SET sequence=sequence+1;
+INSERT INTO accounting_dirty_sessions VALUES(OLD.session_id) ON CONFLICT(session_id) DO NOTHING;
+END;

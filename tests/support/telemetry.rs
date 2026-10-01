@@ -231,3 +231,52 @@ pub fn insert_grant(db_path: &Path, inputs: &LaunchInputs) {
     rusqlite::Connection::open(db_path).unwrap().execute("INSERT INTO approval_grants(id,payload,payload_hash) VALUES(?1,?2,?3)",
         rusqlite::params![reference.id, String::from_utf8(payload).unwrap(), reference.digest]).unwrap();
 }
+
+/// Observe the public aggregate-backed surfaces, omitting observation clocks.
+pub fn aggregate_read_snapshot(f: &Fixture) -> serde_json::Value {
+    use serde_json::json;
+    let report = f.report();
+    let metrics: Vec<_> = ["M08", "M09", "M12", "M14", "M15", "M16", "M17", "M18"]
+        .iter().map(|id| report["metrics"][id].clone()).collect();
+    let cost = f.cli_args(&["view", "cost", "--json"]).0;
+    let rows: Vec<_> = cost["rows"].as_array().unwrap().iter().map(|r|
+        json!({"metric_id": r["metric_id"], "value": r["value"], "coverage": r["coverage"],
+            "status": r["status"], "basis": r["basis"], "digest": r["projection"]["content_digest"]})).collect();
+    json!({"metrics": metrics, "after_termination": report["after_termination"],
+        "tools": f.cli_args(&["accounting", "tools", "--json"]).0, "cost": rows})
+}
+
+/// Exercise maintained reads against source replay and the analytics verifier.
+pub fn verify_aggregate_replay(f: &Fixture, replay: &serde_json::Value) {
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(&aggregate_read_snapshot(f), replay, "maintained reads equal full derivation");
+    f.cli_args(&["accounting", "reprice"]);
+    let priced = aggregate_read_snapshot(f);
+    let ledger = f.cli_args(&["accounting", "entries"]).1;
+    let cost = f.cli_args(&["accounting", "cost", "--json"]).1;
+    f.cli_args(&["query", "--metric", "M08,M09,M12,M14,M16,M17,M18", "--json"]);
+    f.cli_args(&["analytics", "refresh"]);
+    let pinned = f.cli_args(&["analytics", "snapshot"]).1;
+    assert_eq!(f.cli_args(&["analytics", "rebuild", "--verify"]).0["identical"], true);
+    f.cli_args(&["analytics", "rebuild"]);
+    assert_eq!(f.cli_args(&["analytics", "snapshot"]).1, pinned);
+    // The public store's missing projection marker selects full ledger replay.
+    f.sidecar().execute("DELETE FROM usage_ledger", []).unwrap();
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "entries"]).1, ledger);
+    assert_eq!(aggregate_read_snapshot(f), priced);
+    assert_eq!(f.cli_args(&["accounting", "cost", "--json"]).1, cost);
+    f.cli_args(&["analytics", "refresh"]);
+    assert_eq!(f.cli_args(&["analytics", "rebuild", "--verify"]).0["identical"], true);
+}
+
+/// Plant the retained termination observation without launching a worker.
+pub fn plant_aggregate_termination(f: &Fixture) -> i64 {
+    f.cancel_reserved();
+    let at = unix_ms();
+    rusqlite::Connection::open(f.project.join(".state/state.db")).unwrap().execute(
+        "INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.worker_terminated',?1,2,1,?2)",
+        rusqlite::params![f.attempt, serde_json::json!({"version":1,"attempt":f.attempt,
+            "cause":"cancellation","observed_unix_ms":at}).to_string()]).unwrap();
+    at
+}

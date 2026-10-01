@@ -73,6 +73,7 @@ migrated sidecar.
   0010 Claude Code message identity and reported tool outcomes (DG4b);
   0011 OpenCode native message/tool metadata (DG4d);
   accounting 0013 adds Claude ledger source/cache normalization, 0014 adds OpenCode,
+  0015 adds maintained read aggregates,
   contracts-collection.md A6–A9 and DG4b/DG4d), mode 0600, created on first collect. No
   cross-database transaction or foreign key; sidecar rows reference canonical
   IDs by value and record `orphan` when the canonical row is missing.

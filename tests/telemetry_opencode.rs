@@ -136,6 +136,7 @@ fn native_opencode_backup_retention_and_tombstones() {
     let plan = f.cli_args(&["maintenance","plan","--json"]).0;
     f.cli_args(&["maintenance","apply","--confirm",plan["plan_digest"].as_str().unwrap(),"--json"]);
     assert_eq!(f.count("opencode_messages"),0);assert_eq!(f.count("opencode_tools"),0);
+    for table in ["accounting_usage_totals", "accounting_native_totals", "accounting_source_summary", "accounting_tool_summary"] { assert_eq!(f.count(table), 0, "retention purges {table}"); }
     f.cli("collect");assert_eq!(f.count("opencode_messages"),0);
     f.cli_args(&["backup","restore","--from",backup.to_str().unwrap(),"--force"]);
     assert_eq!(f.count("opencode_messages"),0);privacy(&f);
@@ -150,11 +151,66 @@ fn native_opencode_and_codex_keep_independent_usage() {
     let (old,decided): (String,i64) = canonical.query_row("SELECT attempt_id,decided_unix_ms FROM dispatch_decisions WHERE attempt_id<>?1",[&f.attempt],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
     let cwd = format!("{}/.state/worktrees/{old}/repo-00",f.project.display());
     f.rollout(&f.tmp.path().join("codex-home"),SID,&["head.jsonl","tail.jsonl"],&cwd,decided+1000,"0.154.0");
-    f.cli("collect"); f.cli_args(&["accounting","sync"]);
+    f.cli("collect");
+    let full = aggregate_read_snapshot(&f);
+    f.cli_args(&["accounting","sync"]);
+    assert_eq!(aggregate_read_snapshot(&f), full, "mixed Codex/OpenCode maintained reads");
     let all = f.cli_args(&["usage","--json"]).0;
     let old_usage = &all["attempts"].as_array().unwrap().iter().find(|a|a["attempt_id"]==old).unwrap()["usage"];
     assert_eq!(old_usage["input_tokens"],1500);
     assert_eq!(usage(&f)["input_tokens"],140);
     assert_eq!(f.count("usage_entries"),4);
+    privacy(&f);
+}
+
+#[test]
+fn opencode_maintained_reads_match_full_derivation() {
+    let f = fixture();
+    let terminated = plant_aggregate_termination(&f);
+    let db = native(&f);
+    session(&db, SID, &f.worktree(), "1.18.34", terminated + 1);
+    message(&db, SID, "msg-one", false, true, terminated + 2);
+    f.cli("collect");
+    let replay = aggregate_read_snapshot(&f);
+    assert_eq!(replay["metrics"][0]["value"], 140);
+    assert_eq!(replay["metrics"][1]["value"], 25);
+    assert_eq!(replay["tools"]["metrics"]["M16"]["executed"]["by_scope"]["opencode"], 2);
+    assert_eq!(replay["tools"]["metrics"]["M17"]["value"], "1/2");
+    assert_eq!(replay["after_termination"].as_array().unwrap().len(), 1);
+    let card = f.tmp.path().join("opencode-rates.json");
+    fs::write(&card, json!({"card_id":"synthetic-opencode", "version":1,
+        "provider":"fixture-provider", "product":"opencode", "models":["fixture-model"],
+        "currency":"USD", "rate_unit":1_000_000, "effective_from_unix_ms":0,
+        "includes":{"discounts":false,"taxes":false,"fees":false},
+        "source":"INVENTED synthetic rates; not provider prices",
+        "rates":[{"category":"input","rate":"2"},{"category":"cache_read","rate":"0.5"},
+            {"category":"cache_write","rate":"3"},{"category":"output","rate":"6"}]}).to_string()).unwrap();
+    f.cli_args(&["accounting", "import-rate-card", card.to_str().unwrap()]);
+    verify_aggregate_replay(&f, &replay);
+    for table in ["accounting_usage_totals", "accounting_native_totals", "accounting_source_summary", "accounting_tool_summary"] {
+        assert_eq!(f.count(table), 1, "OpenCode populates {table}");
+    }
+    assert_eq!(f.report()["metrics"]["M14"]["value"], "0/1");
+    let native_cost: f64 = f.sidecar().query_row("SELECT sum(cost) FROM opencode_messages", [], |r| r.get(0)).unwrap();
+    assert_eq!(native_cost, 0.125);
+    // Correct a tool outcome with no new usage; cached reads must invalidate.
+    f.sidecar().execute("UPDATE opencode_tools SET status='completed',is_error=0 WHERE part_id='msg-one-fail'", []).unwrap();
+    let corrected = aggregate_read_snapshot(&f);
+    assert_eq!(corrected["tools"]["metrics"]["M17"]["value"], "2/2");
+    f.cli_args(&["analytics", "refresh"]);
+    assert_eq!(f.cli_args(&["analytics", "rebuild", "--verify"]).0["identical"], true);
+    verify_aggregate_replay(&f, &corrected);
+    // Include an independently priceable invocation while preserving main's
+    // refusal to estimate entries with an unknown cache-write convention.
+    message(&db, SID, "msg-priced", false, true, terminated + 3);
+    db.execute("UPDATE message SET data=json_set(data,'$.tokens.cache.write',0) WHERE id='msg-priced'", []).unwrap();
+    f.cli("collect");
+    let appended = aggregate_read_snapshot(&f);
+    assert_eq!(appended["metrics"][0]["value"], 270);
+    assert_eq!(appended["metrics"][1]["value"], 50);
+    verify_aggregate_replay(&f, &appended);
+    let metrics = f.report()["metrics"].clone();
+    assert_eq!(metrics["M12"]["estimate"]["priced_amount"], "0.000365");
+    assert_eq!(metrics["M14"]["value"], "1/2");
     privacy(&f);
 }

@@ -29,7 +29,7 @@ for either. This is not a certification of an OTLP transport.
 | --- | --- |
 | Source | branch `telemetry/tm51-scale-certification` from `main` `20a763f`, plus the fixes in §5 |
 | Build | `cargo test --release --locked --offline -j 3 --features state-store --test telemetry_scale --no-run` (rustc 1.98.0), system SQLite 3.53.4 |
-| Stores | canonical `SCHEMA = 67`; sidecar streams `codex` 3, `ingest` 10, `accounting` 14, `quality` 2, `analytics` 3, `health` 1, `policies` 1 |
+| Stores | canonical `SCHEMA = 68`; sidecar streams `codex` 3, `ingest` 11, `accounting` 15, `quality` 3, `analytics` 3, `health` 1, `policies` 1 |
 | CPU / memory | Intel Core i7-8750H, 6 cores / 12 threads, 62 GiB RAM, zram swap |
 | Disk | Intel SSDPEKNW010T8 NVMe, LUKS, btrfs (`compress=zstd:3`). Every dataset lived under `bench-data/` on this disk, never on the RAM-backed `/tmp` |
 | OS | Linux 7.2.3-arch1-3 |
@@ -764,7 +764,7 @@ warnings remain. Temporary instrumentation, wrappers and all `bench-data/`
 datasets were removed before the final commit.
 ## 4.10 P2 aggregate reads and incremental analytics (pending steward's 1M certification)
 
-Branch `perf/incremental-analytics`, accounting stream **14**, analytics
+Branch `perf/incremental-analytics`, accounting stream **15**, analytics
 stream **3**. This addresses L3 and analytics' portion of L4. Only the
 100k/64 dataset was measured; no 1M run was performed.
 
@@ -955,7 +955,7 @@ on changed lines (existing warnings remain elsewhere).
 Branch `perf/incremental-analytics`, rebased onto main `033e93b` (P3/P3b/P3c).
 **Pending the steward's serial 1M certification.** Analytics migrations are
 now `0001_aggregate_revisions`, `0002_workspace_projections`, then
-`0003_input_frontiers`: current analytics stream **3**, accounting **14**.
+`0003_input_frontiers`: current analytics stream **3**, accounting **15**.
 The original P2 measurements in §4.10 predate this workspace merge.
 
 Providers that independently open canonical/sidecar readers now share pinned
@@ -1193,8 +1193,9 @@ remain. No new crate or source process spawn. Temporary instrumentation and all
 Rebased P2/P2b/P2c onto `origin/main` at `ded2cd9`, preserving DG4b's
 native Claude adapter and #196's fixture-only rule for every non-Codex
 adapter. Main owns accounting `0013_claude_code.sql`; read aggregates are
-`0014_read_aggregates.sql`, accounting stream **14**, ingest stream **10**.
-The migration/version pins and Stores row agree.
+`0015_read_aggregates.sql`, accounting stream **15**, ingest stream **10**.
+P2e subsequently renumbered these read aggregates to 0015; the current
+migration/version pins and Stores row agree.
 
 Claude usage already enters the shared ledger and native usage tables, so
 usage/native/source totals retain the full derivation's acceptance,
@@ -1228,7 +1229,8 @@ and `p2d-after`. All data stayed under `$PWD/bench-data/`; no other benchmark
 or build overlapped timing. The before binary contains the rebased P2c
 implementation, prior to these Claude and contention follow-ups. Before the
 after samples, the fixture's accounting version was reset to 13 to replay the
-corrected, idempotent 0014 migration, then public sync/refresh settled its
+corrected, idempotent read-aggregate migration (now 0015 after P2e), then
+public sync/refresh settled its
 projections outside timing. Sources were neither regenerated nor collected.
 
 | Surface | Before p50 / p95 ms | After p50 / p95 ms |
@@ -1280,6 +1282,131 @@ gate passes in the full suite, all ten contention runs and the final release
 run, retaining exact totals, one acceptance, pinned as-of reproducibility,
 byte-identical rebuild and canonical digest checks. Clippy reports no warning
 in changed lines. Benchmark datasets are deleted before commit.
+
+### 4.14 P2e: OpenCode/Gemini aggregate compatibility (100k only)
+
+Rebased all four P2 commits through the former `052e14c` onto cached
+`origin/main` `ce1b316` (DG6a–c, DG4c and DG4d). The requested fetch failed
+before contacting GitHub because SSH rejected the permissions on
+`/etc/ssh/ssh_config.d/20-omarchy-keepalive.conf`; no SSH configuration was
+changed. This ref already contains both adapter commits named by the steward.
+Main's accounting 0013 (Claude) and 0014 (OpenCode) are preserved; the P2
+migration is `0015_read_aggregates.sql`, stream **15**. Canonical 0068,
+quality 0003, registry v2, health-rules v3 and DG6's quality-collect flake
+derivation remain intact. Every non-Codex adapter remains fixture-only.
+
+OpenCode already shares the native usage tables and normalized ledger. The
+maintained tool tally now merges its execution/success/failure scope counters
+as well as the common totals. Native message/tool insert, update and delete
+triggers advance P1's frontier and queue the affected sessions, including both
+identities on updates. The analytics tools dependency includes `opencode_*`.
+The ledger, summaries and committed frontier still become visible atomically;
+stale reads fall back to the original derivation. No metric arithmetic,
+coverage, as-of selection, pricing convention or certification rule changes.
+Gemini native counters remain outside accounting-certified usage, exactly as
+on main; its SDK records remain separate observations. They are never converted
+into fabricated ledger deltas. Main's OpenCode/Gemini retention and backup lists
+remain; session/path summaries are purged with their sources.
+
+CLI E2E coverage reuses each adapter's native fixtures and planted-attempt
+pattern. It compares M08/M09/M12/M14/M15/M16/M17/M18, tools, cost rows/digests
+and after-termination diagnostics before sync and after maintained sync, then
+forces a full ledger replay and checks identical ledger/cost bytes. Analytics
+verify reports identical, and rebuilding preserves the snapshot byte for byte.
+OpenCode additionally exercises a tool-only correction, mixed Codex/OpenCode
+reads and exact partial pricing: an unknown cache-write convention remains
+unpriced; a separate priceable invocation contributes **0.000365 USD**, coverage
+**1/2**. Gemini preserves its exact unavailable accounting coverage and seven
+SDK observations. Existing adapter retention workflows assert all four
+session-summary tables are empty after source pruning. No unit/source-text
+coverage, crate or source process spawn was added.
+
+An exploratory contention run exposed an accounting writer-acquisition BUSY
+in run 3 (1-minute load 14.46); it is not a socket failure. Collection now
+skips the two empty termination-table DELETE transactions when no termination
+applies and no receipt is retained. Existing receipt reconciliation, recovery,
+idle and replacement paths keep their original writes. The completed-rollout
+CLI workflow holds an IMMEDIATE writer lock during three no-op collects and
+checks unchanged usage, ledger rows and recovered coverage. OpenCode tool-table
+emptiness is checked once per pinned snapshot, avoiding a probe per Codex
+session during aggregate maintenance. Neither busy timeout nor retry limits,
+durability, gate assertions or existing golden values changed.
+
+Final correctness validation ran all **20** `tests/telemetry*.rs` targets with
+`TMPDIR=$PWD/target/tmp`, `RUST_TEST_THREADS=1`, `cargo test --locked --offline
+-j 3 --features state-store --no-fail-fast`: **207 passed, 12 ignored, six
+socket-only failures**. Every scale workflow passes, including the unchanged
+`scale_gates_hold_under_load`. The final release gate also passes unchanged
+in **14.30 s**. Unix socket bind EPERM affects:
+
+- `telemetry::attempts_show_attention_summary`
+- `telemetry_accounting::attention_intervals_union_and_censor`
+- `telemetry_health::recommendations_and_notices_change_no_canonical_state_and_no_dispatch`
+- `telemetry_workspace::thread_start_records_the_dispatch_reason_and_the_sidebar_suffix`
+
+TCP loopback bind EPERM affects `telemetry_otlp::http_auth_limits_malformed_and_replay`
+and `telemetry_otlp::http_request_rate_is_bounded`. No workaround or expected-value
+change was made for these failures. Clippy checks the adapter, collect, query,
+scale and operations targets against changed lines from `origin/main`.
+
+The final reproduction prebuilt `telemetry_scale` and `telemetry_operations`
+with `--locked --offline -j 3 --features state-store --no-run`, then ran ten
+exact `scale_gates_hold_under_load` cargo commands beside ten complete
+`telemetry_operations` cargo commands. Both loops used `TMPDIR=$PWD/target/tmp`
+and one test thread; **10/10 gates and 10/10 operations suites passed, zero
+failures**. A documentation edit triggered the package-wide build script and
+recompiled unchanged source in run 2; all other final runs reused their
+prebuilt binaries. Load averages (1/5/15 minutes)
+were **1.27/3.65/5.65 → 6.29/5.09/5.64**. This is local contention evidence,
+not a universal starvation bound or a controller-latency certification. Clippy
+reported **zero warnings on changed lines**; unrelated warnings remain.
+
+**Same on-disk 100k/64 dataset, three repeats; pending the steward's serial
+1M certification. No 1M run.** Both releases used §1's exact
+`cargo test --release --locked --offline -j 3 --features state-store
+--test telemetry_scale --no-run`. The rebased P2d code with migration 0015
+renumbered, before the adapter/correctness follow-up, supplies the baseline.
+Phases 0 and 1 generate/ingest the seed-5100 dataset once. Run phase 2 and
+`scale_9_analytics_refresh` with `SCALE_EVENTS=100000 SCALE_ACTIVE=64
+SCALE_REPEATS=3 SCALE_PER_ROUND=1 SCALE_TAG=p2e-before|p2e-after`.
+Before the after phases, reset only the sidecar accounting version to 14,
+replay the corrected idempotent 0015 migration, then settle public accounting
+sync and analytics refresh outside timing. No native source, manifest,
+canonical row or producer fact was regenerated, moved or re-collected. All
+fixture homes and data stayed under `$PWD/bench-data/`; one bench process at a
+time, no overlapping build or other test. The final contention workload is
+separate from these measurements.
+
+| 100k/64 surface, n=3 | Before p50 / p95 ms | After p50 / p95 ms |
+| --- | ---: | ---: |
+| M08 lane usage | 39.04 / 52.03 | 36.61 / 66.41 |
+| M13 coverage | 56.89 / 94.58 | 48.24 / 93.83 |
+| Report | 672.72 / 729.37 | 396.78 / 413.84 |
+| Cost view | 222.83 / 227.73 | 132.81 / 158.43 |
+| Analytics refresh | 1,467.35 / 1,630.35 | 1,234.62 / 1,319.66 |
+
+Refresh peak RSS is **78,408 → 78,364 KiB** (effectively unchanged). Both
+refresh result files report `violations: []` and `canonical_unchanged: true`.
+Load averages (1/5/15 minutes, start → end) from the results JSON:
+
+| Phase | Before load | After load |
+| --- | --- | --- |
+| Queries | 4.58/5.08/6.28 → 5.78/5.32/6.31 | 6.15/6.41/6.06 → 5.53/6.24/6.01 |
+| Refresh | 5.78/5.32/6.31 → 5.88/5.35/6.32 | 5.53/6.24/6.01 → 5.65/6.25/6.02 |
+
+All four measured read p95s are below 500 ms after this follow-up, at 100k.
+M08 p95 increased, and the host is shared and noisy: **no general speedup,
+RSS reduction or L3 closure is claimed**. The scale fleet is Codex-only;
+OpenCode/Gemini/Claude correctness remains fixture-only, not live or 100k
+adapter certification. L1's controller-latency and L4's whole-pass resource
+targets remain open. Benchmark data is deleted before commit.
+
+Files for the P2e resolution/follow-up: accounting migration 0015;
+`src/telemetry/accounting/{mod,tools}.rs`, `src/telemetry/analytics/inputs.rs`,
+`src/telemetry/{codex,maintenance/mod}.rs`; shared telemetry test support and
+`tests/telemetry_{accounting,claude,collect,gemini,opencode}.rs`; this
+certificate and the collection/common/analytics contracts. Main's backup
+inventory is preserved without edits.
 
 ## 5. Inefficiencies found and fixed
 
@@ -1422,6 +1549,11 @@ owner. None is hidden by loosening the target.
   38.20/61.30/422.02/172.01 ms; refresh 2,219.66 → 885.00 ms,
   pending the steward's 1M certification** (§4.13, phase load averages
   included). Report/cost increased; no general speedup claim or L3 closure.
+  **P2e preserves OpenCode/Gemini-equivalent maintained reads after DG4d.
+  At 100k/64, M08/M13/report/cost p95 52.03/94.58/729.37/227.73 →
+  66.41/93.83/413.84/158.43 ms; refresh 1,630.35 → 1,319.66 ms,
+  pending the steward's 1M certification** (§4.14, with phase loads).
+  M08 p95 increased; no general speedup or L3 closure is claimed.
   Owners: accounting lane, analytics (TM4.1).
 - **L4: the ticker's telemetry pass exceeds the 256 MiB envelope at 10,000
   bindings.** The collector itself stays within it (58–115 MB) and its byte

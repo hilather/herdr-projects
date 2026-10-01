@@ -188,6 +188,8 @@ fn sessions(db: &Connection, since: Option<i64>, blocked: &BTreeMap<String, Vec<
     // emptiness check avoids probing it separately for every selected session.
     let claude_results = exists(db, "claude_tool_results")?
         && db.query_row("SELECT EXISTS(SELECT 1 FROM claude_tool_results)", [], |r| r.get::<_, bool>(0))?;
+    let opencode_results = exists(db, "opencode_tools")?
+        && db.query_row("SELECT EXISTS(SELECT 1 FROM opencode_tools)", [], |r| r.get::<_, bool>(0))?;
     let mut grouped = BTreeMap::<&str, Vec<&Source>>::new();
     for s in &sources { grouped.entry(s.0.as_str()).or_default().push(s); }
     let (mut out, mut excluded) = (Vec::new(), BTreeMap::<String, usize>::new());
@@ -203,7 +205,7 @@ fn sessions(db: &Connection, since: Option<i64>, blocked: &BTreeMap<String, Vec<
             text.map(|text| serde_json::from_str::<Tally>(&text)).transpose()?
         } else { None };
         let tools = if !a6 { Err("predates_collection") } else if sources.iter().any(|s| !s.5) { Err("pending_reread") }
-            else if !a8 { Err("predates_collection") } else if sources.iter().any(|s| !s.7) { Err("pending_reread") } else { Ok(if summary.is_some() { Rows::default() } else { rows(db, id, claude_results)? }) };
+            else if !a8 { Err("predates_collection") } else if sources.iter().any(|s| !s.7) { Err("pending_reread") } else { Ok(if summary.is_some() { Rows::default() } else { rows(db, id, claude_results, opencode_results)? }) };
         let waits = attempts.iter().filter_map(|a| blocked.get(a)).flatten().copied().collect();
         let guardians = guardians.get(id).cloned().unwrap_or_default();
         let homes = sources.iter().map(|s| s.6.clone()).collect();
@@ -237,7 +239,7 @@ fn guardians(db: &Connection) -> Result<BTreeMap<String, Vec<i64>>> {
 }
 
 /// The A6 and A8 metadata rows of one session (never content: no such column exists).
-fn rows(db: &Connection, session: &str, claude_results: bool) -> Result<Rows> {
+fn rows(db: &Connection, session: &str, claude_results: bool, opencode_results: bool) -> Result<Rows> {
     let calls = db.prepare("SELECT call_id,call_kind IS NOT NULL,call_kind,name,status,turn_id,called_unix_ms,output_unix_ms FROM codex_tool_calls WHERE session_id=?1
         ORDER BY called_unix_ms IS NULL,called_unix_ms,call_id")?
         .query_map([session], |r| Ok(Call { id: r.get(0)?, recorded: r.get(1)?, kind: r.get(2)?, name: r.get(3)?, status: r.get(4)?, turn: r.get(5)?,
@@ -262,7 +264,7 @@ fn rows(db: &Connection, session: &str, claude_results: bool) -> Result<Rows> {
         db.prepare("SELECT call_id,is_error FROM claude_tool_results WHERE session_id=?1 ORDER BY call_id")?
             .query_map([session], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
     } else { Vec::new() };
-    let opencode_results = if exists(db, "opencode_tools")? {
+    let opencode_results = if opencode_results {
         db.prepare("SELECT tool,status,is_error FROM opencode_tools WHERE session_id=?1 ORDER BY part_id")?
             .query_map([session], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<rusqlite::Result<_>>()?
     } else { Vec::new() };
@@ -288,8 +290,11 @@ struct Tally {
     unattributed: usize,
     succeeded: usize,
     failed: usize,
+    #[serde(default)]
     opencode_executed: usize,
+    #[serde(default)]
     opencode_succeeded: usize,
+    #[serde(default)]
     opencode_failed: usize,
     #[serde(default)]
     claude_sidechain_turns: usize,
@@ -330,7 +335,7 @@ impl Tally {
         macro_rules! maps { ($($field:ident),*) => { $(for (key, count) in &other.$field { *self.$field.entry(key.clone()).or_default() += count; })* }; }
         counts!(issued,name_unreported,status_unreported,without_output,outputs_without_call,executed,source_unreported,
             attributed_name_unreported,unattributed,succeeded,failed,mcp,mcp_unnamed,mcp_carried,mcp_without_call,mcp_succeeded,mcp_failed,
-            collab_items,negative,accepted_unknown,claude_executed,claude_succeeded,claude_failed,claude_sidechain_turns);
+            collab_items,negative,accepted_unknown,claude_executed,claude_succeeded,claude_failed,claude_sidechain_turns,opencode_executed,opencode_succeeded,opencode_failed);
         maps!(by_name,by_status,by_namespace,by_source,attributed,unknown,mcp_unknown,accepted,aborted,claude_unknown);
         for (server, tools) in &other.mcp_by_server {
             for (tool, count) in tools { *self.mcp_by_server.entry(server.clone()).or_default().entry(tool.clone()).or_default() += count; }
