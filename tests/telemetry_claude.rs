@@ -225,7 +225,7 @@ fn claude_upgrade_preserves_an_existing_codex_ledger() {
     drop(db);
     // A writable public command upgrades; every Codex byte visible in the ledger stays.
     f.cli("collect");
-    assert_eq!(f.cli_args(&["accounting", "status"]).0["version"], 18);
+    assert_eq!(f.cli_args(&["accounting", "status"]).0["version"], 19);
     assert_eq!(f.cli_args(&["accounting", "entries"]).1, before);
     assert_eq!(attempt_usage(&f)["total_tokens"], 1680);
 }
@@ -410,5 +410,67 @@ fn claude_model_identifiers_and_planted_secret_conformance() {
     f.cli("collect");
     f.cli_args(&["accounting", "sync"]);
     assert_eq!(f.cli_args(&["accounting", "entries"]).0["entries"].as_array().unwrap().len(), 6);
+    no_secrets(&f);
+}
+
+#[test]
+fn otlp_request_fallback_yields_to_later_native_attempt_source() {
+    use herdr_projects::telemetry::otlp;
+    for native_first in [false, true] {
+        let f = claude();
+        f.cli("collect");
+        f.cli_args(&["accounting", "sync"]);
+        if native_first {
+            transcript(&f, SID, &f.worktree(), "2.1.3", f.decided + 1000);
+            f.cli("collect");
+        }
+        let mut request: Value = serde_json::from_str(&fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/telemetry/otlp/claude-logs.json")).unwrap().replace("@ATTEMPT@", &f.attempt)).unwrap();
+        request["resourceLogs"][0]["resource"]["attributes"].as_array_mut().unwrap().push(json!({"key":"service.version","value":{"stringValue":"2.1.3"}}));
+        let bytes = serde_json::to_vec(&request).unwrap();
+        assert_eq!(otlp::ingest(&f.project, "/v1/logs", &bytes).unwrap(), 2);
+        assert_eq!(otlp::ingest(&f.project, "/v1/logs", &bytes).unwrap(), 0);
+        f.cli_args(&["accounting", "sync"]);
+        if !native_first {
+            assert_eq!(attempt_usage(&f)["total_tokens"], 23);
+            assert_eq!(accepted_delta_entries(&f.cli_args(&["accounting", "entries"]).0).len(), 1);
+            transcript(&f, SID, &f.worktree(), "2.1.3", f.decided + 1000);
+            f.cli("collect");
+            assert_eq!(attempt_usage(&f)["total_tokens"], 407, "live read applies precedence before sync");
+        }
+        f.cli_args(&["accounting", "sync"]);
+        assert_eq!(f.cli_args(&["accounting", "status"]).0["sync"]["mode"], "incremental");
+        assert_eq!(attempt_usage(&f)["total_tokens"], 407);
+        assert_eq!(f.report()["metrics"]["M08"]["value"], 382);
+        let ledger = f.cli_args(&["accounting", "entries"]).0;
+        assert_eq!(accepted_delta_entries(&ledger).len(), 2);
+        let loser = ledger["entries"].as_array().unwrap().iter().find(|e| e["source"] == "otlp:claude-code").unwrap();
+        assert_eq!(loser["provenance"][0]["disposition"], "duplicate");
+        assert_eq!(loser["provenance"][0]["reason"], "native_surface_precedence");
+        let replay = aggregate_read_snapshot(&f);
+        verify_aggregate_replay(&f, &replay);
+        assert_eq!(f.cli_args(&["accounting", "entries"]).0, ledger);
+        no_secrets(&f);
+    }
+}
+
+#[test]
+fn accepted_otlp_cannot_hide_an_uncertified_native_surface() {
+    use herdr_projects::telemetry::otlp;
+    let f = claude();
+    transcript(&f, SID, &f.worktree(), "2.1.99", f.decided + 1000);
+    f.cli("collect");
+    let mut request: Value = serde_json::from_str(&fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/telemetry/otlp/claude-logs.json")).unwrap().replace("@ATTEMPT@", &f.attempt)).unwrap();
+    request["resourceLogs"][0]["resource"]["attributes"].as_array_mut().unwrap().push(json!({"key":"service.version","value":{"stringValue":"2.1.3"}}));
+    otlp::ingest(&f.project, "/v1/logs", &serde_json::to_vec(&request).unwrap()).unwrap();
+    assert_eq!(attempt_usage(&f)["reason"], "cli_version_uncertified");
+    assert_eq!(f.report()["metrics"]["M08"]["value"]["reason"], "no_certified_source");
+    f.cli_args(&["accounting", "sync"]);
+    let ledger = f.cli_args(&["accounting", "entries"]).0;
+    assert!(accepted_delta_entries(&ledger).is_empty());
+    assert_eq!(f.report()["metrics"]["M08"]["value"]["reason"], "no_certified_source");
+    assert!(ledger["entries"].as_array().unwrap().iter().any(|e| e["provenance"][0]["reason"] == "native_surface_precedence"));
+    f.sidecar().execute("DELETE FROM usage_ledger", []).unwrap();
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "entries"]).0, ledger);
     no_secrets(&f);
 }

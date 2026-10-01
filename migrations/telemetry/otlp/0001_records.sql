@@ -1,5 +1,5 @@
 -- Sanitized native observations only; no cross-surface aggregation.
-CREATE TABLE otlp_records (
+CREATE TABLE IF NOT EXISTS otlp_records (
     identity TEXT PRIMARY KEY,
     adapter TEXT NOT NULL,
     attempt_id TEXT,
@@ -10,4 +10,4 @@ CREATE TABLE otlp_records (
     record TEXT NOT NULL CHECK(json_valid(record)),
     observed_unix_ms INTEGER NOT NULL
 ) STRICT;
-CREATE INDEX otlp_records_attempt ON otlp_records(attempt_id,kind);
+CREATE INDEX IF NOT EXISTS otlp_records_attempt ON otlp_records(attempt_id,kind);

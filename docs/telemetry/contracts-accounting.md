@@ -13,6 +13,17 @@ tables (§5) read by SQL only. It never writes `state.db` or Codex tables.
 `accounting entries` prints it read-only (`ledger_not_synced` before the first
 sync; `collection_not_run` without a sidecar).
 
+DG4j extends this ledger in accounting **0019** with accepted-version,
+exact-bound OTLP request usage. Collector capture projects sanitized records
+into the shared normalized-session tables; sync reads those projections.
+`accounting entries` exposes adapter source and stable record provenance.
+Native Claude/Muse takes precedence per attempt and harness; losing OTLP
+entries are `duplicate / native_surface_precedence` and never contribute
+usage or valuation. OTLP normalization is inclusive of cache read/creation;
+its retained source and derived projections follow `sidecar.otlp`, outside
+native-session pruning. See [contracts-collection.md DG4j](contracts-collection.md#dg4j-certified-otlp-usage-in-the-accounting-ledger)
+for gates, normalization, capture, identity and fixture/live limits.
+
 `usage_entries`, one per effective invocation or cumulative observation:
 
 | Basis | Scope | Precedence | Identity (`entry_id`) | Position |

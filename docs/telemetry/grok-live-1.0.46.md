@@ -47,7 +47,8 @@ excludes cache reads, so the harness adds them before comparing.
 `input_tokens`, `output_tokens`, `reasoning_tokens`, `cache_read_tokens` and
 `cache_creation_tokens`. Everything else stays fixture-certified.
 
-**Known gap:** OTLP usage is stored as OTLP records and does not yet feed the
-accounting ledger, so Grok usage is not in M08/M09 or other ledger-based
-metrics. Reconciliation here compares the OTLP usage records against Grok's own
-totals. Feeding certified OTLP usage into the ledger is a follow-up card.
+**Known gap:** addressed by DG4j, pending the steward's live rerun.
+Certified, bound API-request OTLP usage now feeds the accounting ledger,
+M08/M09, attempt usage and ledger-based cost. The updated live harness derives
+`ledger_totals` from counted ledger entries and compares them against Grok's
+own totals; reconciliation-only metrics remain excluded.

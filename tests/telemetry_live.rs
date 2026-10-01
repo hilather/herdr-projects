@@ -486,7 +486,7 @@ fn live(kind: &str) {
     let attempts = f.cli_args(&["attempts", "--json"]).0;
     let entries = f.cli_args(&["accounting", "entries"]).0;
     let counted = support::telemetry::accepted_delta_entries(&entries);
-    let mut records: Vec<Value> = counted.iter().map(|e| counters(&e["native"])).collect();
+    let records: Vec<Value> = counted.iter().map(|e| counters(&e["native"])).collect();
     let mut totals = BTreeMap::<String, u64>::new();
     for entry in counted {
         let record = counters(&entry["native"]);
@@ -497,20 +497,6 @@ fn live(kind: &str) {
         }
     }
     let otlp = f.cli_args(&["otlp", "records"]).0;
-    if kind == "grok" {
-        totals.clear();
-        records = otlp.as_array().into_iter().flatten()
-            .filter(|r| r["kind"] == "usage" && r["usage_authority"] == "api_request"
-                && r["attempt_id"] == f.attempt && r["binding"] == "exact")
-            .map(|r| counters(&r["attributes"])).collect();
-        for record in &records {
-            for key in COUNTERS {
-                if let Some(n) = record[key].as_u64() {
-                    *totals.entry(key.into()).or_default() += n;
-                }
-            }
-        }
-    }
     let mut metric_totals = BTreeMap::<String, u64>::new();
     if kind == "grok" {
         for record in otlp.as_array().into_iter().flatten().filter(|r|
@@ -631,7 +617,7 @@ fn live(kind: &str) {
             a["attempt_id"] == f.attempt && a["usage"]["records"].as_u64().unwrap_or(0) > 0
         });
     let report = json!({"harness":kind,"version":version,"turns":if std::env::var_os("HERDR_LIVE_RESUME_ARGS").is_some(){2}else{1},
-        "usage_records":records,"otlp_usage_records":otlp_counts,"ledger_totals":if kind == "grok" {json!({})} else {json!(totals)},"usage_totals":totals,"harness_usage":if own.is_empty(){json!("not_reported")}else{json!(own)},
+        "usage_records":records,"otlp_usage_records":otlp_counts,"ledger_totals":totals,"usage_totals":totals,"harness_usage":if own.is_empty(){json!("not_reported")}else{json!(own)},
         "differences":differences,"metric_reconciliation":{"totals":metric_totals,"differences":metric_differences},"unmapped_keys":keys,"binding_outcome":if quarantined{"quarantined"}else if bound{"bound"}else{"unbound"},
         "privacy":{"marker":MARKER,"sidecar_hits":hits},"attempt_query_observed":attempts["attempts"].as_array().is_some(),
         "binding_query_observed":!bindings.is_null(),"certification_changed":false,"evidence_state":if bound && !own.is_empty() && (kind != "grok" || !records.is_empty()) && metric_differences.values().all(|v| *v == 0) && differences.values().all(|v| v == &json!(0)) && hits == 0 {"review_required"} else {"incomplete"}});
@@ -646,6 +632,11 @@ fn live(kind: &str) {
     file.write_all(serde_json::to_string_pretty(&report).unwrap().as_bytes())
         .unwrap();
     assert_eq!(hits, 0, "privacy marker reached the sidecar");
+    if kind == "grok" {
+        assert!(!records.is_empty(), "bound Grok usage must reach the ledger");
+        assert!(!own.is_empty(), "Grok must report its own usage");
+        assert!(differences.values().all(|v| v == &json!(0)), "Grok and ledger counters must all reconcile");
+    }
     for delta in differences.values().filter(|v| v.is_number()) {
         assert_eq!(
             delta,

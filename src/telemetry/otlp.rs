@@ -104,7 +104,7 @@ const MAPPINGS: &[(&str, &str, &str, &[&str])] = &[
         "tool",
         &["function_name", "success", "duration_ms"],
     ),
-    ("muse", "model_call", "usage", &["gen_ai.request.model", "gen_ai.provider.name", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "tokens.cached", "duration_ms"]),
+    ("muse", "model_call", "usage", &["gen_ai.request.model", "gen_ai.provider.name", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "tokens.cached", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "duration_ms"]),
     ("muse", "tbh.approval_review.token_usage", "usage", &["token_type"]),
     ("grok", "grok_code.api_request", "usage", &["model", "input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens", "cache_creation_tokens", "cost_usd_micros", "duration_ms", "turn_number", "stop_reason"]),
     ("grok", "grok_code.token.usage", "usage", &["type", "model"]),
@@ -564,6 +564,7 @@ fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Optio
                         object.remove("usage_authority");
                         object.remove("usage_source_key");
                     }
+                    super::accounting::otlp::declare_usage(&mut payload, harness, cli_version, metrics);
                     let allowed_keys = if invalid_usage { &[][..] } else { mapping.map_or(&[][..], |m| m.3) };
                     let keys: Vec<_> = attrs
                         .keys()

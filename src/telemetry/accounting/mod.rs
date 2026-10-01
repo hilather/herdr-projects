@@ -18,6 +18,7 @@ pub mod graph;
 pub mod ledger;
 pub mod quota;
 pub mod tools;
+pub(crate) mod otlp;
 
 pub const STREAM: &str = "accounting";
 /// `include_str!` of `migrations/telemetry/accounting/`, in order; index + 1 is the stream version.
@@ -38,7 +39,8 @@ pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/ac
     include_str!("../../../migrations/telemetry/accounting/0015_read_aggregates.sql"),
     include_str!("../../../migrations/telemetry/accounting/0016_cache_read_share.sql"),
     include_str!("../../../migrations/telemetry/accounting/0017_compact_dispositions.sql"),
-    include_str!("../../../migrations/telemetry/accounting/0018_muse.sql")];
+    include_str!("../../../migrations/telemetry/accounting/0018_muse.sql"),
+    include_str!("../../../migrations/telemetry/accounting/0019_otlp_ledger.sql")];
 
 /// `herdr-projects telemetry <slug> accounting ...`
 #[derive(clap::Subcommand)]
@@ -374,10 +376,12 @@ fn usage_metrics_with(project: &Path, since: Option<i64>, aggregates: bool) -> R
     };
     let sources: Vec<Source> = db.prepare(sql)?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?.collect::<rusqlite::Result<_>>()?;
+    let losing = if sources.iter().any(|s| s.0.starts_with("otlp:")) { otlp::losing_sessions(&db)? } else { BTreeSet::new() };
     let (mut certified, mut excluded) = (BTreeSet::new(), BTreeMap::<&str, usize>::new());
     for (session, binding, attempt, version, quarantined, at, rejected) in &sources {
         if since.is_some_and(|since| at.is_none_or(|at| at < since)) { continue; }
         let reason = if binding != "bound" { binding.as_str() } else if !attempt.as_ref().is_some_and(|a| known.contains(a)) { "orphan" }
+            else if losing.contains(session) { "native_surface_precedence" }
             else if *quarantined { "quarantined" } else if !super::codex::accepted_version(version) { "cli_version_uncertified" }
             else if *rejected { "records_not_accepted" }
             else { certified.insert(session.as_str()); continue };
@@ -401,7 +405,7 @@ fn usage_metrics_with(project: &Path, since: Option<i64>, aggregates: bool) -> R
             (input, output, reasoning) = (input + n[0], output + n[4], reasoning + n[5]);
         }
     }
-    let reasoning = if certified.iter().any(|s| s.starts_with("claude-code:")) { unavailable("reasoning_tokens_not_reported") } else { json!(reasoning) };
+    let reasoning = if certified.iter().any(|s| s.starts_with("claude-code:") || s.starts_with("otlp:claude-code:")) { unavailable("reasoning_tokens_not_reported") } else { json!(reasoning) };
     Ok(both(json!({"value": input, "coverage": coverage}), json!({"value": output, "reasoning_output_tokens": reasoning, "coverage": coverage})))
 }
 

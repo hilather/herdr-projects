@@ -33,6 +33,7 @@ pub fn certified(version: &str) -> bool {
 
 /// Adapter-qualified versions keep fixture Claude acceptance separate from live Codex certification.
 pub fn accepted_version(version: &str) -> bool {
+    if let Some(v) = version.strip_prefix("grok/") { return v == "1.0.46"; }
     if let Some(v) = version.strip_prefix("muse/") { return muse::FIXTURE_VERSIONS.contains(&v); }
     if let Some(v) = version.strip_prefix("opencode/") { return opencode::FIXTURE_VERSIONS.contains(&v); }
     version.strip_prefix("claude-code/").map_or_else(|| certified(version), |v| claude::FIXTURE_VERSIONS.contains(&v))
@@ -89,6 +90,8 @@ impl CanonicalAttempt {
     pub fn codex(&self) -> bool {
         self.kind.as_deref() == Some("codex")
     }
+
+    pub(super) fn grok(&self) -> bool { self.kind.as_deref() == Some("grok") }
 
     pub fn supported(&self) -> bool { self.codex() || matches!(self.kind.as_deref(), Some("claude" | "gemini" | "opencode" | "muse")) }
 
@@ -1484,7 +1487,7 @@ fn bind(db: &mut Connection, attempts: &[CanonicalAttempt]) -> Result<()> {
                     ON parent.path_digest=m.parent_path_digest AND parent.home_digest=s.home_digest
                     WHERE m.path_digest=s.path_digest AND parent.originator='muse' AND parent.session_unix_ms IS NOT NULL)
             FROM rollout_sources s LEFT JOIN source_bindings b ON b.path_digest=s.path_digest
-            WHERE s.path_digest>?1 ORDER BY s.path_digest LIMIT 1000")?
+            WHERE s.path_digest>?1 AND coalesce(s.originator,'') NOT LIKE 'otlp:%' ORDER BY s.path_digest LIMIT 1000")?
             .query_map([after], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)))?.collect::<rusqlite::Result<_>>()?)
     };
     let mut after = String::new();

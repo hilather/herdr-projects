@@ -73,7 +73,7 @@ fn derive_scoped(db: &Connection, scoped: bool) -> Result<Vec<Entry>> {
         let (session, ordinal, first): (String, i64, String) = (r.get(0)?, r.get(1)?, r.get(2)?);
         let (accepted, reason, quarantined): (bool, Option<String>, bool) = (r.get(5)?, r.get(6)?, r.get(13)?);
         let native = [r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?];
-        let normalized = normalize(native, session.starts_with("claude-code:") || session.starts_with("opencode:") || session.starts_with("muse:"));
+        let normalized = normalize(native, session.starts_with("claude-code:") || session.starts_with("opencode:") || session.starts_with("muse:") || session.starts_with("otlp:"));
         let (response, digest): (Option<String>, String) = (r.get(3)?, r.get(14)?);
         let (disposition, reason) = match (quarantined, accepted, normalized) {
             (true, ..) => ("conflict", Some("payload_digest_mismatch".to_owned())),
@@ -105,7 +105,7 @@ fn derive_scoped(db: &Connection, scoped: bool) -> Result<Vec<Entry>> {
         let (session, path, position, usage): (String, String, i64, String) = (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?);
         let usage: Value = serde_json::from_str(&usage)?;
         let native = NATIVE.map(|k| usage[k].as_i64());
-        let normalized = normalize(native, session.starts_with("claude-code:") || session.starts_with("opencode:") || session.starts_with("muse:"));
+        let normalized = normalize(native, session.starts_with("claude-code:") || session.starts_with("opencode:") || session.starts_with("muse:") || session.starts_with("otlp:"));
         let mark = high.as_ref().filter(|h| h.0 == session).map(|h| h.1);
         let (disposition, reason) = match (normalized.map(|n| n[6]), mark) {
             (None, _) => ("unresolved", Some("invariant_violation")),
@@ -116,6 +116,7 @@ fn derive_scoped(db: &Connection, scoped: bool) -> Result<Vec<Entry>> {
         entries.push(Entry { id: format!("codex:{session}:thread:{path}"), session, basis: "cumulative", scope: "thread", precedence: 2, position,
             response_id: None, model: None, native, normalized, provenance: vec![(path, disposition, reason.map(str::to_owned))] });
     }
+    super::otlp::apply_precedence(db, &mut entries)?;
     Ok(entries)
 }
 
@@ -128,7 +129,7 @@ fn prepare_sync(db: &Connection) -> Result<SyncPlan> {
     let dirty: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM accounting_dirty_sessions)", [], |r| r.get(0))?;
     let reason = invalidated.or_else(|| (watermark < 0 || watermark > sequence || (watermark != sequence && !dirty)).then(|| "watermark_inconsistent".to_owned()));
     let reason = reason.or(if synced(&tx)? { None } else { Some("ledger_missing".to_owned()) });
-    let reason = reason.or(if super::cache::complete(&tx)? { None } else { Some("cache_totals_missing".to_owned()) });
+    let reason = reason.or(if super::cache::complete_for_sync(&tx)? { None } else { Some("cache_totals_missing".to_owned()) });
     let full = reason.is_some();
     tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS accounting_selected(session_id TEXT PRIMARY KEY); DELETE FROM accounting_selected;")?;
     if full {
@@ -191,7 +192,7 @@ pub fn sync(db: &mut Connection) -> Result<Value> {
         tx.prepare_cached("INSERT INTO usage_entries(entry_id,source,session_id,basis,scope,normalization_version,precedence,position,response_id,model,native,
             input_tokens,cache_read_tokens,new_input_tokens,cache_write_tokens,output_tokens,reasoning_tokens,total_tokens)
             VALUES(?1,?18,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)")?
-                .execute(params![e.id, e.session, e.basis, e.scope, if e.session.starts_with("muse:") { "muse-v1" } else if e.session.starts_with("opencode:") { "opencode-v1" } else if e.session.starts_with("claude-code:") { "claude-code-v1" } else { NORMALIZATION }, e.precedence, e.position, e.response_id, e.model, native.to_string(),
+                .execute(params![e.id, e.session, e.basis, e.scope, if e.session.starts_with("otlp:") { "otlp-inclusive-v1" } else if e.session.starts_with("muse:") { "muse-v1" } else if e.session.starts_with("opencode:") { "opencode-v1" } else if e.session.starts_with("claude-code:") { "claude-code-v1" } else { NORMALIZATION }, e.precedence, e.position, e.response_id, e.model, native.to_string(),
                 n[0], n[1], n[2], n[3], n[4], n[5], n[6], source(&e.session)])?;
         for (path, disposition, reason) in &e.provenance {
             tx.prepare_cached("INSERT INTO usage_dispositions(entry_id,path_digest,disposition,reason) VALUES(?1,?2,?3,?4)")?
@@ -231,6 +232,7 @@ pub fn sync(db: &mut Connection) -> Result<Value> {
         EXISTS(SELECT 1 FROM codex_usage u WHERE u.session_id=s.session_id AND u.reason='invariant_violation'),
         (SELECT count(*) FROM codex_usage u WHERE u.path_digest=s.path_digest AND u.accepted=1)
         FROM rollout_sources s WHERE s.session_id IN (SELECT session_id FROM accounting_selected);")?;
+    super::otlp::store_native_totals(&tx)?;
     tx.execute("INSERT INTO usage_ledger(singleton,normalization_version,synced_unix_ms) VALUES(1,?1,?2)
         ON CONFLICT(singleton) DO UPDATE SET normalization_version=excluded.normalization_version,synced_unix_ms=excluded.synced_unix_ms",
         params![NORMALIZATION, jiff::Timestamp::now().as_millisecond()])?;
@@ -303,7 +305,7 @@ pub fn read(db: &Connection) -> Result<Value> {
         let counters: Vec<Option<i64>> = (10..17).map(|i| r.get(i)).collect::<rusqlite::Result<_>>()?;
         let normalized = if counters.iter().all(Option::is_some) { Value::Object(NORMALIZED.iter().zip(&counters).map(|(k, v)| ((*k).to_owned(), json!(v))).collect()) }
             else { super::unavailable("not_normalized") };
-        entries.push(json!({"entry_id": id, "session_id": r.get::<_, String>(1)?, "basis": r.get::<_, String>(2)?, "scope": r.get::<_, String>(3)?,
+        entries.push(json!({"entry_id": id, "source": source(&r.get::<_, String>(1)?), "session_id": r.get::<_, String>(1)?, "basis": r.get::<_, String>(2)?, "scope": r.get::<_, String>(3)?,
             "normalization_version": r.get::<_, String>(4)?, "precedence": r.get::<_, i64>(5)?, "position": r.get::<_, i64>(6)?,
             "response_id": r.get::<_, Option<String>>(7)?, "model": r.get::<_, Option<String>>(8)?,
             "native": serde_json::from_str::<Value>(&r.get::<_, String>(9)?)?, "normalized": normalized,
@@ -328,5 +330,5 @@ pub(crate) fn status(db: &Connection) -> Result<Option<Value>> {
 }
 
 fn source(session: &str) -> &'static str {
-    if session.starts_with("muse:") { "muse" } else if session.starts_with("opencode:") { "opencode" } else if session.starts_with("claude-code:") { "claude-code" } else { "codex" }
+    if session.starts_with("otlp:grok:") { "otlp:grok" } else if session.starts_with("otlp:claude-code:") { "otlp:claude-code" } else if session.starts_with("otlp:muse:") { "otlp:muse" } else if session.starts_with("muse:") { "muse" } else if session.starts_with("opencode:") { "opencode" } else if session.starts_with("claude-code:") { "claude-code" } else { "codex" }
 }

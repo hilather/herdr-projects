@@ -124,8 +124,12 @@ fn replay_tasks(db: &Connection) -> Result<BTreeSet<String>> {
 /// start) and M13 over terminated attempts decided in the window.
 fn usage_metrics(sidecar: Option<&Connection>, attempts: &[Attempt], since: Option<i64>, in_window: &dyn Fn(&Attempt) -> bool, metrics: &mut BTreeMap<&str, Value>, aggregates: bool) -> Result<()> {
     let terminated: Vec<&Attempt> = attempts.iter().filter(|a| TERMINAL.contains(&a.state.as_str()) && in_window(a)).collect();
-    let adapter_absent = terminated.iter().filter(|a| a.kind.as_deref().is_some_and(|k| !matches!(k, "codex" | "claude" | "opencode" | "muse"))).count();
-    let codex: Vec<&&Attempt> = terminated.iter().filter(|a| matches!(a.kind.as_deref(), Some("codex" | "claude" | "opencode" | "muse"))).collect();
+    let grok_bound: BTreeSet<String> = if let Some(db) = sidecar {
+        db.prepare("SELECT DISTINCT attempt_id FROM rollout_sources WHERE originator='otlp:grok' AND binding='bound'")?
+            .query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+    } else { BTreeSet::new() };
+    let adapter_absent = terminated.iter().filter(|a| a.kind.as_deref().is_some_and(|k| !matches!(k, "codex" | "claude" | "opencode" | "muse")) && !grok_bound.contains(&a.id)).count();
+    let codex: Vec<&&Attempt> = terminated.iter().filter(|a| matches!(a.kind.as_deref(), Some("codex" | "claude" | "opencode" | "muse")) || grok_bound.contains(&a.id)).collect();
     let Some(db) = sidecar else {
         for id in ["M08", "M09", "M15"] { metrics.insert(id, metric(id, json!({"value": unavailable("no_certified_source")}))); }
         metrics.insert("M13", metric("M13", json!({"value": unavailable("collection_not_run"), "adapter_absent": adapter_absent})));
@@ -148,11 +152,13 @@ fn usage_metrics(sidecar: Option<&Connection>, attempts: &[Attempt], since: Opti
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, super::codex::accepted_version(&r.get::<_, String>(3)?), r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?
         .collect::<rusqlite::Result<_>>()?;
     let known: BTreeSet<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
+    let losing = if sources.iter().any(|s| s.0.starts_with("otlp:")) { super::accounting::otlp::losing_sessions(db)? } else { BTreeSet::new() };
     let (mut certified, mut excluded) = (BTreeSet::new(), BTreeMap::<&str, usize>::new());
     for s in sources.iter().filter(|s| since.is_none_or(|since| s.7.is_some_and(|at| at >= since))) {
         let reason = match s {
             (_, binding, ..) if binding != "bound" => binding.as_str(),
             (_, _, attempt, ..) if !attempt.as_deref().is_some_and(|a| known.contains(a)) => "orphan",
+            (session, ..) if losing.contains(session) => "native_surface_precedence",
             (.., true, _, _, _) => "quarantined",
             (_, _, _, false, ..) => "cli_version_uncertified",
             _ => { certified.insert(s.0.as_str()); continue; }
@@ -176,7 +182,7 @@ fn usage_metrics(sidecar: Option<&Connection>, attempts: &[Attempt], since: Opti
             for (sum, value) in sums.iter_mut().zip(row) { *sum += value; }
         }
         metrics.insert("M08", metric("M08", json!({"value": sums[0], "coverage": coverage})));
-        let reasoning = if certified.iter().any(|s| s.starts_with("claude-code:")) { unavailable("reasoning_tokens_not_reported") } else { json!(sums[2]) };
+        let reasoning = if certified.iter().any(|s| s.starts_with("claude-code:") || s.starts_with("otlp:claude-code:")) { unavailable("reasoning_tokens_not_reported") } else { json!(sums[2]) };
         metrics.insert("M09", metric("M09", json!({"value": sums[1], "reasoning_output_tokens": reasoning, "coverage": coverage})));
         metrics.insert("M15", ratio("M15", sums[4] as usize, sums[3] as usize, json!({"coverage": coverage})));
     }

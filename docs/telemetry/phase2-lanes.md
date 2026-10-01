@@ -460,6 +460,12 @@ Cards (gaps that stop those questions being answered):
     retention/backup and tombstones; live harness reads Muse's own usage.
     Native live certification awaits the steward rerun; recorded-live registry
     and `otlp:muse` are unchanged. See contracts-collection.md DG4i.
+  - **Done (DG4j; accounting 0019): certified OTLP usage into the ledger.**
+    Exact-bound, accepted-version request usage feeds M08/M09, attempts and
+    valuation with adapter provenance. Native Claude/Muse wins per attempt;
+    losing OTLP has a non-counting disposition. Capture supports incremental
+    replay; Grok's live report now reconciles ledger totals. Steward live
+    rerun pending. See contracts-collection.md DG4j.
   - **Done (DG4f installed-format review): Cursor (`cursor-agent`) 2026.09.28.**
     Installed program reports `2026.09.28-64d2043`, default service
     `cursor-agent-cli`. Its configured OTel exporter sends protobuf traces;

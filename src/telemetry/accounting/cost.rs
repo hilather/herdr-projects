@@ -520,7 +520,7 @@ fn inputs(db: &Connection) -> Result<Vec<Input>> {
         LEFT JOIN rollout_sources s ON s.path_digest=u.path_digest
         LEFT JOIN codex_usage_times t ON t.session_id=e.session_id AND t.ordinal=e.position
         LEFT JOIN rollout_metadata m ON m.path_digest=u.path_digest WHERE e.basis='delta'
-        AND NOT EXISTS(SELECT 1 FROM usage_dispositions d WHERE d.entry_id=e.entry_id AND d.reason=?1) ORDER BY e.entry_id")?;
+        AND NOT EXISTS(SELECT 1 FROM usage_dispositions d WHERE d.entry_id=e.entry_id AND (d.reason=?1 OR d.reason='native_surface_precedence')) ORDER BY e.entry_id")?;
     // A repeated response (ledger `REPEATED`) is not usage: it is never valued.
     let rows = stmt.query_map([super::ledger::REPEATED], |r| Ok(Input { entry_id: r.get(0)?, session_id: r.get(1)?, source: r.get(2)?, model: r.get(3)?,
         q: [r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?], counted: r.get(8)?, role: r.get(9)?, attempt_id: r.get(10)?, start: r.get(11)?,

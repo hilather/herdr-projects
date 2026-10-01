@@ -704,3 +704,10 @@ See [contracts-collection.md DG4i](contracts-collection.md#dg4i--muse-native-ses
 DG4i also adds `accounting` **0018_muse.sql** to admit `muse` ledger sources
 and their inclusive read/write normalization while preserving existing entries
 and dispositions. These projections retain their existing follows-sources class.
+
+DG4j adds sidecar `accounting` **0019_otlp_ledger.sql**: certified exact-bound
+OTLP request usage projects into the existing normalized-session tables,
+with stable identity, native-first attempt/harness precedence and change
+capture. OTLP-derived sessions retain `sidecar.otlp` retention and full-backup
+coverage; ledger/aggregate rows follow sources. No canonical schema change.
+See [contracts-collection.md DG4j](contracts-collection.md#dg4j-certified-otlp-usage-in-the-accounting-ledger).

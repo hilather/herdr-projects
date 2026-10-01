@@ -183,6 +183,13 @@ pub(crate) fn migrate(db: &mut Connection) -> Result<()> {
                     tx.prepare("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND sql IS NOT NULL")?
                         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
                 } else { Vec::new() };
+                // OTLP capture writes across normalized tables. Suspend those
+                // triggers while compact migrations temporarily replace targets.
+                for (name, _) in &triggers {
+                    if name.starts_with("accounting_otlp_") {
+                        tx.execute_batch(&format!("DROP TRIGGER \"{}\"", name.replace('"', "\"\"")))?;
+                    }
+                }
                 tx.execute_batch(migration)?;
                 for (name, sql) in triggers {
                     if name.starts_with("analytics_input_source_observations_") { continue; }
@@ -265,7 +272,7 @@ pub fn report(project: &Path) -> Result<Value> {
     }
     let mut out = Vec::new();
     for attempt in &attempts {
-        let usage = if attempt.supported() { attempt_usage(&db, &attempt.id)? } else { unavailable("adapter_absent") };
+        let usage = if attempt.supported() || (attempt.grok() && db.query_row("SELECT EXISTS(SELECT 1 FROM rollout_sources WHERE attempt_id=?1 AND originator='otlp:grok' AND binding='bound')", [&attempt.id], |r| r.get::<_, bool>(0))?) { attempt_usage(&db, &attempt.id)? } else { unavailable("adapter_absent") };
         let after_termination = after_termination(&db, &attempt.id, attempt.terminated_unix_ms())?;
         out.push(json!({"attempt_id": attempt.id, "usage": usage, "after_termination": after_termination}));
     }
@@ -386,9 +393,12 @@ pub(super) fn attempt_usage(db: &Connection, attempt: &str) -> Result<Value> {
     if rejected {
         return Ok(unavailable("records_not_accepted"));
     }
+    let losing = if bound.iter().any(|s| s.0.starts_with("otlp:")) {
+        super::accounting::otlp::losing_sessions(db)?
+    } else { std::collections::BTreeSet::new() };
     let mut sums = [0i64; 6];
     let mut records = 0;
-    for (session, ..) in &bound {
+    for (session, ..) in bound.iter().filter(|s| !losing.contains(&s.0)) {
         let row: Option<[i64; 7]> = db.prepare_cached("SELECT count(*),sum(input_tokens),sum(cached_input_tokens),sum(cache_write_input_tokens),
             sum(output_tokens),sum(reasoning_output_tokens),sum(total_tokens) FROM codex_usage WHERE session_id=?1 AND accepted=1 AND NOT EXISTS(SELECT 1 FROM codex_usage e WHERE e.session_id=codex_usage.session_id AND e.accepted=1 AND e.response_id IS NOT NULL AND e.response_id=codex_usage.response_id AND unhex(substr(e.payload_digest,8)) IS unhex(substr(codex_usage.payload_digest,8)) AND e.payload_digest=codex_usage.payload_digest AND e.ordinal<codex_usage.ordinal)")?.query_row([session],
             |r| Ok([r.get(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0), r.get::<_, Option<i64>>(2)?.unwrap_or(0), r.get::<_, Option<i64>>(3)?.unwrap_or(0),
@@ -398,7 +408,7 @@ pub(super) fn attempt_usage(db: &Connection, attempt: &str) -> Result<Value> {
             for (sum, value) in sums.iter_mut().zip(&row[1..]) { *sum += value; }
         }
     }
-    let reasoning = if bound.iter().any(|s| s.0.starts_with("claude-code:")) { unavailable("reasoning_tokens_not_reported") } else { json!(sums[4]) };
+    let reasoning = if bound.iter().any(|s| s.0.starts_with("claude-code:") || s.0.starts_with("otlp:claude-code:")) { unavailable("reasoning_tokens_not_reported") } else { json!(sums[4]) };
     Ok(json!({"input_tokens": sums[0], "cached_input_tokens": sums[1], "cache_write_input_tokens": sums[2],
         "output_tokens": sums[3], "reasoning_output_tokens": reasoning, "total_tokens": sums[5], "records": records}))
 }

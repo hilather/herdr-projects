@@ -344,3 +344,39 @@ fn native_muse_parent_without_a_timestamp_cannot_bind_children() {
     );
     no_secrets(&f);
 }
+
+#[test]
+fn otlp_explicit_usage_yields_to_native_muse_children() {
+    use herdr_projects::telemetry::otlp;
+    let f = muse();
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    let mut request: Value = serde_json::from_str(&fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/telemetry/otlp/muse-logs.json")).unwrap().replace("@ATTEMPT@", &f.attempt)).unwrap();
+    let records = request["resourceLogs"][0]["scopeLogs"][0]["logRecords"].as_array_mut().unwrap();
+    records.retain(|r| r["eventName"] == "model_call");
+    let attrs = records[0]["attributes"].as_array_mut().unwrap();
+    for (key, value) in [("cache_read_tokens", 3), ("cache_write_tokens", 0), ("reasoning_tokens", 1)] {
+        attrs.push(json!({"key":key,"value":{"intValue":value.to_string()}}));
+    }
+    let bytes = serde_json::to_vec(&request).unwrap();
+    assert_eq!(otlp::ingest(&f.project, "/v1/logs", &bytes).unwrap(), 1);
+    assert_eq!(otlp::ingest(&f.project, "/v1/logs", &bytes).unwrap(), 0);
+    f.cli_args(&["accounting", "sync"]);
+    let before = f.cli_args(&["accounting", "entries"]).0;
+    assert_eq!(accepted_delta_entries(&before).len(), 1);
+    assert_eq!(before["entries"][0]["source"], "otlp:muse");
+    assert_eq!(before["entries"][0]["normalized"]["cache_read_tokens"], 3);
+    plant(&f, &f.worktree(), f.decided + 1000);
+    f.cli("collect");
+    let replay = aggregate_read_snapshot(&f);
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "status"]).0["sync"]["mode"], "incremental");
+    assert_eq!(f.report()["metrics"]["M08"]["value"], 46344);
+    let entries = f.cli_args(&["accounting", "entries"]).0;
+    assert_eq!(accepted_delta_entries(&entries).len(), 4);
+    let loser = entries["entries"].as_array().unwrap().iter().find(|e| e["source"] == "otlp:muse").unwrap();
+    assert_eq!(loser["provenance"][0]["reason"], "native_surface_precedence");
+    verify_aggregate_replay(&f, &replay);
+    assert_eq!(f.cli_args(&["accounting", "entries"]).0, entries);
+    no_secrets(&f);
+}

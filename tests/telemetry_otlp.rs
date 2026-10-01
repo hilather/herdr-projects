@@ -1351,7 +1351,15 @@ fn http_protobuf_attempt_token_binding_auth_and_project_token_unchanged() {
 #[test]
 fn grok_live_shape_protobuf_two_turns_uses_api_calls_without_pii_or_double_count() {
     for metrics_first in [false, true] {
-        let f = Fixture::reserved();
+        let mut f = Fixture::reserved();
+        let mut profile = codex_profile(&f.config, "grok", "grok", Some(&f.home));
+        profile.agent.version = "1.0.46".into();
+        plant_profile(&f.project.join(".state/state.db"), profile);
+        f.readmit("grok");
+        (f.attempt,f.decided) = rusqlite::Connection::open(f.project.join(".state/state.db")).unwrap()
+            .query_row("SELECT a.id,d.decided_unix_ms FROM attempts a JOIN dispatch_decisions d ON d.attempt_id=a.id WHERE a.state='reserved'", [], |r| Ok((r.get(0)?,r.get(1)?))).unwrap();
+        f.cli("collect");
+        f.cli_args(&["accounting", "sync"]);
         let minted = otlp::mint_attempt_token(&f.project, &f.attempt, 600).unwrap();
         let token = minted["token"].as_str().unwrap();
         for turn in 1..=2 {
@@ -1374,6 +1382,8 @@ fn grok_live_shape_protobuf_two_turns_uses_api_calls_without_pii_or_double_count
                     otlp::ingest_attempt(&f.project, endpoint, &pb_request(&replay, false), "application/x-protobuf", token).unwrap();
                 }
             }
+            f.cli_args(&["accounting", "sync"]);
+            assert_eq!(f.cli_args(&["accounting", "status"]).0["sync"]["mode"], "incremental");
         }
         let rows = f.cli_args(&["otlp", "records"]).0;
         let rows = rows.as_array().unwrap();
@@ -1412,6 +1422,49 @@ fn grok_live_shape_protobuf_two_turns_uses_api_calls_without_pii_or_double_count
                 assert!(row["attributes"].get(key).is_none());
             }
         }
+        f.cli_args(&["accounting", "sync"]);
+        let ledger = f.cli_args(&["accounting", "entries"]).0;
+        let counted = accepted_delta_entries(&ledger);
+        assert_eq!(counted.len(), 2);
+        assert!(counted.iter().all(|e| e["source"] == "otlp:grok" && e["model"] == "grok-4.5"));
+        assert_eq!(counted.iter().map(|e| e["normalized"]["input_tokens"].as_u64().unwrap()).sum::<u64>(), 30894);
+        assert_eq!(counted.iter().map(|e| e["normalized"]["cache_read_tokens"].as_u64().unwrap()).sum::<u64>(), 6400);
+        assert_eq!(counted.iter().map(|e| e["normalized"]["output_tokens"].as_u64().unwrap()).sum::<u64>(), 28);
+        for command in ["usage", "attempts"] {
+            let queried = f.cli_args(&[command, "--json"]).0;
+            let attempt = queried["attempts"].as_array().unwrap().iter().find(|a| a["attempt_id"] == f.attempt).unwrap();
+            assert_eq!(attempt["usage"]["total_tokens"], 30922, "{queried}");
+            assert_eq!(attempt["usage"]["records"], 2);
+        }
+        assert_eq!(f.report()["metrics"]["M08"]["value"], 30894);
+        assert_eq!(f.report()["metrics"]["M09"]["value"], 28);
+        f.cli_args(&["accounting", "sync"]);
+        assert_eq!(f.cli_args(&["accounting", "entries"]).0, ledger);
+        f.sidecar().execute("DELETE FROM usage_ledger", []).unwrap();
+        f.cli_args(&["accounting", "sync"]);
+        assert_eq!(f.cli_args(&["accounting", "entries"]).0, ledger);
+        f.cli_args(&["analytics", "refresh"]);
+        let verify = f.cli_args(&["analytics", "rebuild", "--verify"]).0;
+        assert_eq!(verify["identical"], true, "{verify}");
+        let card = f.tmp.path().join("otlp-rates.json");
+        fs::write(&card, serde_json::to_vec(&json!({"card_id":"synthetic-grok","version":1,"provider":"synthetic",
+            "product":"otlp:grok","models":["grok-4.5"],"currency":"USD","rate_unit":1,
+            "effective_from_unix_ms":0,"effective_to_unix_ms":null,
+            "includes":{"discounts":false,"taxes":false,"fees":false},"source":"invented fixture rates",
+            "rates":[{"category":"input","rate":"1"},{"category":"cache_read","rate":"1"},{"category":"output","rate":"1"}]})).unwrap()).unwrap();
+        f.cli_args(&["accounting", "import-rate-card", card.to_str().unwrap()]);
+        f.cli_args(&["accounting", "reprice"]);
+        let cost = f.cli_args(&["accounting", "cost", "--json"]).0;
+        assert_eq!(cost["attempts"][0]["estimate"]["amount"], "30922", "{cost}");
+        let backup = f.tmp.path().join("grok-ledger-backup");
+        f.cli_args(&["backup", "create", "--out", backup.to_str().unwrap()]);
+        let copy = rusqlite::Connection::open_with_flags(backup.join("telemetry.db"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(copy.query_row("SELECT sum(e.total_tokens) FROM usage_entries e WHERE EXISTS(SELECT 1 FROM usage_dispositions d WHERE d.entry_id=e.entry_id AND d.disposition='accepted')", [], |r| r.get::<_, i64>(0)).unwrap(), 30922);
+        f.cancel_reserved();
+        let future = (unix_ms() + 100 * 86400000).to_string();
+        let plan = f.cli_args(&["maintenance", "plan", "--now", &future, "--json"]).0;
+        let sessions = plan["classes"].as_array().unwrap().iter().find(|c| c["class"] == "sidecar.normalized_sessions").unwrap();
+        assert_eq!(sessions["eligible_count"], 0, "{sessions}");
         privacy_scan(&f, &["lc4-planted-secret@example.invalid"]);
     }
 }
@@ -1512,6 +1565,10 @@ fn grok_prompt_turn_fallback_retains_cache_creation_and_isolates_invalid_usage()
     assert!(diagnostic.get("attributes").is_none());
     assert!(diagnostic.get("usage_authority").is_none());
     assert!(diagnostic["unmapped_attribute_keys"].as_array().unwrap().contains(&json!("cache_read_tokens")));
+    f.cli_args(&["accounting", "sync"]);
+    let ledger = f.cli_args(&["accounting", "entries"]).0;
+    assert_eq!(accepted_delta_entries(&ledger).len(), 2);
+    assert!(ledger["entries"].as_array().unwrap().iter().any(|e| e["normalized"]["cache_write_tokens"] == 5 && e["normalized"]["new_input_tokens"] == 14141));
     privacy_scan(&f, &["lc4-planted-secret@example.invalid"]);
 }
 
@@ -1537,5 +1594,71 @@ fn grok_continuation_sequence_restart_does_not_merge_distinct_api_calls() {
     assert_eq!(records.as_array().unwrap().len(), 2);
     assert!(records.as_array().unwrap().iter().all(|r| r["kind"] == "usage"));
     assert_eq!(records.as_array().unwrap().iter().map(|r| r["attributes"]["input_tokens"].as_u64().unwrap()).sum::<u64>(), 30852);
+    privacy_scan(&f, &["lc4-planted-secret@example.invalid"]);
+}
+
+#[test]
+fn uncertified_unbound_and_metric_only_grok_never_enter_accounting() {
+    for excluded in ["uncertified", "unbound", "metric_only", "codex"] {
+        let f = Fixture::reserved();
+        let metrics = excluded == "metric_only";
+        let signal = if metrics { "metrics" } else { "logs" };
+        let mut root: Value = serde_json::from_slice(&fs::read(format!("{}/tests/fixtures/telemetry/grok-1.0.46/turn-1-{signal}.json", env!("CARGO_MANIFEST_DIR"))).unwrap()).unwrap();
+        let group = if metrics { "resourceMetrics" } else { "resourceLogs" };
+        let attrs = root[group][0]["resource"]["attributes"].as_array_mut().unwrap();
+        attrs.push(json!({"key":"herdr.attempt_id","value":{"stringValue":f.attempt}}));
+        if excluded == "unbound" { attrs.retain(|a| a["key"] != "herdr.attempt_id"); }
+        if excluded == "uncertified" {
+            attrs.retain(|a| a["key"] != "client.version");
+            attrs.push(json!({"key":"client.version","value":{"stringValue":"1.0.99"}}));
+        }
+        if excluded == "codex" {
+            attrs.retain(|a| a["key"] != "service.name");
+            attrs.push(json!({"key":"service.name","value":{"stringValue":"codex"}}));
+        }
+        otlp::ingest(&f.project, if metrics { "/v1/metrics" } else { "/v1/logs" }, &serde_json::to_vec(&root).unwrap()).unwrap();
+        f.cli_args(&["accounting", "sync"]);
+        let ledger = f.cli_args(&["accounting", "entries"]).0;
+        assert!(ledger["entries"].as_array().unwrap().is_empty(), "{excluded}: {ledger}");
+        let usage = f.cli_args(&["usage", "--json"]).0;
+        assert!(usage["attempts"].as_array().unwrap().iter().all(|a| a["usage"]["status"] == "unavailable"));
+        privacy_scan(&f, &["lc4-planted-secret@example.invalid"]);
+    }
+}
+
+#[test]
+fn accounting_upgrade_backfills_existing_grok_records_and_preserves_native_ledger() {
+    let f = Fixture::new();
+    f.rollout(&f.home, SID, &["head.jsonl"], &f.worktree(), f.decided + 1000, "0.154.0");
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    let native = f.cli_args(&["accounting", "entries"]).0;
+    let mut request: Value = serde_json::from_slice(&fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/telemetry/grok-1.0.46/turn-1-logs.json")).unwrap()).unwrap();
+    request["resourceLogs"][0]["resource"]["attributes"].as_array_mut().unwrap()
+        .push(json!({"key":"herdr.attempt_id","value":{"stringValue":f.attempt}}));
+    otlp::ingest(&f.project, "/v1/logs", &serde_json::to_vec(&request).unwrap()).unwrap();
+    let evidence = f.cli_args(&["otlp", "records"]).0;
+    // Reconstruct the known-gap v18 state: retained OTLP evidence, with no
+    // OTLP accounting bridge or projected source rows. Native ledger stays.
+    let db = f.sidecar();
+    db.execute_batch("DROP TRIGGER accounting_otlp_insert; DROP TRIGGER accounting_otlp_update; DROP TRIGGER accounting_otlp_delete;
+        DROP TRIGGER accounting_native_otlp_insert; DROP TRIGGER accounting_native_otlp_update; DROP TRIGGER accounting_native_otlp_delete;
+        DROP VIEW otlp_ledger_sources;
+        DELETE FROM codex_usage_times WHERE session_id LIKE 'otlp:%';
+        DELETE FROM codex_usage WHERE session_id LIKE 'otlp:%';
+        DELETE FROM rollout_sources WHERE originator LIKE 'otlp:%';
+        UPDATE telemetry_streams SET version=18 WHERE stream='accounting';").unwrap();
+    drop(db);
+    assert_eq!(f.cli_args(&["accounting", "entries"]).0, native);
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "status"]).0["version"], 19);
+    let upgraded = f.cli_args(&["accounting", "entries"]).0;
+    assert_eq!(accepted_delta_entries(&upgraded).len(), 2);
+    assert!(upgraded["entries"].as_array().unwrap().contains(&native["entries"][0]));
+    assert_eq!(f.report()["metrics"]["M08"]["value"], 16426);
+    assert_eq!(f.cli_args(&["otlp", "records"]).0, evidence);
+    f.cli("collect");
+    f.cli_args(&["accounting", "sync"]);
+    assert_eq!(f.cli_args(&["accounting", "entries"]).0, upgraded);
     privacy_scan(&f, &["lc4-planted-secret@example.invalid"]);
 }

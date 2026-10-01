@@ -418,7 +418,7 @@ pub fn plan(project: &Path, config_dir: &Path, now: i64, forget: &[String]) -> R
 fn sessions(ctx: &Ctx, db: &Connection, forget: &[String]) -> Result<Found> {
     let mut found = Found::default();
     let cutoff = ctx.cutoff(SESSIONS);
-    let rows: Vec<(String, String, Option<String>, i64)> = db.prepare("SELECT session_id,path_digest,attempt_id,observed_unix_ms FROM rollout_sources ORDER BY session_id,path_digest")?
+    let rows: Vec<(String, String, Option<String>, i64)> = db.prepare("SELECT session_id,path_digest,attempt_id,observed_unix_ms FROM rollout_sources WHERE coalesce(originator,'') NOT LIKE 'otlp:%' ORDER BY session_id,path_digest")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
     let mut by: BTreeMap<String, (Vec<String>, BTreeSet<String>, i64)> = BTreeMap::new();
     for (session, path, attempt, observed) in rows {

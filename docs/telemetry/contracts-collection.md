@@ -1315,8 +1315,8 @@ retain their nonnegative value, reviewed unit (empty, USD, token/tokens/{token})
 explicit delta/cumulative temporality. Cumulative samples remain snapshots,
 never deltas computed by guessing resets. Both logs and metrics are retained
 as independent native evidence: do not sum their overlapping token or cost
-reports. Cache/thought/tool inclusion is not certified. No OTLP evidence
-feeds budgets or existing Codex accounting totals.
+reports. Cache/thought/tool inclusion is not certified. DG4j below promotes
+only certified, bound request-authority usage into the ledger; overlapping metrics and incomplete request observations remain excluded.
 
 Text identifiers go through the existing excerpt sanitizer after a
 128-byte/control-character limit; numbers are nonnegative, booleans typed
@@ -1943,7 +1943,7 @@ reasoning separately, and reads model from the single `modelUsage` key when
 there is no top-level model. It requests `--output-format json` and uses
 stdout rather than a Grok home-file projection. The live report compares
 only bound authoritative API rows against stdout, reports their `usage_totals`
-separately from the accounting ledger, and cross-checks DELTA token metrics
+from the accounting ledger after DG4j, and cross-checks DELTA token metrics
 through `metric_reconciliation` without counting them.
 
 Expected API totals for the supplied two turns: full input **30,894**, cache
@@ -2512,3 +2512,102 @@ Native live certification and exporter behavior remain pending that rerun.
 `cargo clippy --locked --offline -j 3 --features state-store --all-targets`
 completed successfully. No warning points at a changed line or either new Rust
 file; pre-existing warnings elsewhere remain. `git diff --check` passes.
+
+## DG4j: certified OTLP usage in the accounting ledger
+
+Accounting stream **0019_otlp_ledger.sql** bridges eligible OTLP request
+records into the shared `rollout_sources`, `codex_usage` and
+`codex_usage_times` projections. The legacy table names do not imply Codex
+provenance. `accounting entries` exposes `source=otlp:grok`,
+`otlp:claude-code` or `otlp:muse`, the stable record identity in the source
+and response keys, and normalization `otlp-inclusive-v1`. Existing native
+source identities and numeric fixtures are unchanged. No canonical migration
+or new retained table is needed; `otlp_ledger_sources` is a projection view.
+The initial OTLP table DDL is idempotent so accounting can install capture
+before the last stream initializes on a new sidecar. Rate cards match the
+ledger source as their product (for example `otlp:grok`); existing pricing
+availability and cache-tier policy still applies. Reported OTLP cost fields
+remain reported evidence, not provider charges.
+
+Eligibility requires an exact canonical attempt binding (projected as
+`bound`), an accepted harness version, `kind=usage`, a declared request
+usage authority, and complete valid counters. Grok **1.0.46** accepts only
+`grok_code.api_request` / `usage_authority=api_request`, including LC4's
+reviewed build-version fallback. Its input includes cache reads and creation;
+cache read is `cache_read_tokens`, creation is `cache_creation_tokens`, and
+reasoning is a subset of output. New input is input minus read minus creation;
+total is input plus output. Model is preserved. LC4's attempt-scoped
+`usage_source_key` / record identity survives timestamp-changing re-exports.
+Metrics remain reconciliation-only, with no metric fallback. Codex OTLP
+remains excluded; its rollout adapter is authoritative.
+
+Claude request logs require the existing accepted **2.1.3 / 2.1.286** gate;
+input is uncached input plus reported cache read and creation, as for the
+native adapter. The unreported reasoning compatibility counter is zero;
+M09 and attempt reports retain `reasoning_tokens_not_reported`. Muse
+**1.4.0-R4161.1** `model_call` records can declare authority only with explicit
+`cache_read_tokens`, `cache_write_tokens` and `reasoning_tokens` alongside
+input/output. `tokens.cached` alone has ambiguous read/write semantics and
+cannot establish accounting authority. These extensions are fixture-only;
+no new exporter or field live certification is claimed. Versionless logs,
+unbound records, unsupported versions and incomplete counters remain OTLP
+evidence without accounting usage.
+
+**Surface precedence is per attempt and harness, independent of arrival
+order:** a bound native Claude Code or Muse source takes precedence over
+that harness's OTLP surface for the entire attempt. Native presence wins even
+when its version or records are incomplete, so OTLP cannot conceal a native
+coverage gap. The losing OTLP entry has disposition `duplicate`, reason
+`native_surface_precedence`, and contributes no tokens, records or cost.
+Different harnesses and attempts remain independent. Live attempt reads,
+ledger replay, maintained totals and valuation apply the same rule.
+
+Capture triggers project OTLP inserts, updates and deletions in the source
+transaction and mark their synthetic sessions dirty. Native source arrival,
+rebinding or removal also marks affected OTLP sessions dirty. Fresh dirty
+sessions can receive their first aggregates incrementally; missing untouched
+aggregates still invalidate the base. Sync and full replay therefore produce
+the same usage, dispositions and public metrics. Re-ingest is a no-op;
+full rebuild derives the same record keys. The migration backfills existing
+eligible Grok evidence without changing the retained OTLP records.
+
+Retention remains `sidecar.otlp` **retain / source_of_truth**, including full
+sidecar backups. Synthetic OTLP sessions are excluded from native-session
+pruning and native home/cwd rebinding; their ledger/aggregate rows follow the
+retained OTLP evidence. No raw content or new identity attribute is retained.
+Existing privacy scans cover the database, WAL and SHM.
+
+Public collector/API and CLI E2E workflows cover LC4's two turns (**30,894
+input; 6,400 read; 28 output; 26 reasoning; 30,922 total**), both signal orders,
+retries and changed timestamps, `usage --json`, `attempts --json`, provenance,
+incremental/full equality, negative gates, and native precedence for Claude
+and Muse. `telemetry_live::grok_live` now computes `ledger_totals` from accepted
+ledger deltas and requires all reported Grok counters to reconcile. The
+steward's live rerun remains pending.
+
+### DG4j validation
+
+All **22** `tests/telemetry*.rs` suites ran with
+`TMPDIR=$PWD/target/tmp cargo test --locked --offline -j 3 --features state-store --no-fail-fast`
+and one `--test <suite>` argument per suite: **241 passed, 7 socket-only
+failures, 17 ignored**. The ignored cases are four owner-gated live harnesses
+and thirteen on-disk scale/resource cases. No agent CLI or owner agent data
+was accessed. New coverage uses public collector/API and CLI workflows;
+there are no new unit tests or source-text assertions.
+
+Every remaining failure is `Operation not permitted` at a socket bind, for
+the steward to rerun outside this sandbox:
+
+- `telemetry::attempts_show_attention_summary`
+- `telemetry_accounting::attention_intervals_union_and_censor`
+- `telemetry_health::recommendations_and_notices_change_no_canonical_state_and_no_dispatch`
+- `telemetry_otlp::http_auth_limits_malformed_and_replay`
+- `telemetry_otlp::http_protobuf_attempt_token_binding_auth_and_project_token_unchanged`
+- `telemetry_otlp::http_request_rate_is_bounded`
+- `telemetry_workspace::thread_start_records_the_dispatch_reason_and_the_sidebar_suffix`
+
+`cargo clippy --locked --offline -j 3 --features state-store --all-targets`
+completed successfully. Compiler diagnostic spans were checked against the
+diff and new Rust module: **no warnings in changed lines**; existing warnings
+elsewhere remain. `git diff --check` passes. The steward's Grok live rerun is
+pending; this worker did not run any live harness or change certification.

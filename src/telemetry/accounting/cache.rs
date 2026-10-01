@@ -42,6 +42,14 @@ pub(crate) fn complete(db: &Connection) -> Result<bool> {
         WHERE NOT EXISTS(SELECT 1 FROM accounting_cache_totals t WHERE t.session_id=s.session_id))", [], |r| r.get(0))?)
 }
 
+/// Newly captured sessions need their first totals; missing untouched totals
+/// invalidate the incremental base instead.
+pub(crate) fn complete_for_sync(db: &Connection) -> Result<bool> {
+    Ok(db.query_row("SELECT NOT EXISTS(SELECT 1 FROM rollout_sources s
+        WHERE NOT EXISTS(SELECT 1 FROM accounting_cache_totals t WHERE t.session_id=s.session_id)
+        AND NOT EXISTS(SELECT 1 FROM accounting_dirty_sessions d WHERE d.session_id=s.session_id))", [], |r| r.get(0))?)
+}
+
 fn inputs(db: &Connection) -> Result<Option<String>> {
     let Some(generations) = crate::telemetry::analytics::inputs::generations(db)? else { return Ok(None); };
     let selected: BTreeMap<_, _> = generations.into_iter().filter(|(table, _)|
@@ -109,6 +117,7 @@ fn evaluate(project: &Path, db: &Connection, since: Option<i64>, aggregates: boo
     let mut arms = BTreeMap::<String, Tally>::new();
     let mut unknown = Tally::default();
     let mut excluded_sessions = BTreeSet::new();
+    let losing = super::otlp::losing_sessions(db)?;
     let mut eligible = BTreeMap::<String, (Option<String>, [i64; 4])>::new();
     let mut rows = db.prepare(sql)?;
     let mut rows = rows.query([])?;
@@ -125,6 +134,7 @@ fn evaluate(project: &Path, db: &Connection, since: Option<i64>, aggregates: boo
         let total = totals.get(&session).copied().unwrap_or_default();
         let reason = if binding != "bound" { Some(binding.as_str()) }
             else if !attempt.as_ref().is_some_and(|a| known.contains_key(a)) { Some("orphan") }
+            else if losing.contains(&session) { Some("native_surface_precedence") }
             else if quarantined { Some("quarantined") }
             else if session.starts_with("gemini-cli:") { Some("cache_denominator_not_reconciled") }
             else if !crate::telemetry::codex::accepted_version(&version) { Some("cli_version_uncertified") }

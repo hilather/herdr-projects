@@ -45,7 +45,10 @@ fn project_attempts(project: &Path, selected: Option<&std::collections::BTreeSet
     // Contracts §4/§5 `usage`: the sidecar's bound, certified sums or its reason.
     let mut records = records;
     if let Some(sidecar) = super::sidecar::read(project)? {
-        for record in records.iter_mut().filter(|r| r["usage"]["reason"] == "collection_not_run") {
+        for record in &mut records {
+            if record["usage"]["reason"] != "collection_not_run" && !sidecar.query_row(
+                "SELECT EXISTS(SELECT 1 FROM rollout_sources WHERE attempt_id=?1 AND originator LIKE 'otlp:%' AND binding='bound')",
+                [record["attempt_id"].as_str().unwrap_or_default()], |r| r.get::<_, bool>(0))? { continue; }
             record["usage"] = super::sidecar::attempt_usage(&sidecar, record["attempt_id"].as_str().unwrap_or_default())?;
         }
         let lane = match selected {
