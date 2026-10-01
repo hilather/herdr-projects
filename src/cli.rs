@@ -855,6 +855,8 @@ enum OperationsCommand { Inspect,
 #[cfg(feature="state-store")]
 #[derive(Subcommand)]
 enum TelemetryCommand {
+    /// Authenticated loopback OTLP/HTTP JSON receiver (explicit opt-in).
+    Otlp { #[command(subcommand)] command: herdr_projects::telemetry::otlp::Command },
     /// One outcome record per canonical attempt (lifecycle, result, verification, integration)
     Attempts { #[arg(long)] json:bool },
     /// Read Codex rollouts under each Codex execution home into .state/telemetry.db, then print usage.
@@ -1365,6 +1367,11 @@ pub fn run() -> Result<()> {
         Command::Telemetry{slug,command:TelemetryCommand::Maintenance{command}}=>{
             project::validate_slug(&slug)?;
             print!("{}",herdr_projects::telemetry::maintenance::run(&ctx.root.join(slug),&ctx.config_dir,command)?);Ok(())
+        },
+        #[cfg(feature="state-store")]
+        Command::Telemetry{slug,command:TelemetryCommand::Otlp{command}}=>{
+            project::validate_slug(&slug)?;
+            herdr_projects::telemetry::otlp::run(&ctx.root.join(&slug),&ctx.config_dir,command)?;Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:TelemetryCommand::Backup{command}}=>{

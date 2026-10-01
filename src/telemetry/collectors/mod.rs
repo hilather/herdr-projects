@@ -301,8 +301,10 @@ fn capabilities(project: &Path) -> Result<Value> {
             anyhow::ensure!(declared.iter().any(|f| f.kind == kind && f.field == path), "codex {kind}.{path} is collected but not declared");
         }
     }
-    Ok(json!({"adapters": [{"adapter": "codex", "interface": "rollout_jsonl", "certified_versions": super::codex::CERTIFIED,
-        "uncertified_version": "cli_version_uncertified", "fields": out, "profiles": super::codex::profile_versions(project)?}]}))
+    let mut adapters = super::otlp::capabilities();
+    adapters.insert(0, json!({"adapter": "codex", "interface": "rollout_jsonl", "certified_versions": super::codex::CERTIFIED,
+        "uncertified_version": "cli_version_uncertified", "fields": out, "profiles": super::codex::profile_versions(project)?}));
+    Ok(json!({"adapters": adapters}))
 }
 
 fn capabilities_text(value: &Value) -> String {

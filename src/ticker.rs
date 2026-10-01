@@ -703,8 +703,10 @@ fn telemetry_pass(ctx:&Ctx,log:&Log,slug:&str) {
     if last.get(slug).is_some_and(|at|at.elapsed()<Duration::from_secs(secs)) {return;}
     last.insert(slug.to_owned(),Instant::now());drop(last);
     let (line,slug,project)=(log.clone(),slug.to_owned(),ctx.root.join(slug));
+    let otlp_config = ctx.config_dir.clone();
     let pass=std::thread::Builder::new().name("telemetry-pass".into()).spawn(move||{
         use herdr_projects::telemetry::codex;
+        if let Err(error) = herdr_projects::telemetry::otlp::start_configured(&project,&otlp_config) {line.line(&format!("{slug}: OTLP config: {error}"));}
         herdr_projects::telemetry::background::idle_priority(|warning|line.line(warning));
         if let Err(error)=codex::collect(&project,codex::Budget::TICK,false) {line.line(&format!("{slug}: telemetry collect: {error:#}"));}
         for lane in &herdr_projects::telemetry::LANES {

@@ -1,0 +1,98 @@
+{
+  "resourceMetrics": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "gemini-cli"
+            }
+          },
+          {
+            "key": "herdr.attempt_id",
+            "value": {
+              "stringValue": "@ATTEMPT@"
+            }
+          }
+        ]
+      },
+      "scopeMetrics": [
+        {
+          "metrics": [
+            {
+              "name": "gemini_cli.token.usage",
+              "unit": "{token}",
+              "sum": {
+                "aggregationTemporality": 2,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1700000000000000100",
+                    "startTimeUnixNano": "1700000000000000000",
+                    "asInt": "19",
+                    "attributes": [
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "gemini-pro"
+                        }
+                      },
+                      {
+                        "key": "type",
+                        "value": {
+                          "stringValue": "input"
+                        }
+                      },
+                      {
+                        "key": "prompt",
+                        "value": {
+                          "stringValue": "OTLP_SECRET_CONTENT"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "gemini_cli.token.usage",
+              "unit": "{token}",
+              "sum": {
+                "aggregationTemporality": 2,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1700000000000000101",
+                    "startTimeUnixNano": "1700000000000000000",
+                    "asInt": "5",
+                    "attributes": [
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "gemini-pro"
+                        }
+                      },
+                      {
+                        "key": "type",
+                        "value": {
+                          "stringValue": "output"
+                        }
+                      },
+                      {
+                        "key": "prompt",
+                        "value": {
+                          "stringValue": "OTLP_SECRET_CONTENT"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

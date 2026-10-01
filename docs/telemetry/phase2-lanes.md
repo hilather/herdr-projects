@@ -369,14 +369,16 @@ Cards (gaps that stop those questions being answered):
   worker kind (version probe, launch arguments, isolation profile) before it
   can run as a product worker. Its telemetry can be collected before that,
   from sessions run outside the product.
-  - **DG4a OTLP receiver** (deferred in contracts.md §8). A local
-    OpenTelemetry logs/metrics endpoint in the collector lane. It maps each
-    harness's documented OTel usage, tool and error events onto the existing
-    usage ledger and tool tables, with a per-harness mapping table and source
-    trust `collector_observed`. It binds to attempts through the same
-    execution-home/cwd/time rules as rollouts. It covers every OTel-capable
-    harness at once: Claude Code, Gemini CLI, Codex, and others where
-    supported.
+  - **DG4a OTLP receiver — done (fixture-certified).** Opt-in loopback
+    OTLP/HTTP JSON logs/metrics, per-project bearer token, bounded requests,
+    sanitized sidecar stream `otlp` (migration 0001), exact resource
+    `herdr.attempt_id` binding and digest replay. Claude Code and Gemini CLI
+    mappings are fixture-only; Codex OTLP is `none` pending native-name
+    certification, retaining its rollout adapter. Protobuf/gRPC unsupported
+    under the no-new-crates constraint. See contracts-collection.md DG4a.
+    **DG4a follow-up: launch-env wiring** supplies `OTEL_*`, authorization
+    and resource attempt/harness identity for product-launched workers;
+    exporter JSON compatibility and token lifecycle remain to be reviewed.
   - **DG4b Claude Code native adapter.** Reads Claude Code session
     transcripts (`~/.claude/projects/<project>/<session>.jsonl`) for per-turn
     usage (input/output/cache tokens), model, tool calls and results

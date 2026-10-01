@@ -1,0 +1,200 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "gemini-cli"
+            }
+          },
+          {
+            "key": "herdr.attempt_id",
+            "value": {
+              "stringValue": "@ATTEMPT@"
+            }
+          },
+          {
+            "key": "private.resource",
+            "value": {
+              "stringValue": "OTLP_SECRET_CONTENT"
+            }
+          }
+        ]
+      },
+      "scopeLogs": [
+        {
+          "logRecords": [
+            {
+              "body": {
+                "stringValue": "gemini_cli.api_response"
+              },
+              "timeUnixNano": "1700000000000000000",
+              "attributes": [
+                {
+                  "key": "model",
+                  "value": {
+                    "stringValue": "gemini-pro"
+                  }
+                },
+                {
+                  "key": "input_token_count",
+                  "value": {
+                    "intValue": "19"
+                  }
+                },
+                {
+                  "key": "output_token_count",
+                  "value": {
+                    "intValue": "5"
+                  }
+                },
+                {
+                  "key": "cached_content_token_count",
+                  "value": {
+                    "intValue": "4"
+                  }
+                },
+                {
+                  "key": "thoughts_token_count",
+                  "value": {
+                    "intValue": "2"
+                  }
+                },
+                {
+                  "key": "tool_token_count",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "total_token_count",
+                  "value": {
+                    "intValue": "31"
+                  }
+                },
+                {
+                  "key": "duration_ms",
+                  "value": {
+                    "intValue": "90"
+                  }
+                },
+                {
+                  "key": "prompt",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                },
+                {
+                  "key": "tool_input",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                },
+                {
+                  "key": "tool_output",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                },
+                {
+                  "key": "file_contents",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                },
+                {
+                  "key": "function_args",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                },
+                {
+                  "key": "response_text",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                },
+                {
+                  "key": "tool_parameters",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                }
+              ]
+            },
+            {
+              "body": {
+                "stringValue": "gemini_cli.tool_call"
+              },
+              "timeUnixNano": "1700000000000000001",
+              "attributes": [
+                {
+                  "key": "function_name",
+                  "value": {
+                    "stringValue": "read_file"
+                  }
+                },
+                {
+                  "key": "success",
+                  "value": {
+                    "boolValue": false
+                  }
+                },
+                {
+                  "key": "duration_ms",
+                  "value": {
+                    "intValue": "12"
+                  }
+                },
+                {
+                  "key": "prompt",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                },
+                {
+                  "key": "tool_input",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                },
+                {
+                  "key": "tool_output",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                },
+                {
+                  "key": "file_contents",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                },
+                {
+                  "key": "function_args",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                },
+                {
+                  "key": "response_text",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                },
+                {
+                  "key": "tool_parameters",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

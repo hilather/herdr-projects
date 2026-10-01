@@ -122,7 +122,7 @@ fn watermark(db: &Connection) -> Result<i64> {
 /// Row counts of the tables behind each retention class and the non-derivable tables.
 fn counts(db: &Connection) -> Result<BTreeMap<String, i64>> {
     let mut out = BTreeMap::new();
-    for table in ["rollout_sources", "codex_usage", "source_observations", "attention_samples", "health_evaluations", "analytics_revisions", "analytics_workspace_metrics", "analytics_workspace_comparisons", "rate_cards",
+    for table in ["otlp_records", "rollout_sources", "codex_usage", "source_observations", "attention_samples", "health_evaluations", "analytics_revisions", "analytics_workspace_metrics", "analytics_workspace_comparisons", "rate_cards",
         "provider_charges", "fx_tables", "valuation_revisions", "tombstones", "holds"] {
         let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [table], |r| r.get(0))?;
         if exists { out.insert(table.to_owned(), db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?); }

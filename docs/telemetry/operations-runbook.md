@@ -114,6 +114,8 @@ may only be shortened.
 ```text
 $ herdr-projects telemetry demo maintenance classes
 retention.v1
+sidecar.otlp retain - source_of_truth destructive
+secret.otlp_tokens external_lifecycle - source_of_truth destructive
 sidecar.normalized_sessions prune 90d derivable_from_native_source destructive
 sidecar.attention_samples prune 90d source_of_truth destructive
 sidecar.health_evaluations prune 90d derivable
@@ -321,6 +323,7 @@ $ herdr-projects telemetry demo backup create --out <tmp>/backup-2026-09-30
     "codex": <version>,
     "health": <version>,
     "ingest": <version>,
+    "otlp": <version>,
     "policies": <version>,
     "quality": <version>
   },
@@ -406,6 +409,7 @@ $ herdr-projects telemetry demo backup restore --from <tmp>/backup-2026-09-30
     "codex_usage": 0,
     "fx_tables": 0,
     "health_evaluations": 0,
+    "otlp_records": 0,
     "provider_charges": 0,
     "rate_cards": 0,
     "rollout_sources": 0,
@@ -418,6 +422,7 @@ $ herdr-projects telemetry demo backup restore --from <tmp>/backup-2026-09-30
     "codex": <version>,
     "health": <version>,
     "ingest": <version>,
+    "otlp": <version>,
     "policies": <version>,
     "quality": <version>
   },

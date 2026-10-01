@@ -98,8 +98,8 @@ the envelopes of each source are written through, advanced with
 **Gate status.** The Codex adapter (`rollout_jsonl`, certified version
 `0.154.0`) passes the conformance gate at the scope below. Closing the gate
 authorizes downstream development (lane D review capture, lane B) only. It
-claims neither paid-account nor production compatibility. No other adapter
-exists (owner decision 3), so no other gate is open.
+claims neither paid-account nor production compatibility. The DG4a OTLP
+adapters below are fixture-certified only and do not inherit this live gate.
 
 **Suite.** `tests/telemetry_conformance.rs` runs the adapter on the CLI over
 one shared corpus (`CASES`: `codex-0.154.0/{head,tail}.jsonl` and
@@ -1236,3 +1236,135 @@ post-termination records, resolution with none, and unchanged M08 = 2000.
 | Behaviour | Test |
 | --- | --- |
 | A turn open when the product cancelled the attempt: `ended_by_termination` with the receipt's cause and time, even idle past the threshold; no pending gap, no health alert; a turn opened after the receipt and left idle is `missing`, and its usage record is counted `after_termination` | `a_turn_the_product_ended_is_ended_by_termination_not_a_missing_final_event` (`telemetry_collect.rs`) |
+
+## DG4a: generic OTLP receiver (fixture certification)
+
+`telemetry <slug> otlp serve [--port 4318] [--seconds 3600]
+[--max-requests 10000]` opts into a foreground receiver. It listens only on
+**127.0.0.1**, including when port `0` selects an ephemeral port. Startup
+prints its address and token **path**, never the secret. Nothing starts by
+default. The per-project random 256-bit bearer token is stored under the
+config directory as `otlp-<sha256(canonical-project-path)>.token`, created
+0600, opened without following symlinks, and refused unless owned by the
+current user with exactly 0600 permissions. Stop the receiver and remove its
+token to rotate it. Tokens are external secrets, excluded from backups.
+
+Only POST `/v1/logs` and `/v1/metrics`, with `Content-Type: application/json`
+and `Authorization: Bearer <token>`, are supported. **Protobuf, gRPC,
+traces, compression and chunked bodies are unsupported.** Exporters that
+only offer protobuf need an external JSON conversion step; HTTP support alone
+does not establish compatibility. Authentication failure is 401; a body over
+4 MiB is 413; invalid JSON, structure or mapped field types is 400; unsupported
+encoding is 415. Headers are capped at 16 KiB, each request has a two-second
+read deadline, each request accepts at most 4096 records and each attribute
+container at most 128 keys. A global fixed window allows 30 requests/second
+(429 thereafter). One connection is handled at a time, closed after its reply;
+there is no unbounded thread pool. Lifetime is 1–86400 seconds and accepted
+connections are capped at 1–100000. This bounds receiver work independently
+of the controller. Storage I/O/SQLite failures return 503 without exposing SQL or payload
+details; callers must retain their own retry evidence.
+
+Optional ticker configuration in `<config_dir>/config.toml`:
+
+```toml
+[telemetry.otlp.projects.my-project]
+enabled = true
+port = 4318
+```
+
+The disposable telemetry pass reads this configuration and starts a separate
+receiver thread per project, with a 300-second / 10000-connection lease.
+Later telemetry passes restart an expired lease; cadence changes can create
+gaps. A second active thread for the same project is never started. Each
+project must choose its own port. Disabling the config takes effect after the
+active lease expires; ticker exit ends its threads. The normal telemetry
+collection interval (and its disable switch) also governs lease startup.
+The receiver spawns no processes; the controller never waits for requests.
+
+### Mapping and sanitizer
+
+The single reviewed mapping declaration in `telemetry::otlp` also generates
+`collectors capabilities`. Adapter IDs are `otlp:claude-code`,
+`otlp:gemini-cli`, `otlp:codex` and `otlp:unknown`. Every available field is
+**fixture**, never live. No version or live compatibility is certified. Names
+come from [Claude Code monitoring](https://code.claude.com/docs/en/monitoring-usage)
+and [Gemini CLI telemetry](https://geminicli.com/docs/cli/telemetry/);
+fixtures under `tests/fixtures/telemetry/otlp` are synthetic OTLP JSON, not
+captured paid sessions. Codex OTLP names were not established from the
+offline evidence reviewed for this card: its OTLP capability is **none**;
+the existing certified rollout adapter remains its collection path.
+
+| Harness / native name | Kind | Allowlisted attributes |
+|---|---|---|
+| Claude `claude_code.token.usage` | usage | `type` (input/output/cacheRead/cacheCreation), `model` |
+| Claude `claude_code.cost.usage` | usage | `model` |
+| Claude `claude_code.api_request` | usage | `model`, `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `duration_ms`, `cost_usd` |
+| Claude `claude_code.tool_result` | tool | `tool_name`, `success`, `duration_ms` |
+| Gemini `gemini_cli.token.usage` | usage | `type` (input/output/cache/thought/tool), `model` |
+| Gemini `gemini_cli.api_response` | usage | `model`, `input_token_count`, `output_token_count`, `cached_content_token_count`, `thoughts_token_count`, `tool_token_count`, `total_token_count`, `duration_ms` |
+| Gemini `gemini_cli.tool_call` | tool | `function_name`, `success`, `duration_ms` |
+
+Gemini's documented name uses **`api_response`**, not `api.response`;
+the latter is unmapped. Known log names may arrive in `eventName`, a string
+body containing exactly the reviewed name, or `event.name`. Arbitrary bodies
+are never stored. Known sum metrics retain their nonnegative value, reviewed
+unit (empty, USD, token/tokens/{token}), start/end nanosecond timestamps and
+explicit delta/cumulative temporality. Cumulative samples remain snapshots,
+never deltas computed by guessing resets. Both logs and metrics are retained
+as independent native evidence: do not sum their overlapping token or cost
+reports. Cache/thought/tool inclusion is not certified. No OTLP evidence
+feeds budgets or existing Codex accounting totals.
+
+Text identifiers go through the existing excerpt sanitizer after a
+128-byte/control-character limit; numbers are nonnegative, booleans typed
+(or Claude's documented true/false strings). Unknown services, events,
+metric token categories and attributes produce unmapped diagnostics with
+**attribute keys only**, no unknown values, arbitrary service names or event
+names. Known records also retain the keys of discarded attributes, making
+unmapped coverage countable. Body text, prompts, response text, tool
+arguments/input/output/parameters, file contents and resource attribute
+values outside the binding allowlist are never persisted. Malformed payloads
+write nothing, even if earlier records in that payload were valid.
+
+### Binding, identity and storage
+
+Only resource `herdr.attempt_id` exactly equal to a canonical attempt ID
+binds a record (`exact`), with resource `service.name` selecting the mapping.
+Missing ID is `unbound`; an unknown ID is `unknown_attempt`, with its value
+dropped. There is no cwd/home/time inference. This per-project transport
+token authenticates delivery, not an attempt-scoped launch capability, and
+never grants workflow authority. Provenance is `collector_observed` and
+measurement basis is reported (excerpted for text).
+
+Stream `otlp`, migration `otlp/0001_records.sql`, stores sanitized usage,
+tool and unmapped rows in `otlp_records`. `otlp records` reads them without
+creating or migrating a store. Identity is SHA-256 over canonical sanitized
+record JSON, including adapter, exact binding, native timestamp, metric
+start timestamp/temporality and discarded attribute **keys**. Receipt time
+and discarded values are excluded. An identical resend is a no-op, including
+when only forbidden values differ. Without native timestamps, identical
+sanitized observations collapse; this limitation is explicit rather than an
+invented source identity. A changed sanitized observation is separate
+evidence, not a guessed correction. A whole request commits in one sidecar
+transaction under the existing maintenance lock. Raw payloads are never
+spooled, logged or stored.
+
+Retention class `sidecar.otlp` is source-of-truth **retain**, because exporters
+may not replay. It does not follow Codex session deletion. Full sidecar
+backups include this stream, its version and row counts; tokens remain
+external. Future automatic expiry/operator deletion needs a reviewed OTLP
+identity/tombstone contract rather than reusing Codex session tombstones.
+
+`tests/telemetry_otlp.rs` exercises public collector/store and CLI entry points
+with isolated projects: exact hand-computed rows per harness, metric native
+semantics, privacy canaries, atomic malformed rejection, unbound/unknown
+attempts, unknown harnesses, digest replay, capabilities and backup coverage.
+TCP ephemeral-port tests exercise authentication, body limits, malformed
+rejection, both routes, replay and rate limiting. A sandbox denying loopback
+binds must report these failures for the steward to run outside it.
+
+**DG4a follow-up: launch environment wiring.** Configure product-launched
+workers' `OTEL_*` endpoint, JSON exporter protocol, authorization header and
+resource `herdr.attempt_id`/`service.name`, with explicit token lifecycle and
+per-harness exporter compatibility. This is a separate card; DG4a does not
+modify launch environments or claim protobuf-only exporters work directly.

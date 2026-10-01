@@ -1,0 +1,197 @@
+{
+  "resourceMetrics": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "claude-code"
+            }
+          },
+          {
+            "key": "herdr.attempt_id",
+            "value": {
+              "stringValue": "@ATTEMPT@"
+            }
+          }
+        ]
+      },
+      "scopeMetrics": [
+        {
+          "metrics": [
+            {
+              "name": "claude_code.token.usage",
+              "unit": "{token}",
+              "sum": {
+                "aggregationTemporality": 1,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1700000000000000100",
+                    "startTimeUnixNano": "1700000000000000000",
+                    "asInt": "11",
+                    "attributes": [
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "claude-sonnet"
+                        }
+                      },
+                      {
+                        "key": "type",
+                        "value": {
+                          "stringValue": "input"
+                        }
+                      },
+                      {
+                        "key": "prompt",
+                        "value": {
+                          "stringValue": "OTLP_SECRET_CONTENT"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "claude_code.token.usage",
+              "unit": "{token}",
+              "sum": {
+                "aggregationTemporality": 1,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1700000000000000101",
+                    "startTimeUnixNano": "1700000000000000000",
+                    "asInt": "7",
+                    "attributes": [
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "claude-sonnet"
+                        }
+                      },
+                      {
+                        "key": "type",
+                        "value": {
+                          "stringValue": "output"
+                        }
+                      },
+                      {
+                        "key": "prompt",
+                        "value": {
+                          "stringValue": "OTLP_SECRET_CONTENT"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "claude_code.token.usage",
+              "unit": "{token}",
+              "sum": {
+                "aggregationTemporality": 1,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1700000000000000102",
+                    "startTimeUnixNano": "1700000000000000000",
+                    "asInt": "3",
+                    "attributes": [
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "claude-sonnet"
+                        }
+                      },
+                      {
+                        "key": "type",
+                        "value": {
+                          "stringValue": "cacheRead"
+                        }
+                      },
+                      {
+                        "key": "prompt",
+                        "value": {
+                          "stringValue": "OTLP_SECRET_CONTENT"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "claude_code.token.usage",
+              "unit": "{token}",
+              "sum": {
+                "aggregationTemporality": 1,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1700000000000000103",
+                    "startTimeUnixNano": "1700000000000000000",
+                    "asInt": "2",
+                    "attributes": [
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "claude-sonnet"
+                        }
+                      },
+                      {
+                        "key": "type",
+                        "value": {
+                          "stringValue": "cacheCreation"
+                        }
+                      },
+                      {
+                        "key": "prompt",
+                        "value": {
+                          "stringValue": "OTLP_SECRET_CONTENT"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "claude_code.cost.usage",
+              "unit": "USD",
+              "sum": {
+                "aggregationTemporality": 2,
+                "isMonotonic": true,
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1700000000000000104",
+                    "startTimeUnixNano": "1700000000000000000",
+                    "asDouble": 0.04,
+                    "attributes": [
+                      {
+                        "key": "model",
+                        "value": {
+                          "stringValue": "claude-sonnet"
+                        }
+                      },
+                      {
+                        "key": "prompt",
+                        "value": {
+                          "stringValue": "OTLP_SECRET_CONTENT"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

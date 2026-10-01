@@ -1,0 +1,194 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "claude-code"
+            }
+          },
+          {
+            "key": "herdr.attempt_id",
+            "value": {
+              "stringValue": "@ATTEMPT@"
+            }
+          },
+          {
+            "key": "private.resource",
+            "value": {
+              "stringValue": "OTLP_SECRET_CONTENT"
+            }
+          }
+        ]
+      },
+      "scopeLogs": [
+        {
+          "logRecords": [
+            {
+              "body": {
+                "stringValue": "claude_code.api_request"
+              },
+              "timeUnixNano": "1700000000000000000",
+              "attributes": [
+                {
+                  "key": "model",
+                  "value": {
+                    "stringValue": "claude-sonnet"
+                  }
+                },
+                {
+                  "key": "input_tokens",
+                  "value": {
+                    "intValue": "11"
+                  }
+                },
+                {
+                  "key": "output_tokens",
+                  "value": {
+                    "intValue": "7"
+                  }
+                },
+                {
+                  "key": "cache_read_tokens",
+                  "value": {
+                    "intValue": "3"
+                  }
+                },
+                {
+                  "key": "cache_creation_tokens",
+                  "value": {
+                    "intValue": "2"
+                  }
+                },
+                {
+                  "key": "duration_ms",
+                  "value": {
+                    "intValue": "123"
+                  }
+                },
+                {
+                  "key": "cost_usd",
+                  "value": {
+                    "doubleValue": 0.04
+                  }
+                },
+                {
+                  "key": "prompt",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                },
+                {
+                  "key": "tool_input",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                },
+                {
+                  "key": "tool_output",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                },
+                {
+                  "key": "file_contents",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                },
+                {
+                  "key": "function_args",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                },
+                {
+                  "key": "response_text",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                },
+                {
+                  "key": "tool_parameters",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                }
+              ]
+            },
+            {
+              "body": {
+                "stringValue": "claude_code.tool_result"
+              },
+              "timeUnixNano": "1700000000000000001",
+              "attributes": [
+                {
+                  "key": "tool_name",
+                  "value": {
+                    "stringValue": "Read"
+                  }
+                },
+                {
+                  "key": "success",
+                  "value": {
+                    "stringValue": "true"
+                  }
+                },
+                {
+                  "key": "duration_ms",
+                  "value": {
+                    "intValue": "8"
+                  }
+                },
+                {
+                  "key": "prompt",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                },
+                {
+                  "key": "tool_input",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                },
+                {
+                  "key": "tool_output",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                },
+                {
+                  "key": "file_contents",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                },
+                {
+                  "key": "function_args",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                },
+                {
+                  "key": "response_text",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                },
+                {
+                  "key": "tool_parameters",
+                  "value": {
+                    "stringValue": "OTLP_SECRET_CONTENT"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

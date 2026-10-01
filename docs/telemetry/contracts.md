@@ -16,7 +16,8 @@ needs a new reviewed revision, not a silent reinterpretation.
   certificate-scale.md §5), and one stream per lane under
   `migrations/telemetry/<stream>/`: `ingest`, `accounting`, `quality`,
   `review`, `analytics` (TM4.1 aggregate revisions), `health` (TM4.5 alert
-  state). A reader refuses only a
+  state), `otlp` (DG4a sanitized native records, migration 0001;
+  contracts-collection.md DG4a). A reader refuses only a
   stream newer than it knows. Plan:
   [phase2-lanes.md](phase2-lanes.md).
 - Lane contracts, each owned by its lane: collection
@@ -609,7 +610,7 @@ the shadow bridge landed, contracts-accounting.md §14);
 candidate-group races; resume/compaction
 reconciliation beyond quarantine.
 
-Planned, no longer deferred (owner decision 2026-09-30): harness coverage beyond Codex: an OTLP receiver first, then native adapters for Claude Code, Gemini CLI, OpenCode and Grok, and a second wave (Cursor, GitHub Copilot CLI, Amp, Aider). Cards DG4a–DG4f in [phase2-lanes.md](phase2-lanes.md).
+Planned, no longer deferred (owner decision 2026-09-30): harness coverage beyond Codex: DG4a has landed a fixture-certified OTLP/HTTP JSON receiver (contracts-collection.md DG4a); next are launch-env wiring and native adapters for Claude Code, Gemini CLI, OpenCode and Grok, and a second wave (Cursor, GitHub Copilot CLI, Amp, Aider). Cards DG4a–DG4f in [phase2-lanes.md](phase2-lanes.md).
 
 Landed since this list was first written: the worker submission spool and
 Git quarantine (docs/reviews/2026-09-29-worker-isolation.md), randomized

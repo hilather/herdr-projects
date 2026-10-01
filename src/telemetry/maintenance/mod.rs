@@ -92,6 +92,10 @@ pub struct Class {
 
 /// `retention.v1`: doc 09's defaults, one row per sidecar table group and on-disk artefact.
 pub const CLASSES: &[Class] = &[
+    Class { id: "sidecar.otlp", store: "telemetry.db", scope: "otlp_records", default_days: None, basis: "source_of_truth", destructive: true,
+        action: Action::Retain, age_from: "observed_unix_ms", requires: "kept: exporters may not replay; included in full sidecar backups" },
+    Class { id: "secret.otlp_tokens", store: "<config_dir>/otlp-<project-digest>.token", scope: "per-project bearer tokens", default_days: None, basis: "source_of_truth", destructive: true,
+        action: Action::External, age_from: "-", requires: "never included in telemetry backups; delete to rotate while receiver stopped" },
     Class { id: SESSIONS, store: "telemetry.db", scope: "per Codex session: codex_*, rollout_*, collect_offsets, codex_tool_sources, source_bindings, source_observations, ingest_quarantine, coverage_gaps, source_cursors, usage_entries, usage_dispositions, model_segments, quota_window_observations, session_graph_nodes",
         default_days: Some(90), basis: "derivable_from_native_source", destructive: true, action: Action::Prune, age_from: "last durable acceptance (rollout_sources.observed_unix_ms)",
         requires: "bound attempt terminal; accounting ledger synced after acceptance with no unresolved or conflicting disposition; no quarantined record" },
