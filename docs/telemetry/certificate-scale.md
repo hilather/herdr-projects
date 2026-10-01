@@ -1764,6 +1764,87 @@ telemetry_conformance,telemetry_operations}.rs`; this certificate,
 `operations-runbook.md` (relative to `docs/telemetry/`). The scale harness,
 including its load-gate body, is unchanged.
 
+### 4.16 P5b: preserve disposition invalidation after compaction (100k only)
+
+Branch `perf/sidecar-size`, following the steward's rebase onto DG2/P2 main.
+**Pending the steward's serial 1M certification.** Accounting remains stream
+**17**; DG2 owns `0016_cache_read_share.sql`, and compaction is migration
+`0017_compact_dispositions.sql`. No 1M run was performed.
+
+Root cause: `DROP TABLE usage_dispositions` in 0017 also dropped 0012's
+`accounting_dispositions_update` trigger. The operations workflow changes one
+accepted disposition to unresolved after a completed sync. Without that
+trigger, `accounting_stream.invalidated` stays null and no source session is
+dirty. DG2's cache aggregates are complete, so `prepare_sync` selects an empty
+incremental replay instead of rebuilding. The disposition row is **not lost**:
+it remains unresolved, and retention correctly blocks the session, giving
+eligible_count 0 instead of 1. P2's generic analytics generation triggers are
+reinstalled, but they validate concurrent snapshots rather than force this
+ledger replay. Neither DG2's cache evaluator nor a compacted-view DELETE
+removes the row.
+
+0017 now recreates the exact original AFTER UPDATE trigger after renaming the
+compact table. An external correction again sets `projection_changed`; sync
+replays the original native facts and atomically replaces ledger, graph, quota
+and maintained aggregates, including DG2 cache totals. No derivation, metric,
+coverage or as-of rule changes. The blocking operations test and scale gate
+are unchanged; only the two remaining accounting-version pins advance 16 → 17.
+No new tests, crates or source process spawns were added.
+
+Both release builds used §1's exact locked/offline `-j 3` no-run command.
+Phases 0/1 used `SCALE_EVENTS=100000 SCALE_ACTIVE=64 SCALE_REPEATS=3`, one
+bench process at a time, without an overlapping build or test. The same
+seed-5100 initial fixture was saved before baseline ingest and restored at
+identical absolute paths before after ingest; source and canonical bytes
+are identical. Active rollout mtimes were refreshed after the release build
+to preserve initial freshness. All fixtures, copies and datasets remained
+under `$PWD/bench-data/` on disk. Phase 1 produces one cold sample regardless
+of `SCALE_REPEATS`; timings are not three-sample percentiles.
+
+| Cold ingest, 100k/64 | Before P5b | After P5b |
+| --- | --- | --- |
+| Rollout bytes | 53,714,262 | 53,714,262 |
+| Sidecar database / WAL bytes | 105,037,824 / 0 | 105,037,824 / 0 |
+| Collection wall time | 16,368.81 ms | 16,777.20 ms |
+| Accounting sync wall time / peak RSS | 2,993.93 ms / 59,460 KiB | 3,244.55 ms / 61,212 KiB |
+| Analytics refresh wall time / peak RSS | 2,826.11 ms / 202,924 KiB | 2,796.37 ms / 202,588 KiB |
+| Health evaluation wall time | 2,233.79 ms | 2,382.79 ms |
+| Loadavg start (1 / 5 / 15 min) | 5.26 / 5.09 / 5.65 | 2.51 / 3.73 / 4.90 |
+| Loadavg end (1 / 5 / 15 min) | 4.16 / 4.84 / 5.55 | 1.91 / 3.47 / 4.77 |
+
+These `results-prepare-before.json` / `results-prepare.json` measurements
+preserve L6's compact size exactly; they compare the trigger repair, not the
+original storage halving. No timing speedup is claimed on the noisy shared
+host. Both phases report `violations: []`, `canonical_unchanged: true`, and
+identical 19,800 accepted records: input 202,285,731, cached 50,862,666, output
+20,258,435 and reasoning 5,062,106. The earlier P5 size comparison remains
+provisional until the steward's serial 1M certification.
+
+Validation used `TMPDIR=$PWD/target/tmp`, `RUST_TEST_THREADS=1` and
+`cargo test --locked --offline -j 3 --features state-store --no-fail-fast`.
+The requested operations/accounting/Claude/scale command passed **51 tests**,
+with **12 ignored** and only the accounting Unix-bind failure below. The
+subsequent run of every **20** telemetry suite passed **212 tests**, with
+**12 ignored** and **six socket-only failures**. The unchanged operations
+regression and `scale_gates_hold_under_load` pass in both runs, retaining
+exact totals, one acceptance, reproducible as-of answers, byte-identical
+rebuild and the canonical digest. No other expected value was edited.
+
+Unix socket binds return `Operation not permitted` in:
+
+- `telemetry::attempts_show_attention_summary`
+- `telemetry_accounting::attention_intervals_union_and_censor`
+- `telemetry_health::recommendations_and_notices_change_no_canonical_state_and_no_dispatch`
+- `telemetry_workspace::thread_start_records_the_dispatch_reason_and_the_sidebar_suffix`
+
+TCP loopback binds return the same sandbox denial in
+`telemetry_otlp::http_auth_limits_malformed_and_replay` and
+`telemetry_otlp::http_request_rate_is_bounded`. No workaround was attempted.
+Clippy checks the operations/accounting/Claude targets plus scale with the same
+locked/offline `-j 3` flags; no warning falls on changed lines. Benchmark
+datasets are removed before commit. Files: accounting migration 0017,
+`tests/telemetry_accounting.rs`, `tests/telemetry_claude.rs`, and this certificate.
+
 ## 5. Inefficiencies found and fixed
 
 The first measurement (same generator, same host) missed the query and
@@ -1986,7 +2067,10 @@ owner. None is hidden by loosening the target.
   2.7–3.1 times rollout bytes (1.44 GB at 1M). On the same current 100k
   fixture, lossless storage reduces 209,563,648 → 104,570,880 bytes:
   3.901452× → 1.946799×, a 50.101% reduction, at start/end 1-minute loads
-  4.83 → 4.54 before / 4.78 → 4.54 after. TM5.3's defaults require an
+  4.83 → 4.54 before / 4.78 → 4.54 after. **P5b preserves compact size
+  at 105,037,824 → 105,037,824 bytes on its current 100k fixture (§4.16),
+  at loads 5.26 → 4.16 before / 2.51 → 1.91 after; pending the steward's
+  1M certification.** TM5.3's defaults require an
   operator-confirmed apply; automatic destructive retention was not enabled.
   Incremental page reclamation is enabled on new stores. Indefinitely retained
   valuation/latest history, active attempts and holds still prevent a universal
