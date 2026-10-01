@@ -912,7 +912,7 @@ fn candidate_group_cost_includes_every_arm() {
 /// decision (harness coverage, phase2-lanes.md DG4) the OTLP receiver adds
 /// `otlp:<harness>` adapters and DG4b the native `claude-code` adapter, but
 /// those are fixture-certified at most; Cursor's reviewed surfaces are
-/// unavailable (`none`). No other adapter may claim a `live` field. An uncertified Codex version is
+/// unavailable (`none`). Only adapters with a recorded live report may claim a `live` field. An uncertified Codex version is
 /// never summed.
 #[test]
 fn accounting_fields_match_the_adapter_certificate() {
@@ -923,9 +923,20 @@ fn accounting_fields_match_the_adapter_certificate() {
     assert_eq!(names[0], "codex", "{names:?}");
     assert!(names[1..].iter().all(|n| *n == "claude-code" || *n == "gemini-cli" || *n == "opencode" || *n == "cursor-agent" || n.starts_with("otlp:")), "only declared adapters besides Codex: {names:?}");
     assert!(names.contains(&"otlp:grok"), "Grok fixture adapter must be advertised: {names:?}");
-    for other in &adapters[1..] {
-        let live: Vec<&Value> = other["fields"].as_array().into_iter().flatten().filter(|f| f["certified"] == "live").collect();
-        assert!(live.is_empty(), "{} must not claim live-certified fields: {live:?}", other["adapter"]);
+    // Recorded live evidence registry. Adding an adapter/version requires a
+    // reviewed report, not merely a successful invocation of the live test.
+    let recorded_live = [("codex", "0.154.0", "docs/telemetry/certificate-live.md")];
+    for adapter in adapters {
+        let claims_live = adapter["fields"].as_array().into_iter().flatten().any(|f| f["certified"] == "live");
+        if claims_live {
+            let name = adapter["adapter"].as_str().unwrap();
+            let versions = adapter["certified_versions"].as_array().unwrap();
+            assert!(!versions.is_empty(), "live fields need a recorded version");
+            for version in versions {
+                assert!(recorded_live.iter().any(|(a, v, report)| *a == name && Some(*v) == version.as_str() && !report.is_empty()),
+                    "{name} {version} needs a recorded live report before claiming live");
+            }
+        }
     }
     for (name, reason) in [
         ("cursor-agent", "stable_local_usage_format_not_evident"),
