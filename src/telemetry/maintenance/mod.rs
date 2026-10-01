@@ -96,6 +96,8 @@ pub const CLASSES: &[Class] = &[
         action: Action::Retain, age_from: "end_unix_ms", requires: "kept: ticker observations cannot be replayed; included in full sidecar backups" },
     Class { id: "sidecar.otlp", store: "telemetry.db", scope: "otlp_records, gemini_file_cursors", default_days: None, basis: "source_of_truth", destructive: true,
         action: Action::Retain, age_from: "observed_unix_ms", requires: "kept: exporters may not replay; included in full sidecar backups" },
+    Class { id: "sidecar.otlp_attempt_tokens", store: "telemetry.db", scope: "otlp_attempt_tokens", default_days: None, basis: "source_of_truth", destructive: true,
+        action: Action::Retain, age_from: "created_unix_ms", requires: "hashed credentials and revocations retained in full backups; no plaintext tokens; expiry remains absolute" },
     Class { id: "secret.otlp_tokens", store: "<config_dir>/otlp-<project-digest>.token", scope: "per-project bearer tokens", default_days: None, basis: "source_of_truth", destructive: true,
         action: Action::External, age_from: "-", requires: "never included in telemetry backups; delete to rotate while receiver stopped" },
     Class { id: SESSIONS, store: "telemetry.db", scope: "per native session: claude_messages, claude_tool_results, opencode_messages, opencode_tools, codex_*, rollout_*, collect_offsets, codex_tool_sources, source_bindings, source_observations, ingest_quarantine, coverage_gaps, source_cursors, usage_entries, usage_dispositions, model_segments, quota_window_observations, session_graph_nodes",

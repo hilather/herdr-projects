@@ -1,4 +1,5 @@
-//! DG4a: bounded OTLP/HTTP JSON, allowlist before durable storage.
+//! DG4a/DG4h: bounded OTLP/HTTP JSON and protobuf, allowlist before storage.
+mod protobuf;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -12,9 +13,11 @@ use std::{
 };
 
 pub const STREAM: &str = "otlp";
-pub const MIGRATIONS: &[&str] = &[include_str!(
-    "../../migrations/telemetry/otlp/0001_records.sql"
-), include_str!("../../migrations/telemetry/otlp/0002_file_cursors.sql")];
+pub const MIGRATIONS: &[&str] = &[
+    include_str!("../../migrations/telemetry/otlp/0001_records.sql"),
+    include_str!("../../migrations/telemetry/otlp/0002_file_cursors.sql"),
+    include_str!("../../migrations/telemetry/otlp/0003_attempt_tokens.sql"),
+];
 pub const MAX_BODY: usize = 4 * 1024 * 1024;
 const MAX_RECORDS: usize = 4096;
 
@@ -31,6 +34,18 @@ pub enum Command {
     },
     /// Read sanitized records, including unbound and unmapped diagnostics.
     Records,
+    /// Mint a scoped bearer credential and print it once.
+    MintToken {
+        #[arg(long)]
+        attempt: String,
+        #[arg(long, default_value_t = 3600)]
+        seconds: u64,
+    },
+    /// Revoke using the nonsecret token hash returned at mint time.
+    RevokeToken {
+        #[arg(long)]
+        token_hash: String,
+    },
 }
 
 // Native names and allowlisted attribute paths are shared with capabilities.
@@ -135,7 +150,7 @@ pub fn capabilities() -> Vec<Value> {
         if harness == "codex" {
             fields.insert(0,json!({"kind":"otlp","field":"*","available":false,"basis":"unavailable","certified":"none","caveat":null,"reason":"names_not_certified_use_rollout_adapter"}));
         }
-        out.push(json!({"adapter":format!("otlp:{harness}"),"interface":"otlp_http_json","certified_versions":[],"uncertified_version":"fixture_only","fields":fields}));
+        out.push(json!({"adapter":format!("otlp:{harness}"),"interface":"otlp_http_json_protobuf","certified_versions":[],"uncertified_version":"fixture_only","fields":fields}));
         if harness == "muse" {
             let cap = out.last_mut().unwrap();
             cap["fixture_versions"] = json!(["1.4.0-R4161.1"]);
@@ -228,12 +243,48 @@ fn timestamp(v: &Value, key: &str) -> Result<Value> {
 /// before calling it. Like public sidecar APIs it is for trusted local callers.
 pub fn ingest(project: &Path, endpoint: &str, bytes: &[u8]) -> Result<usize> {
     ensure!(bytes.len() <= MAX_BODY, "body oversized");
+    let root: Value = serde_json::from_slice(bytes).context("malformed JSON")?;
+    ingest_root(project, endpoint, root, None)
+}
+
+/// Public transport-equivalent API: authenticate a scoped token before decoding.
+pub fn ingest_attempt(
+    project: &Path,
+    endpoint: &str,
+    bytes: &[u8],
+    content_type: &str,
+    token: &str,
+) -> Result<usize> {
+    let attempt = authenticate_attempt(project, token)?.context("unauthorized attempt token")?;
+    ingest_encoded(project, endpoint, bytes, content_type, Some(&attempt))
+}
+
+/// Trusted local protobuf collector entry point, sharing JSON validation/storage.
+pub fn ingest_protobuf(project: &Path, endpoint: &str, bytes: &[u8]) -> Result<usize> {
+    ingest_encoded(project, endpoint, bytes, "application/x-protobuf", None)
+}
+fn ingest_encoded(
+    project: &Path,
+    endpoint: &str,
+    bytes: &[u8],
+    content_type: &str,
+    attempt: Option<&str>,
+) -> Result<usize> {
+    ensure!(bytes.len() <= MAX_BODY, "body oversized");
+    let root = match content_type {
+        "application/json" => serde_json::from_slice(bytes).context("malformed JSON")?,
+        "application/x-protobuf" => protobuf::request(endpoint, bytes)?,
+        _ => anyhow::bail!("unsupported content type"),
+    };
+    ingest_root(project, endpoint, root, attempt)
+}
+
+fn ingest_root(project: &Path, endpoint: &str, root: Value, token_attempt: Option<&str>) -> Result<usize> {
     let metrics = match endpoint {
         "/v1/logs" => false,
         "/v1/metrics" => true,
         _ => anyhow::bail!("unsupported endpoint"),
     };
-    let root: Value = serde_json::from_slice(bytes).context("malformed JSON")?;
     let resources = array(
         &root,
         if metrics {
@@ -261,8 +312,13 @@ pub fn ingest(project: &Path, endpoint: &str, bytes: &[u8]) -> Result<usize> {
         let attempted = (!harness.is_empty())
             .then(|| ra.get("herdr.attempt_id").and_then(Value::as_str))
             .flatten();
-        let attempt = attempted.filter(|id| attempts.iter().any(|a| a.id == *id));
-        let binding = if attempt.is_some() {
+        let named_attempt = ra.get("herdr.attempt_id");
+        ensure!(named_attempt.is_none_or(Value::is_string), "invalid attempt attribute");
+        let conflict = token_attempt.is_some_and(|id| named_attempt.and_then(Value::as_str).is_some_and(|named| named != id));
+        let attempt = if conflict { None } else { token_attempt.or(attempted).filter(|id| attempts.iter().any(|a| a.id == *id)) };
+        let binding = if conflict {
+            "unknown_attempt"
+        } else if attempt.is_some() {
             "exact"
         } else if attempted.is_some() {
             "unknown_attempt"
@@ -281,7 +337,7 @@ pub fn ingest(project: &Path, endpoint: &str, bytes: &[u8]) -> Result<usize> {
                         .or_else(|| entry["body"]["stringValue"].as_str())
                         .or_else(|| ea.get("event.name").and_then(Value::as_str))
                 }
-                .context("missing native name")?;
+                .unwrap_or("");
                 let mapping = MAPPINGS
                     .iter()
                     .find(|m| known && m.0 == harness && m.1 == name && metrics == (name.ends_with(".usage") || name.ends_with("token_usage") || m.0 == "grok")
@@ -313,6 +369,15 @@ pub fn ingest(project: &Path, endpoint: &str, bytes: &[u8]) -> Result<usize> {
                             })
                     });
                     let mut payload = json!({"adapter":adapter,"attempt_id":attempt,"binding":binding,"source_trust":"collector_observed","certified":"fixture", "timeUnixNano":timestamp(&point,"timeUnixNano")?});
+                    if !metrics {
+                        if point.get("observedTimeUnixNano").is_some() {
+                            payload["observedTimeUnixNano"] = timestamp(&point, "observedTimeUnixNano")?;
+                        }
+                        if let Some(severity) = point.get("severityNumber") {
+                            ensure!(severity.as_u64().is_some_and(|n| n <= 24), "invalid severity");
+                            payload["severityNumber"] = severity.clone();
+                        }
+                    }
                     if harness == "muse" {
                         payload["cli_version"] = if cli_version == Some("1.4.0-R4161.1") { json!("1.4.0-R4161.1") } else { Value::Null };
                         if cli_version != Some("1.4.0-R4161.1") {
@@ -327,6 +392,7 @@ pub fn ingest(project: &Path, endpoint: &str, bytes: &[u8]) -> Result<usize> {
                             payload["reason"] = json!("cli_version_uncertified");
                         }
                     }
+                    if conflict { payload["reason"] = json!("cross_attempt_quarantined"); }
                     let mut allowed = BTreeMap::new();
                     if let Some((_, native, kind, fields)) = mapping {
                         payload["native_name"] = json!(native);
@@ -370,34 +436,25 @@ pub fn ingest(project: &Path, endpoint: &str, bytes: &[u8]) -> Result<usize> {
                         }
                         payload["attributes"] = json!(allowed);
                         if metrics {
-                            ensure!(
-                                point.get("asInt").is_some() != point.get("asDouble").is_some(),
-                                "invalid metric value fields"
-                            );
-                            let val = if let Some(raw) = point.get("asInt") {
-                                integer(raw).filter(|n| *n >= 0).map(|n| json!(n))
+                            if entry.get("histogram").is_some() {
+                                let count = point.get("count").and_then(|n| n.as_u64().or_else(|| n.as_str()?.parse::<u64>().ok())).context("invalid histogram count")?;
+                                payload["count"] = json!(count);
+                                if let Some(sum) = point.get("sum") {
+                                    payload["sum"] = number(sum).context("invalid histogram sum")?;
+                                }
                             } else {
-                                point
-                                    .get("asDouble")
-                                    .filter(|v| v.is_number())
-                                    .and_then(number)
+                                ensure!(point.get("asInt").is_some() != point.get("asDouble").is_some(), "invalid metric value fields");
+                                payload["value"] = if let Some(raw) = point.get("asInt") {
+                                    integer(raw).filter(|n| *n >= 0).map(|n| json!(n))
+                                } else { point.get("asDouble").filter(|v| v.is_number()).and_then(number) }.context("invalid metric value")?;
                             }
-                            .context("invalid metric value")?;
-                            payload["value"] = val;
                             payload["startTimeUnixNano"] = timestamp(&point, "startTimeUnixNano")?;
-                            let temp = entry["sum"]["aggregationTemporality"].clone();
-                            ensure!(
-                                matches!(temp.as_i64(), Some(1 | 2))
-                                    || matches!(
-                                        temp.as_str(),
-                                        Some(
-                                            "AGGREGATION_TEMPORALITY_DELTA"
-                                                | "AGGREGATION_TEMPORALITY_CUMULATIVE"
-                                        )
-                                    ),
-                                "unknown counter temporality"
-                            );
-                            payload["aggregationTemporality"] = temp;
+                            if entry.get("gauge").is_none() {
+                                let data = entry.get("sum").or_else(|| entry.get("histogram")).unwrap();
+                                let temp = data["aggregationTemporality"].clone();
+                                ensure!(matches!(temp.as_i64(), Some(1 | 2)) || matches!(temp.as_str(), Some("AGGREGATION_TEMPORALITY_DELTA" | "AGGREGATION_TEMPORALITY_CUMULATIVE")), "unknown counter temporality");
+                                payload["aggregationTemporality"] = temp;
+                            }
                             // Reviewed units only; never retain arbitrary exporter text.
                             let unit = entry["unit"].as_str().unwrap_or("");
                             ensure!(
@@ -466,6 +523,62 @@ pub fn records(project: &Path) -> Result<Value> {
             .map(|s| serde_json::from_str::<Value>(&s))
             .collect::<serde_json::Result<Vec<_>>>()?
     ))
+}
+
+fn project_hash(project: &Path) -> Result<String> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(
+            std::fs::canonicalize(project)?
+                .as_os_str()
+                .as_encoded_bytes()
+        )
+    ))
+}
+fn secret_hash(secret: &str) -> String {
+    format!("{:x}", Sha256::digest(secret.as_bytes()))
+}
+
+/// Mint once, persist only the hash, and restrict authority to an existing attempt.
+pub fn mint_attempt_token(project: &Path, attempt: &str, seconds: u64) -> Result<Value> {
+    ensure!((1..=86400).contains(&seconds), "invalid token lifetime");
+    ensure!(
+        super::codex::canonical_attempts(project)?
+            .iter()
+            .any(|a| a.id == attempt),
+        "unknown attempt"
+    );
+    let mut entropy = [0u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut entropy)?;
+    let secret: String = entropy.iter().map(|b| format!("{b:02x}")).collect();
+    let hash = secret_hash(&secret);
+    let now = jiff::Timestamp::now().as_millisecond();
+    let expires = now + (seconds as i64) * 1000;
+    let _lock = super::maintenance::lock(project, false)?;
+    let db = super::sidecar::open(project, true)?.context("sidecar unavailable")?;
+    db.execute("INSERT INTO otlp_attempt_tokens(token_hash,project_hash,attempt_id,expires_unix_ms,created_unix_ms) VALUES(?1,?2,?3,?4,?5)", rusqlite::params![hash, project_hash(project)?, attempt, expires, now])?;
+    Ok(json!({"token":secret,"token_hash":hash,"attempt_id":attempt,"expires_unix_ms":expires}))
+}
+
+pub fn revoke_attempt_token(project: &Path, hash: &str) -> Result<()> {
+    let _lock = super::maintenance::lock(project, false)?;
+    let db = super::sidecar::open(project, true)?.context("sidecar unavailable")?;
+    ensure!(db.execute("UPDATE otlp_attempt_tokens SET revoked_unix_ms=?1 WHERE token_hash=?2 AND project_hash=?3", rusqlite::params![jiff::Timestamp::now().as_millisecond(), hash, project_hash(project)?])? == 1, "unknown token hash");
+    Ok(())
+}
+fn authenticate_attempt(project: &Path, secret: &str) -> Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    if secret.len() != 64 || !secret.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(None);
+    }
+    let Some(db) = super::sidecar::read(project)? else {
+        return Ok(None);
+    };
+    let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='otlp_attempt_tokens')", [], |r| r.get(0))?;
+    if !exists {
+        return Ok(None);
+    }
+    Ok(db.query_row("SELECT attempt_id FROM otlp_attempt_tokens WHERE token_hash=?1 AND project_hash=?2 AND revoked_unix_ms IS NULL AND expires_unix_ms>?3", rusqlite::params![secret_hash(secret), project_hash(project)?, jiff::Timestamp::now().as_millisecond()], |r| r.get(0)).optional()?)
 }
 
 /// Token scope includes the canonical project path, not merely a reusable slug.
@@ -571,13 +684,15 @@ fn request(stream: &mut TcpStream, secret: &str, project: &Path, remaining: Dura
             .bytes()
             .zip(expected.bytes())
             .fold(0u8, |a, (x, y)| a | (x ^ y));
-        if supplied.len() != expected.len() || diff != 0 {
-            return Err(401);
-        }
+        let attempt = if supplied.len() == expected.len() && diff == 0 { None } else {
+            let bearer = supplied.strip_prefix("Bearer ").ok_or(401u16)?;
+            Some(authenticate_attempt(project, bearer).map_err(|_| 503u16)?.ok_or(401u16)?)
+        };
         if headers.contains_key("transfer-encoding") || headers.contains_key("content-encoding") {
             return Err(415);
         }
-        if headers.get("content-type").copied() != Some("application/json") {
+        let content_type = headers.get("content-type").copied().unwrap_or("");
+        if !matches!(content_type, "application/json" | "application/x-protobuf") {
             return Err(415);
         }
         let length = headers
@@ -602,7 +717,7 @@ fn request(stream: &mut TcpStream, secret: &str, project: &Path, remaining: Dura
             }
             read += n;
         }
-        ingest(project, first[1], &body).map_err(|e| {
+        ingest_encoded(project, first[1], &body, content_type, attempt.as_deref()).map_err(|e| {
             if e.downcast_ref::<rusqlite::Error>().is_some()
                 || e.downcast_ref::<std::io::Error>().is_some()
             {
@@ -689,6 +804,15 @@ pub fn run(project: &Path, config: &Path, command: Command) -> Result<()> {
             seconds,
             max_requests,
         } => serve(project, config, port, seconds, max_requests),
+        Command::MintToken { attempt, seconds } => {
+            println!("{}", mint_attempt_token(project, &attempt, seconds)?);
+            Ok(())
+        }
+        Command::RevokeToken { token_hash } => {
+            revoke_attempt_token(project, &token_hash)?;
+            println!("{}", json!({"revoked":true,"token_hash":token_hash}));
+            Ok(())
+        },
         Command::Records => {
             println!("{}", serde_json::to_string_pretty(&records(project)?)?);
             Ok(())

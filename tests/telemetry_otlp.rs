@@ -348,10 +348,10 @@ fn http_auth_limits_malformed_and_replay() {
             Some(&token),
             "/v1/logs",
             "application/x-protobuf",
-            b"",
-            0
+            b"\x0b",
+            1
         ),
-        415
+        400
     );
     assert_eq!(
         http(
@@ -412,6 +412,8 @@ fn http_request_rate_is_bounded() {
 #[test]
 fn sidecar_migration_retention_and_backup_preserve_otlp_evidence() {
     let f = Fixture::reserved();
+    let minted = otlp::mint_attempt_token(&f.project, &f.attempt, 3600).unwrap();
+    otlp::revoke_attempt_token(&f.project, minted["token_hash"].as_str().unwrap()).unwrap();
     otlp::ingest(&f.project, "/v1/logs", &payload(&f, "claude-logs")).unwrap();
     otlp::ingest(&f.project, "/v1/metrics", &payload(&f, "grok-metrics")).unwrap();
     let before = otlp::records(&f.project).unwrap();
@@ -423,7 +425,7 @@ fn sidecar_migration_retention_and_backup_preserve_otlp_evidence() {
                 |r| r.get::<_, i64>(0)
             )
             .unwrap(),
-        2
+        3
     );
     let (classes, _) = f.cli_args(&["maintenance", "classes", "--json"]);
     let class = classes["classes"]
@@ -434,6 +436,10 @@ fn sidecar_migration_retention_and_backup_preserve_otlp_evidence() {
         .unwrap();
     assert_eq!(class["action"], "retain");
     assert_eq!(class["basis"], "source_of_truth");
+    let token_class = classes["classes"].as_array().unwrap().iter()
+        .find(|c| c["class"] == "sidecar.otlp_attempt_tokens").unwrap();
+    assert_eq!(token_class["action"], "retain");
+    assert_eq!(token_class["basis"], "source_of_truth");
     assert!(class["retention_days"].is_null());
     let backup = f.tmp.path().join("otlp-backup");
     f.cli_args(&["backup", "create", "--out", backup.to_str().unwrap()]);
@@ -448,10 +454,15 @@ fn sidecar_migration_retention_and_backup_preserve_otlp_evidence() {
             .unwrap(),
         12
     );
+    assert_eq!(copy.query_row("SELECT count(*) FROM otlp_attempt_tokens WHERE revoked_unix_ms IS NOT NULL", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    let backup_bytes = fs::read(backup.join("telemetry.db")).unwrap();
+    let secret = minted["token"].as_str().unwrap();
+    assert!(!backup_bytes.windows(secret.len()).any(|w| w == secret.as_bytes()));
     drop(copy);
     f.cli_args(&["backup", "verify", "--from", backup.to_str().unwrap()]);
     f.cli_args(&["backup", "restore", "--from", backup.to_str().unwrap()]);
     assert_eq!(otlp::records(&f.project).unwrap(), before);
+    assert!(otlp::ingest_attempt(&f.project, "/v1/logs", &payload(&f, "claude-logs"), "application/json", secret).is_err());
     assert!(fs::read_dir(&backup).unwrap().all(|entry| {
         !entry
             .unwrap()
@@ -618,4 +629,630 @@ fn muse_installed_contract_is_version_gated_and_content_free() {
             assert!(!fs::read(entry.path()).unwrap().windows(b"MUSE_SECRET_CONTENT".len()).any(|w| w == b"MUSE_SECRET_CONTENT"));
         }
     }
+}
+
+// Independent fixture encoder: OTLP field numbers from the public wire contract.
+fn pb_varint(mut n: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    while n >= 128 {
+        out.push((n as u8 & 127) | 128);
+        n >>= 7;
+    }
+    out.push(n as u8);
+    out
+}
+fn pb_field(n: u64, wire: u64, bytes: &[u8]) -> Vec<u8> {
+    let mut out = pb_varint(n * 8 + wire);
+    if wire == 2 {
+        out.extend(pb_varint(bytes.len() as u64));
+    }
+    out.extend(bytes);
+    out
+}
+fn pb_any(value: &Value) -> Vec<u8> {
+    if let Some(v) = value.get("stringValue") {
+        pb_field(1, 2, v.as_str().unwrap().as_bytes())
+    } else if let Some(v) = value.get("boolValue") {
+        pb_field(2, 0, &pb_varint(u64::from(v.as_bool().unwrap())))
+    } else if let Some(v) = value.get("intValue") {
+        pb_field(
+            3,
+            0,
+            &pb_varint(
+                v.as_i64()
+                    .unwrap_or_else(|| v.as_str().unwrap().parse().unwrap()) as u64,
+            ),
+        )
+    } else if let Some(v) = value.get("doubleValue") {
+        pb_field(4, 1, &v.as_f64().unwrap().to_le_bytes())
+    } else if let Some(v) = value.get("arrayValue") {
+        pb_field(
+            5,
+            2,
+            &v["values"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|a| pb_field(1, 2, &pb_any(a)))
+                .collect::<Vec<_>>(),
+        )
+    } else if let Some(v) = value.get("kvlistValue") {
+        pb_field(6, 2, &pb_attrs(1, &v["values"]))
+    } else {
+        pb_field(7, 2, b"unsupported secret bytes")
+    }
+}
+fn pb_attrs(n: u64, attrs: &Value) -> Vec<u8> {
+    attrs
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|a| {
+            let mut kv = pb_field(1, 2, a["key"].as_str().unwrap().as_bytes());
+            kv.extend(pb_field(2, 2, &pb_any(&a["value"])));
+            pb_field(n, 2, &kv)
+        })
+        .collect()
+}
+fn pb_point(point: &Value, histogram: bool) -> Vec<u8> {
+    let mut out = pb_attrs(if histogram { 9 } else { 7 }, &point["attributes"]);
+    for (key, n) in [
+        ("startTimeUnixNano", 2),
+        ("timeUnixNano", 3),
+        ("asInt", 6),
+        ("count", 4),
+    ] {
+        if let Some(v) = point.get(key) {
+            let nvalue = v
+                .as_u64()
+                .unwrap_or_else(|| v.as_str().unwrap().parse().unwrap());
+            out.extend(pb_field(n, 1, &nvalue.to_le_bytes()));
+        }
+    }
+    for (key, n) in [("asDouble", 4), ("sum", 5)] {
+        if let Some(v) = point.get(key) {
+            out.extend(pb_field(n, 1, &v.as_f64().unwrap().to_le_bytes()));
+        }
+    }
+    out
+}
+fn pb_request(root: &Value, metrics: bool) -> Vec<u8> {
+    root[if metrics {
+        "resourceMetrics"
+    } else {
+        "resourceLogs"
+    }]
+    .as_array()
+    .unwrap()
+    .iter()
+    .flat_map(|r| {
+        let mut resource = pb_field(1, 2, &pb_attrs(1, &r["resource"]["attributes"]));
+        for scope in r[if metrics { "scopeMetrics" } else { "scopeLogs" }]
+            .as_array()
+            .unwrap()
+        {
+            let mut s = Vec::new();
+            for entry in scope[if metrics { "metrics" } else { "logRecords" }]
+                .as_array()
+                .unwrap()
+            {
+                let mut e = Vec::new();
+                if metrics {
+                    e.extend(pb_field(1, 2, entry["name"].as_str().unwrap().as_bytes()));
+                    e.extend(pb_field(
+                        3,
+                        2,
+                        entry["unit"].as_str().unwrap_or("").as_bytes(),
+                    ));
+                    for (key, n) in [("sum", 7), ("gauge", 5), ("histogram", 9)] {
+                        if let Some(data) = entry.get(key) {
+                            let mut d: Vec<_> = data["dataPoints"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .flat_map(|p| pb_field(1, 2, &pb_point(p, key == "histogram")))
+                                .collect();
+                            if let Some(t) = data.get("aggregationTemporality") {
+                                d.extend(pb_field(2, 0, &pb_varint(t.as_u64().unwrap())));
+                            }
+                            e.extend(pb_field(n, 2, &d));
+                        }
+                    }
+                } else {
+                    if let Some(t) = entry.get("timeUnixNano") {
+                        e.extend(pb_field(
+                            1,
+                            1,
+                            &t.as_str().unwrap().parse::<u64>().unwrap().to_le_bytes(),
+                        ));
+                    }
+                    if let Some(t) = entry.get("severityNumber") {
+                        e.extend(pb_field(2, 0, &pb_varint(t.as_u64().unwrap())));
+                    }
+                    if let Some(name) = entry.get("eventName") {
+                        e.extend(pb_field(12, 2, name.as_str().unwrap().as_bytes()));
+                    }
+                    if let Some(body) = entry.get("body") {
+                        e.extend(pb_field(5, 2, &pb_any(body)));
+                    }
+                    e.extend(pb_attrs(6, &entry["attributes"]));
+                }
+                s.extend(pb_field(2, 2, &e));
+            }
+            resource.extend(pb_field(2, 2, &s));
+        }
+        pb_field(1, 2, &resource)
+    })
+    .collect()
+}
+fn privacy_scan(f: &Fixture, markers: &[&str]) {
+    let rows = otlp::records(&f.project).unwrap().to_string();
+    for marker in markers {
+        assert!(!rows.contains(marker));
+        for suffix in ["", "-wal", "-shm"] {
+            if let Ok(bytes) = fs::read(f.project.join(format!(".state/telemetry.db{suffix}"))) {
+                assert!(
+                    !bytes.windows(marker.len()).any(|w| w == marker.as_bytes()),
+                    "privacy leak {suffix}"
+                );
+            }
+        }
+    }
+}
+#[test]
+fn protobuf_grok_muse_match_json_including_gauge_histogram_and_privacy() {
+    let f = Fixture::reserved();
+    for (fixture, metrics, expected) in [
+        ("grok-metrics", true, 10),
+        ("muse-logs", false, 1),
+        ("muse-metrics", true, 4),
+    ] {
+        let root: Value = serde_json::from_slice(&payload(&f, fixture)).unwrap();
+        let endpoint = if metrics { "/v1/metrics" } else { "/v1/logs" };
+        assert_eq!(
+            otlp::ingest_protobuf(&f.project, endpoint, &pb_request(&root, metrics)).unwrap(),
+            expected
+        );
+        let before = otlp::records(&f.project).unwrap();
+        assert_eq!(
+            otlp::ingest(&f.project, endpoint, &serde_json::to_vec(&root).unwrap()).unwrap(),
+            0
+        );
+        assert_eq!(otlp::records(&f.project).unwrap(), before);
+    }
+    let mut root: Value = serde_json::from_slice(&payload(&f, "grok-metrics")).unwrap();
+    let entries = root["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
+        .as_array_mut()
+        .unwrap();
+    entries.truncate(1);
+    let mut data = entries[0].as_object_mut().unwrap().remove("sum").unwrap();
+    data.as_object_mut()
+        .unwrap()
+        .remove("aggregationTemporality");
+    data["dataPoints"].as_array_mut().unwrap().truncate(1);
+    data["dataPoints"][0]["asDouble"] = json!(31.5);
+    data["dataPoints"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("asInt");
+    for any in [
+        json!({"boolValue":true}),
+        json!({"intValue":"-1"}),
+        json!({"doubleValue":1.25}),
+        json!({"arrayValue":{"values":[{"stringValue":"DG4H_PLANTED_SECRET"}]}}),
+        json!({"kvlistValue":{"values":[{"key":"nested","value":{"stringValue":"DG4H_PLANTED_SECRET"}}]}}),
+        json!({"bytesValue":"AAAA"}),
+    ] {
+        let attrs = data["dataPoints"][0]["attributes"].as_array_mut().unwrap();
+        attrs.push(json!({"key":format!("unknown{}",attrs.len()),"value":any}));
+    }
+    entries[0]["gauge"] = data.clone();
+    assert_eq!(
+        otlp::ingest_protobuf(&f.project, "/v1/metrics", &pb_request(&root, true)).unwrap(),
+        1
+    );
+    assert_eq!(
+        otlp::ingest(
+            &f.project,
+            "/v1/metrics",
+            &serde_json::to_vec(&root).unwrap()
+        )
+        .unwrap(),
+        0
+    );
+    let entry = &mut root["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0];
+    entry.as_object_mut().unwrap().remove("gauge");
+    data["aggregationTemporality"] = json!(2);
+    data["dataPoints"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("asDouble");
+    data["dataPoints"][0]["count"] = json!("3");
+    data["dataPoints"][0]["sum"] = json!(42.5);
+    entry["histogram"] = data;
+    assert_eq!(
+        otlp::ingest_protobuf(&f.project, "/v1/metrics", &pb_request(&root, true)).unwrap(),
+        1
+    );
+    assert_eq!(
+        otlp::ingest(
+            &f.project,
+            "/v1/metrics",
+            &serde_json::to_vec(&root).unwrap()
+        )
+        .unwrap(),
+        0
+    );
+    let rows = otlp::records(&f.project).unwrap();
+    assert!(
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["count"] == 3 && r["sum"] == 42.5)
+    );
+    assert!(
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["value"] == 31.5 && r.get("aggregationTemporality").is_none())
+    );
+    privacy_scan(
+        &f,
+        &[
+            "GROK_SECRET_CONTENT",
+            "MUSE_SECRET_CONTENT",
+            "DG4H_PLANTED_SECRET",
+            "unsupported secret bytes",
+        ],
+    );
+}
+#[test]
+fn attempt_tokens_cli_bind_quarantine_revoke_expire_and_never_store_secrets() {
+    let f = Fixture::reserved();
+    assert!(f.cli_fail(&["otlp", "mint-token", "--attempt", "absent"]).contains("unknown attempt"));
+    assert!(otlp::mint_attempt_token(&f.project, &f.attempt, 0).is_err());
+    assert!(otlp::mint_attempt_token(&f.project, &f.attempt, 86401).is_err());
+    assert!(!f.project.join(".state/telemetry.db").exists());
+    let (minted, _) = f.cli_args(&[
+        "otlp",
+        "mint-token",
+        "--attempt",
+        &f.attempt,
+        "--seconds",
+        "60",
+    ]);
+    let token = minted["token"].as_str().unwrap();
+    let mut root: Value = serde_json::from_slice(&payload(&f, "muse-logs")).unwrap();
+    root["resourceLogs"][0]["resource"]["attributes"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|a| a["key"] != "herdr.attempt_id");
+    root["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["severityNumber"] = json!(9);
+    let bytes = pb_request(&root, false);
+    assert_eq!(
+        otlp::ingest_attempt(
+            &f.project,
+            "/v1/logs",
+            &bytes,
+            "application/x-protobuf",
+            token
+        )
+        .unwrap(),
+        1
+    );
+    let rows = otlp::records(&f.project).unwrap();
+    assert_eq!(rows[0]["attempt_id"], f.attempt);
+    assert_eq!(rows[0]["binding"], "exact");
+    assert_eq!(rows[0]["severityNumber"], 9);
+    assert_eq!(
+        otlp::ingest_attempt(
+            &f.project,
+            "/v1/logs",
+            &serde_json::to_vec(&root).unwrap(),
+            "application/json",
+            token
+        )
+        .unwrap(),
+        0
+    );
+    // A second real canonical attempt exists in this same project.
+    f.readmit("other");
+    let second_attempt = herdr_projects::store::SqliteStore::open(&f.project.join(".state/state.db"))
+        .unwrap().read_snapshot(None).unwrap().attempts.into_iter()
+        .find(|a| a.id.as_str() != f.attempt).unwrap().id.as_str().to_owned();
+    root["resourceLogs"][0]["resource"]["attributes"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"key":"herdr.attempt_id","value":{"stringValue":second_attempt}}));
+    assert_eq!(
+        otlp::ingest_attempt(
+            &f.project,
+            "/v1/logs",
+            &pb_request(&root, false),
+            "application/x-protobuf",
+            token
+        )
+        .unwrap(),
+        1
+    );
+    let rows = otlp::records(&f.project).unwrap();
+    let quarantined = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["reason"] == "cross_attempt_quarantined")
+        .unwrap();
+    assert!(quarantined["attempt_id"].is_null());
+    assert_eq!(quarantined["binding"], "unknown_attempt");
+    let other = Fixture::reserved();
+    assert!(
+        otlp::ingest_attempt(
+            &other.project,
+            "/v1/logs",
+            &bytes,
+            "application/x-protobuf",
+            token
+        )
+        .is_err()
+    );
+    f.cli_args(&[
+        "otlp",
+        "revoke-token",
+        "--token-hash",
+        minted["token_hash"].as_str().unwrap(),
+    ]);
+    assert!(
+        otlp::ingest_attempt(
+            &f.project,
+            "/v1/logs",
+            &bytes,
+            "application/x-protobuf",
+            token
+        )
+        .is_err()
+    );
+    let expiring = otlp::mint_attempt_token(&f.project, &f.attempt, 1).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    assert!(
+        otlp::ingest_attempt(
+            &f.project,
+            "/v1/logs",
+            &bytes,
+            "application/x-protobuf",
+            expiring["token"].as_str().unwrap()
+        )
+        .is_err()
+    );
+    assert_eq!(otlp::records(&f.project).unwrap(), rows);
+    privacy_scan(
+        &f,
+        &[
+            token,
+            expiring["token"].as_str().unwrap(),
+            "MUSE_SECRET_CONTENT",
+            &second_attempt,
+        ],
+    );
+}
+#[test]
+fn protobuf_malformed_truncated_oversized_and_limits_are_atomic() {
+    let f = Fixture::reserved();
+    let root: Value = serde_json::from_slice(&payload(&f, "grok-metrics")).unwrap();
+    let good = pb_request(&root, true);
+    let mut extended = good.clone();
+    extended.extend(pb_field(100, 0, &pb_varint(42)));
+    extended.extend(pb_field(101, 1, &42u64.to_le_bytes()));
+    extended.extend(pb_field(102, 2, b"DG4H_UNKNOWN_FIELD_SECRET"));
+    extended.extend(pb_field(103, 5, &42u32.to_le_bytes()));
+    for bad in [
+        vec![0x0b],
+        vec![0x0f],
+        vec![0],
+        vec![0x80; 11],
+        vec![0x0a, 0xff, 0xff],
+        good[..good.len() - 1].to_vec(),
+        vec![0; otlp::MAX_BODY + 1],
+    ] {
+        assert!(otlp::ingest_protobuf(&f.project, "/v1/metrics", &bad).is_err());
+    }
+    let mut many = root.clone();
+    let point =
+        many["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]["sum"]["dataPoints"][0].clone();
+    many["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]["sum"]["dataPoints"] =
+        json!(vec![point.clone(); 4097]);
+    assert!(otlp::ingest_protobuf(&f.project, "/v1/metrics", &pb_request(&many, true)).is_err());
+    many = root.clone();
+    let attr = json!({"key":"too_many","value":{"stringValue":"secret"}});
+    many["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]["sum"]["dataPoints"][0]["attributes"] =
+        json!(vec![attr; 129]);
+    assert!(otlp::ingest_protobuf(&f.project, "/v1/metrics", &pb_request(&many, true)).is_err());
+    let mut nested = pb_field(1, 2, b"secret");
+    for _ in 0..20 {
+        nested = pb_field(5, 2, &pb_field(1, 2, &nested));
+    }
+    let mut kv = pb_field(1, 2, b"unknown");
+    kv.extend(pb_field(2, 2, &nested));
+    let nested_request = pb_field(1, 2, &pb_field(1, 2, &pb_field(1, 2, &kv)));
+    assert!(otlp::ingest_protobuf(&f.project, "/v1/metrics", &nested_request).is_err());
+    assert!(!f.project.join(".state/telemetry.db").exists());
+    assert_eq!(
+        otlp::ingest_protobuf(&f.project, "/v1/metrics", &good).unwrap(),
+        10
+    );
+    let before = otlp::records(&f.project).unwrap();
+    assert_eq!(
+        otlp::ingest_protobuf(&f.project, "/v1/metrics", &extended).unwrap(),
+        0
+    );
+    privacy_scan(&f, &["DG4H_UNKNOWN_FIELD_SECRET"]);
+    let mut bad = good;
+    bad.extend([0x0a, 0x03, 0x12, 0x05, 0x01]);
+    assert!(otlp::ingest_protobuf(&f.project, "/v1/metrics", &bad).is_err());
+    assert_eq!(otlp::records(&f.project).unwrap(), before);
+}
+
+#[test]
+fn http_protobuf_attempt_token_binding_auth_and_project_token_unchanged() {
+    let f = Fixture::reserved();
+    let minted = otlp::mint_attempt_token(&f.project, &f.attempt, 60).unwrap();
+    let attempt_token = minted["token"].as_str().unwrap();
+    let (_server, address, project_token) = server(&f);
+    let mut root: Value = serde_json::from_slice(&payload(&f, "grok-metrics")).unwrap();
+    root["resourceMetrics"][0]["resource"]["attributes"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|a| a["key"] != "herdr.attempt_id");
+    let bytes = pb_request(&root, true);
+    assert_eq!(
+        http(
+            &address,
+            Some(attempt_token),
+            "/v1/metrics",
+            "application/x-protobuf",
+            &bytes,
+            bytes.len()
+        ),
+        200
+    );
+    assert!(
+        otlp::records(&f.project)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["attempt_id"] == f.attempt)
+    );
+    root["resourceMetrics"][0]["resource"]["attributes"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"key":"herdr.attempt_id","value":{"stringValue":"other-attempt"}}));
+    let bytes = pb_request(&root, true);
+    assert_eq!(
+        http(
+            &address,
+            Some(attempt_token),
+            "/v1/metrics",
+            "application/x-protobuf",
+            &bytes,
+            bytes.len()
+        ),
+        200
+    );
+    let rows = otlp::records(&f.project).unwrap();
+    assert_eq!(
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["reason"] == "cross_attempt_quarantined" && r["attempt_id"].is_null())
+            .count(),
+        10
+    );
+    for bad in [b"\x0b".as_slice(), &bytes[..bytes.len() - 1]] {
+        assert_eq!(
+            http(
+                &address,
+                Some(attempt_token),
+                "/v1/metrics",
+                "application/x-protobuf",
+                bad,
+                bad.len()
+            ),
+            400
+        );
+    }
+    assert_eq!(
+        http(
+            &address,
+            Some(attempt_token),
+            "/v1/metrics",
+            "application/x-protobuf",
+            b"",
+            otlp::MAX_BODY + 1
+        ),
+        413
+    );
+    assert_eq!(
+        http(
+            &address,
+            Some(attempt_token),
+            "/v1/metrics",
+            "application/x-protobuf\r\nContent-Encoding: gzip",
+            b"",
+            0
+        ),
+        415
+    );
+    assert_eq!(
+        http(
+            &address,
+            Some(attempt_token),
+            "/v1/traces",
+            "application/x-protobuf",
+            b"",
+            0
+        ),
+        404
+    );
+    otlp::revoke_attempt_token(&f.project, minted["token_hash"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        http(
+            &address,
+            Some(attempt_token),
+            "/v1/metrics",
+            "application/x-protobuf",
+            &bytes,
+            bytes.len()
+        ),
+        401
+    );
+    let expired = otlp::mint_attempt_token(&f.project, &f.attempt, 1).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    assert_eq!(
+        http(
+            &address,
+            Some(expired["token"].as_str().unwrap()),
+            "/v1/metrics",
+            "application/x-protobuf",
+            &bytes,
+            bytes.len()
+        ),
+        401
+    );
+    assert_eq!(otlp::records(&f.project).unwrap(), rows);
+    // The original project credential still binds solely from the resource ID.
+    let json = payload(&f, "grok-metrics");
+    assert_eq!(
+        http(
+            &address,
+            Some(&project_token),
+            "/v1/metrics",
+            "application/json",
+            &json,
+            json.len()
+        ),
+        200
+    );
+    assert_eq!(otlp::records(&f.project).unwrap(), rows);
+    assert_eq!(
+        http(
+            &address,
+            Some(&project_token),
+            "/v1/metrics",
+            "application/x-protobuf",
+            &bytes,
+            bytes.len()
+        ),
+        200
+    );
+    assert_eq!(
+        otlp::records(&f.project)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["binding"] == "unknown_attempt" && r.get("reason").is_none())
+            .count(),
+        10
+    );
+    privacy_scan(&f, &[attempt_token, "GROK_SECRET_CONTENT"]);
 }

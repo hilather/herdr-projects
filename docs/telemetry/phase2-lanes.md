@@ -391,13 +391,20 @@ Cards (gaps that stop those questions being answered):
   worker kind (version probe, launch arguments, isolation profile) before it
   can run as a product worker. Its telemetry can be collected before that,
   from sessions run outside the product.
+  - **Done (DG4h): direct OTLP/HTTP protobuf and attempt-token binding.**
+    Bounded no-dependency metrics/logs decoder shares JSON allowlisting and
+    atomic persistence; hashed, expiring, revocable per-attempt credentials
+    bind without resource injection and quarantine conflicts. OTLP stream 0003
+    retains token hashes/revocations in backups. LC0 Grok/Muse use the product
+    receiver directly; live certification and Muse header/version confirmation
+    remain steward work. gRPC, compression and traces stay unsupported.
   - **DG4a OTLP receiver — done (fixture-certified).** Opt-in loopback
     OTLP/HTTP JSON logs/metrics, per-project bearer token, bounded requests,
     sanitized sidecar stream `otlp` (migration 0001), exact resource
     `herdr.attempt_id` binding and digest replay. Claude Code and Gemini CLI
     mappings are fixture-only; Codex OTLP is `none` pending native-name
-    certification, retaining its rollout adapter. Protobuf/gRPC unsupported
-    under the no-new-crates constraint. See contracts-collection.md DG4a.
+    certification, retaining its rollout adapter. DG4h above adds protobuf HTTP;
+    gRPC remains unsupported. See contracts-collection.md DG4a/DG4h.
     **DG4a follow-up: launch-env wiring** supplies `OTEL_*`, authorization
     and resource attempt/harness identity for product-launched workers;
     exporter JSON compatibility and token lifecycle remain to be reviewed.

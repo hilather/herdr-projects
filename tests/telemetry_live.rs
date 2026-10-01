@@ -115,9 +115,9 @@ fn ready(process: &mut Process) -> Value {
     });
     let (result, line) = receive
         .recv_timeout(Duration::from_secs(15))
-        .expect("receiver/bridge readiness timed out");
+        .expect("receiver readiness timed out");
     result.unwrap();
-    serde_json::from_str(&line).expect("receiver/bridge readiness JSON missing")
+    serde_json::from_str(&line).expect("receiver readiness JSON missing")
 }
 fn run(mut cmd: Command, scratch: &Path, name: &str) -> Vec<u8> {
     let out = scratch.join(format!("{name}.stdout"));
@@ -360,82 +360,17 @@ fn live(kind: &str) {
     );
 
     let mut receiver = None;
-    let mut bridge = None;
     let mut endpoint = None;
     let mut attempt_token = None;
-    if kind == "grok" {
-        // Stock Grok ignores resource attributes and sends protobuf. Require an
-        // explicit steward bridge; never hand the project token to the agent.
-        let bridge_bin = PathBuf::from(
-            std::env::var_os("HERDR_LIVE_OTLP_BRIDGE_BIN")
-                .expect("DG4e requires a protobuf-to-JSON bridge"),
-        );
-        assert!(bridge_bin.is_absolute());
+    if matches!(kind, "grok" | "muse") {
+        let minted = herdr_projects::telemetry::otlp::mint_attempt_token(&f.project, &f.attempt, 600).unwrap();
+        attempt_token = Some(minted["token"].as_str().unwrap().to_owned());
         let mut c = command(Path::new(BIN), &f.tmp.path().join("home"), f.tmp.path());
-        c.args([
-            "--root",
-            f.root.to_str().unwrap(),
-            "telemetry",
-            "demo",
-            "otlp",
-            "serve",
-            "--port",
-            "0",
-            "--seconds",
-            "600",
-        ]);
-        let mut p = Process(
-            c.stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
+        c.args(["--root", f.root.to_str().unwrap(), "telemetry", "demo", "otlp", "serve", "--port", "0", "--seconds", "600"]);
+        let mut p = Process(c.stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap());
         let ready = ready(&mut p);
-        let bridge_args =
-            std::env::var("HERDR_LIVE_OTLP_BRIDGE_ARGS").expect("bridge arguments required");
-        assert!(
-            bridge_args.contains("{attempt_token_file}"),
-            "bridge must accept the attempt-scoped credential"
-        );
-        use std::io::{Read, Write};
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut random = [0u8; 32];
-        fs::File::open("/dev/urandom")
-            .unwrap()
-            .read_exact(&mut random)
-            .unwrap();
-        let secret: String = random.iter().map(|b| format!("{b:02x}")).collect();
-        let token_file = f.tmp.path().join("attempt-otlp.token");
-        let mut token = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&token_file)
-            .unwrap();
-        token.write_all(secret.as_bytes()).unwrap();
-        attempt_token = Some(secret);
-        let mut c = command(&bridge_bin, &f.tmp.path().join("home"), f.tmp.path());
-        c.args(words(&bridge_args).into_iter().map(|s| {
-            s.replace("{receiver}", ready["address"].as_str().unwrap())
-                .replace("{token_file}", ready["token_file"].as_str().unwrap())
-                .replace("{attempt}", &f.attempt)
-                .replace("{attempt_token_file}", token_file.to_str().unwrap())
-        }));
-        let mut b = Process(
-            c.stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
-        let ready = self::ready(&mut b);
-        endpoint = Some(
-            ready["endpoint"]
-                .as_str()
-                .expect("bridge endpoint required")
-                .to_owned(),
-        );
+        endpoint = Some(format!("http://{}", ready["address"].as_str().unwrap()));
         receiver = Some(p);
-        bridge = Some(b);
     }
     let mut own = Vec::new();
     let resume = std::env::var("HERDR_LIVE_RESUME_ARGS").ok();
@@ -474,7 +409,6 @@ fn live(kind: &str) {
         }
         own.extend(own_stdout(&run(c, f.tmp.path(), &format!("turn-{n}"))));
     }
-    drop(bridge);
     drop(receiver);
     let file_usage = own_files(kind, &f.home);
     if !file_usage.is_empty() {

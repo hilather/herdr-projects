@@ -47,28 +47,37 @@ and never copied into the report. Reports are created exclusively with 0600
 permissions; reruns require a new output filename. Never attach raw captures,
 login copies, prompts, environment dumps or tokens to review artifacts.
 
-## Grok transport prerequisite
+## Direct Grok and Muse receiver (DG4h)
 
-DG4a accepts authenticated OTLP JSON only. DG4e's installed Grok sends
-HTTP/protobuf and ignores `OTEL_RESOURCE_ATTRIBUTES`. A direct endpoint does
-not work. The test requires `HERDR_LIVE_OTLP_BRIDGE_BIN` (absolute) and
-`HERDR_LIVE_OTLP_BRIDGE_ARGS`. This steward-supplied converter must bind
-loopback on an ephemeral port, accept protobuf from this single attempt,
-inject its canonical attempt ID, convert to JSON, and authenticate to the
-product receiver. Arguments substitute `{receiver}`, `{token_file}`, `{attempt}` and
-`{attempt_token_file}` (required). The latter is a fresh 0600 random credential
-created in scratch for this attempt; the bridge must require its bearer value
-on ingress. The harness receives only that attempt credential in OTLP headers. Its first stdout line must be JSON with an `endpoint` URL; it
-must remain running and flush delivery before the agent exits. The test starts
-a fresh product DG4a receiver; only the bridge receives its token-file path.
-The agent receives no project bearer token. Confirm the bridge rejects requests without the attempt credential before
-live execution. A bridge implementation
-is not included in LC0. Do not claim direct Grok exporter compatibility.
+`grok_live` and `muse_live` start a fresh product loopback receiver and mint a
+600-second token scoped to the fixture project and canonical attempt. The
+harness receives only this attempt token through
+`OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer <attempt token>`, with
+`OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` and the receiver's HTTP endpoint.
+No external bridge or bridge environment variables are required. Grok's ignored
+`OTEL_RESOURCE_ATTRIBUTES` no longer prevents binding. The resource attribute
+is also supplied for exporters that support it; a conflicting attempt is
+quarantined rather than rebound. The project credential remains private to the
+product receiver.
 
-The harness sets GROK_EXTERNAL_OTEL=1, OTEL_METRICS_EXPORTER=otlp,
-OTEL_LOGS_EXPORTER=otlp, OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf and the
-bridge endpoint, plus the attempt resource attribute and disabled content
-export switches. Confirm exporter shutdown flush and bridge delivery.
+The test sets GROK_EXTERNAL_OTEL=1, OTEL_METRICS_EXPORTER=otlp,
+OTEL_LOGS_EXPORTER=otlp and disabled content export switches. Confirm exporter
+shutdown flush before stopping the receiver. Compression, gRPC and traces are
+unsupported; `/v1/traces` returns 404. Muse's installed evidence establishes
+only its endpoint switch, so the steward must verify that its build honors
+bearer headers and exports to `/v1/logs` and `/v1/metrics`. DG4h does not bypass
+service/version gates: Muse must report `service.name=tbh` and the accepted
+`service.version=1.4.0-R4161.1`; `app.version` alone remains uncertified. These
+are live evidence gaps until the disposable owner-approved run confirms them.
+
+For other launchers, mint with
+`telemetry <slug> otlp mint-token --attempt <id> --seconds 600`. Capture the
+JSON output privately: `token` is returned once; `token_hash` is the nonsecret
+revocation handle. Set the headers above only in that attempt's environment.
+Revoke with `telemetry <slug> otlp revoke-token --token-hash <hash>` when the
+attempt ends. Never pass the project token to an agent. No product launch-env
+helper exists yet; the steward or launcher sets these variables explicitly.
+
 Optional `HERDR_LIVE_USAGE_FILES` lists exact relative fresh-session
 `.grok/sessions/.../signals.json` or `summary.json` paths, one per line.
 Only numeric `usage` fields and model are parsed; an unrecognized schema is
@@ -107,7 +116,8 @@ may claim live. Its existing Codex 0.154.0 evidence stays unchanged. Extend
 that registry only with a reviewed certificate, and extend E2E adapter coverage
 for newly observed formats. No file-content assertions are used for this rule.
 
-Stop the bridge/receiver, remove the disposable execution home and private
+Stop the receiver, remove the disposable execution home and private
 login copy, delete any scratch remaining after interrupted runs, and retain
 only the reviewed counts-only report. Never clean up an owner home, running
-server or ticker. No new schema, retention class or backup category is added.
+server or ticker. DG4h adds OTLP stream migration 0003 and retained hashed-token/revocation
+metadata in full sidecar backups; plaintext attempt credentials are never stored.

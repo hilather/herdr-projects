@@ -216,7 +216,7 @@ fn local_sdk_backup_retention_restore_and_stream_upgrade() {
     f.cli("collect");
     let before = otlp::records(&f.project).unwrap();
     // Recreate the DG4a historical stream while preserving its real observations.
-    f.sidecar().execute_batch("DROP TABLE gemini_file_cursors; UPDATE telemetry_streams SET version=1 WHERE stream='otlp'").unwrap();
+    f.sidecar().execute_batch("DROP TABLE gemini_file_cursors; DROP TABLE otlp_attempt_tokens; UPDATE telemetry_streams SET version=1 WHERE stream='otlp'").unwrap();
     f.cli("collect");
     assert_eq!(otlp::records(&f.project).unwrap(), before);
     assert_eq!(
@@ -227,7 +227,7 @@ fn local_sdk_backup_retention_restore_and_stream_upgrade() {
                 |r| r.get::<_, i64>(0)
             )
             .unwrap(),
-        2
+        3
     );
     let backup = f.tmp.path().join("synthetic-gemini-backup");
     f.cli_args(&["backup", "create", "--out", backup.to_str().unwrap()]);

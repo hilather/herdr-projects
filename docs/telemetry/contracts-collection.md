@@ -1251,11 +1251,11 @@ config directory as `otlp-<sha256(canonical-project-path)>.token`, created
 current user with exactly 0600 permissions. Stop the receiver and remove its
 token to rotate it. Tokens are external secrets, excluded from backups.
 
-Only POST `/v1/logs` and `/v1/metrics`, with `Content-Type: application/json`
-and `Authorization: Bearer <token>`, are supported. **Protobuf, gRPC,
-traces, compression and chunked bodies are unsupported.** Exporters that
-only offer protobuf need an external JSON conversion step; HTTP support alone
-does not establish compatibility. Authentication failure is 401; a body over
+POST `/v1/logs` and `/v1/metrics` support `Content-Type: application/json`
+or `application/x-protobuf` (DG4h), with `Authorization: Bearer <token>`.
+**gRPC, traces, compression and chunked bodies are unsupported.**
+`/v1/traces` returns 404. Transport acceptance alone does not establish live
+exporter compatibility. Authentication failure is 401; a body over
 4 MiB is 413; invalid JSON, structure or mapped field types is 400; unsupported
 encoding is 415. Headers are capped at 16 KiB, each request has a two-second
 read deadline, each request accepts at most 4096 records and each attribute
@@ -1369,7 +1369,8 @@ binds must report these failures for the steward to run outside it.
 workers' `OTEL_*` endpoint, JSON exporter protocol, authorization header and
 resource `herdr.attempt_id`/`service.name`, with explicit token lifecycle and
 per-harness exporter compatibility. This is a separate card; DG4a does not
-modify launch environments or claim protobuf-only exporters work directly.
+modify launch environments. DG4h below adds direct protobuf transport and
+per-attempt token binding; launchers still set the environment explicitly.
 ## DG4b: Claude Code native session files (fixture certification)
 
 Owner decision DG4 supersedes the former Codex-only product scope. Adapter
@@ -1806,11 +1807,10 @@ instruments. They remain unmapped; no histogram or timing semantics are
 certified here. Identity keys (`user.id`, `user.email`, organization/team/
 deployment ids, `session.id`) are discarded, never used for binding.
 
-The exporter supports protobuf HTTP or gRPC, while DG4a accepts JSON only.
-An external converter must supply OTLP JSON and the resource
-`herdr.attempt_id`; the stock CLI ignores `OTEL_RESOURCE_ATTRIBUTES`, so
-launch-env wiring alone cannot supply it. This card adds neither a converter
-nor launch configuration and makes no direct-export compatibility claim.
+The exporter supports protobuf HTTP or gRPC and ignores
+`OTEL_RESOURCE_ATTRIBUTES`. DG4h below adds direct HTTP/protobuf acceptance
+and bearer-token binding without resource injection. gRPC remains unsupported.
+This mapping is fixture-certified; live emission remains unverified.
 
 ### Mapping, privacy and binding
 
@@ -2087,12 +2087,12 @@ was established. Tool spans and histogram latency instruments remain unmapped.
 
 `otlp:muse` is fixture-only for release **1.4.0-R4161.1**. Its fixture and
 accepted version lists contain that release; certified versions remain empty.
-The JSON converter must preserve `service.name=tbh` and explicitly supply
+The exporter or any converter must preserve `service.name=tbh` and explicitly supply
 `service.version=1.4.0-R4161.1` from trusted install/release metadata. The
 stock resource's `app.version` is not silently interpreted as the release.
 Unknown/missing service versions produce unmapped, uncertified diagnostics.
-Protobuf is unsupported by DG4a: this card supplies neither a converter nor
-launch exporter wiring, and does not claim direct compatibility.
+DG4h below adds protobuf HTTP transport and attempt-token binding, but does
+not reinterpret `app.version` or certify the installed exporter live.
 
 | Native name | Kind | Allowlisted attributes |
 | --- | --- | --- |
@@ -2105,8 +2105,9 @@ cache reads/writes. Approval totals and splits overlap; they are independent
 native evidence, never added together or to model-call logs. No Muse observation
 enters accounting, M08/M09, budgets or existing adapter totals.
 
-Binding remains exact resource `herdr.attempt_id` only. Missing ids remain
-unbound; unknown ids are dropped with `unknown_attempt`. Session/cwd/time and
+Project-token binding uses exact resource `herdr.attempt_id`. Missing ids
+remain unbound; unknown ids use `unknown_attempt`. DG4h attempt tokens also
+bind without the resource ID and quarantine conflicting IDs. Session/cwd/time and
 telemetry identity attributes do not infer a binding or grant authority.
 Prompts, body text, model responses, tool arguments/results, file content and
 unknown attribute values are dropped before persistence or digesting. Unknown
@@ -2168,8 +2169,7 @@ converter were not attempted.
 ### Installed Codex 0.159.2 (LC1)
 
 Certified versions are 0.154.0 and 0.159.2. The latter's recorded report is
-[codex-live-0.159.2.md](codex-live-0.159.2.md), a draft pending the steward's
-passing live reconciliation. Codex capability fields include `live_versions`:
+[codex-live-0.159.2.md](codex-live-0.159.2.md), which records the passing live reconciliation (#211). Codex capability fields include `live_versions`:
 only usage counters, model and session binding inputs gain 0.159.2 evidence;
 all other field evidence retains its prior scope.
 
@@ -2180,3 +2180,107 @@ root_turn_id are explicitly unavailable. turn_token_usage and last_token_usage
 remain uncollected; thread_token_usage and token_count totals reconcile only.
 Accounting entries expose cumulative entries alongside deltas. Live reports
 must select delta basis before counting records or summing accepted counters.
+
+## DG4h: OTLP/HTTP protobuf and per-attempt credentials
+
+DG4h replaces LC0's external protobuf-to-JSON bridge with direct product
+receiver ingestion. No crates or agent executions are added. Both JSON and
+protobuf feed one normalized collector path: exact service/version mapping,
+allowlisting, sanitization, request atomicity, digest deduplication and binding
+remain shared. Certification is still **fixture**, never live.
+
+The hand-written reader accepts varint, fixed64, length-delimited and fixed32
+wire fields; unknown fields are skipped within the body bound, while groups,
+invalid tags/wire types, overflowing varints, invalid UTF-8, truncated fields,
+duplicate singular fields and invalid AnyValue/data oneofs are rejected. It
+handles ResourceMetrics/ScopeMetrics/Metric Sum, Gauge and Histogram, resource
+and point attributes, integer/double values, timestamps, histogram count/sum,
+and ResourceLogs/ScopeLogs/LogRecord attributes, time and severity number.
+Gauge rows have no temporality; Sum/Histogram require explicit delta/cumulative
+and retain it. Histogram rows carry count and optional sum, never invented
+point values or buckets. Unknown timing/latency names remain unmapped.
+
+AnyValue strings, booleans, signed integers and finite doubles normalize as
+JSON does. Arrays and kvlists are recursively validated, then unsupported as
+attribute values; bytes are unsupported. Unknown attribute/resource values
+are never durable. Protobuf log bodies are validated then discarded, never
+used as an event name: logs must use `eventName` or `event.name` for mapping.
+Unnamed logs remain sanitized unmapped diagnostics. Severity text is discarded;
+severity number is bounded to 0–24. Bodies, unsupported bytes, nested content
+and unknown values are absent from identities, database, WAL and SHM.
+
+Limits: 4 MiB body, 4096 total log records/data points, 128 attributes or
+array/kvlist elements per container, nesting depth 16 and 65536 wire fields
+per request. Each length must fit the remaining bounded input; no input-sized
+allocation occurs before checking the body cap. Malformed/limit failures return
+400 and persist no records. Oversized HTTP bodies return 413. Both transports
+reject Content-Encoding (including gzip) and transfer encoding with 415.
+JSON never supported gzip. `/v1/traces` returns 404; gRPC is unsupported.
+
+`telemetry <slug> otlp mint-token --attempt <id> [--seconds 3600]` validates an
+existing canonical attempt and returns JSON with `token`, `token_hash`,
+`attempt_id` and absolute `expires_unix_ms`. Lifetime is 1–86400 seconds;
+256 bits from `/dev/urandom` are printed only in this response. The public
+`mint_attempt_token`, `revoke_attempt_token`, `ingest_attempt` APIs support the
+same workflow. `ingest_protobuf` is the trusted local collector equivalent of
+`ingest`, without transport credentials.
+
+Sidecar stream `otlp` migration **0003_attempt_tokens.sql** stores SHA-256 token
+hash, canonical-project-path digest, attempt, expiry, creation and revocation.
+The raw bearer is never written. `otlp revoke-token --token-hash <hash>` revokes
+it; expired, revoked, wrong-project or unknown credentials receive 401 before
+body decoding. A valid attempt credential binds missing resource IDs to its
+attempt. Any present conflicting ID produces an unbound `unknown_attempt`
+diagnostic with `reason=cross_attempt_quarantined`; it is never rebound to
+either attempt. No conflicting ID value is retained. The project token's
+resource-only binding behavior and file-based lifecycle remain unchanged.
+
+New retention class `sidecar.otlp_attempt_tokens` is source-of-truth **retain**:
+full sidecar backups include hashed credentials and revocations, inventory
+counts include the table, and expiry stays absolute after restore. Restoring
+an older backup can restore its older revocation state; revoke any outstanding
+credentials before reuse. Plaintext project credentials remain external and
+excluded; plaintext attempt credentials have no durable product artifact.
+There is no canonical schema change.
+
+No OTLP launch-env helper exists. The steward/launcher privately captures the
+mint response and sets `OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer <token>`,
+`OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` and the product receiver endpoint
+in that attempt's environment; never give agents the project token. Grok's
+resource override limitation no longer prevents binding. LC0 `grok_live` and
+`muse_live` use this workflow without an external bridge. Muse's actual header
+support and accepted service version still need live confirmation; DG4h does
+not bypass the version gate or assume `app.version` equals release metadata.
+
+`tests/telemetry_otlp.rs` builds protobuf fixtures with an independent test-only
+encoder and exercises public APIs, CLI and HTTP: Grok/Muse JSON/protobuf exact
+row/replay equality, Gauge/Histogram, AnyValue variants, token binding,
+cross-attempt quarantine, project-token compatibility, expiry/revocation,
+malformed/truncated/oversized/count/depth rejection and planted secret scans
+including WAL/SHM. No tests inspect source files.
+
+### DG4h sandbox validation (2026-10-01)
+
+Ran every `tests/telemetry*.rs` suite (21 targets) with
+`TMPDIR=$PWD/target/tmp cargo test --locked --offline -j 3 --features state-store
+--no-fail-fast` and explicit `--test` targets. After rerunning the affected
+migration/backup suites and refreshing the two operations runbook transcript
+lines, final combined results are **221 passed, 7 socket-only failures,
+17 ignored**. The ignored tests comprise four owner-run live harness tests and
+13 opt-in scale/resource tests. No live agent CLI was executed.
+
+| Suite | Socket-only failure (`Operation not permitted`) |
+| --- | --- |
+| `telemetry` | `attempts_show_attention_summary` (Unix) |
+| `telemetry_accounting` | `attention_intervals_union_and_censor` (Unix) |
+| `telemetry_health` | `recommendations_and_notices_change_no_canonical_state_and_no_dispatch` (Unix) |
+| `telemetry_otlp` | `http_auth_limits_malformed_and_replay` (TCP loopback) |
+| `telemetry_otlp` | `http_request_rate_is_bounded` (TCP loopback) |
+| `telemetry_otlp` | `http_protobuf_attempt_token_binding_auth_and_project_token_unchanged` (TCP loopback) |
+| `telemetry_workspace` | `thread_start_records_the_dispatch_reason_and_the_sidebar_suffix` (Unix) |
+
+All ten non-socket OTLP tests pass, including new protobuf/token workflows.
+`cargo clippy --locked --offline -j 3 --features state-store --all-targets`
+completes with no warnings in changed files/lines; existing unrelated warnings
+remain. `git diff --check` passes. The steward must run socket tests outside
+the sandbox and perform the separate disposable live certification runs.
