@@ -280,3 +280,12 @@ pub fn plant_aggregate_termination(f: &Fixture) -> i64 {
             "cause":"cancellation","observed_unix_ms":at}).to_string()]).unwrap();
     at
 }
+
+/// Countable accounting entries for live reconciliation: accepted deltas only.
+/// Cumulative entries describe the same usage and remain reconciliation evidence.
+pub fn accepted_delta_entries(entries: &serde_json::Value) -> Vec<&serde_json::Value> {
+    entries["entries"].as_array().into_iter().flatten().filter(|e| {
+        e["basis"] == "delta" && e["provenance"].as_array().into_iter().flatten()
+            .any(|p| p["disposition"] == "accepted")
+    }).collect()
+}

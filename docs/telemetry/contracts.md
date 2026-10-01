@@ -689,3 +689,9 @@ canonical metadata; sidecar derived copies follow their surviving source.
 Flake projections are derived only by quality collect or the quality lane tick,
 never by migration or unrelated commands. Rebuilding the sidecar requires
 replaying quality collection before comparing its verification metrics.
+
+LC1 certifies Codex 0.159.2 alongside 0.154.0 without a schema change. See
+[codex-live-0.159.2.md](codex-live-0.159.2.md) (draft pending steward live
+reconciliation) and the installed-version scope in contracts-collection.md.
+The sanitizer excludes world_state and thread_settings_applied snapshots and
+new session metadata; only existing allowlisted counters are retained.

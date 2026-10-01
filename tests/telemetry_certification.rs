@@ -925,7 +925,8 @@ fn accounting_fields_match_the_adapter_certificate() {
     assert!(names.contains(&"otlp:grok"), "Grok fixture adapter must be advertised: {names:?}");
     // Recorded live evidence registry. Adding an adapter/version requires a
     // reviewed report, not merely a successful invocation of the live test.
-    let recorded_live = [("codex", "0.154.0", "docs/telemetry/certificate-live.md")];
+    let recorded_live = [("codex", "0.154.0", "docs/telemetry/certificate-live.md"),
+        ("codex", "0.159.2", "docs/telemetry/codex-live-0.159.2.md")];
     for adapter in adapters {
         let claims_live = adapter["fields"].as_array().into_iter().flatten().any(|f| f["certified"] == "live");
         if claims_live {
@@ -959,7 +960,7 @@ fn accounting_fields_match_the_adapter_certificate() {
         }
     }
     let codex = &adapters[0];
-    assert_eq!(codex["certified_versions"], json!(["0.154.0"]));
+    assert_eq!(codex["certified_versions"], json!(["0.154.0", "0.159.2"]));
     let field = |kind: &str, name: &str| codex["fields"].as_array().unwrap().iter().find(|x| x["kind"] == kind && x["field"] == name).cloned()
         .unwrap_or_else(|| panic!("{kind}.{name}"));
     let facts = |kind: &str, name: &str| { let x = field(kind, name); (x["available"].clone(), x["basis"].clone(), x["certified"].clone(), x["caveat"].clone()) };

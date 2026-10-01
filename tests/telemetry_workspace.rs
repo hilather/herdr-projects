@@ -691,7 +691,7 @@ fn workspace_doc_captures_are_real_outputs() {
 
 
 /// L1/F6 (certificate-live.md §7): Codex 0.158.0 is installed and a version
-/// manager's default while only 0.154.0 is certified. `collectors
+/// manager's default while 0.154.0 and 0.159.2 are certified. `collectors
 /// capabilities` lists each retained Codex profile with its recorded agent
 /// version and warns, and `doctor` warns (never fails) with how to pin, when
 /// the version is uncertified, when the agent path is a launcher (a shim
@@ -728,7 +728,7 @@ fn doctor_and_capabilities_warn_on_an_uncertified_or_drifting_codex_profile() {
     assert_eq!((&drift["version"], &drift["certified"], &drift["resolved"]), (&json!("0.158.0"), &json!(false), &json!(mise.join("bin/mise").display().to_string())));
     let text = f.text(&["collectors", "capabilities"]);
     assert!(text.lines().any(|l| l == format!("profile drift agent {} version 0.158.0 certified=false", mise.join("shims/codex").display())), "{text}");
-    assert!(text.lines().any(|l| l.starts_with("  WARNING version_uncertified: Codex 0.158.0 is not certified (certified: 0.154.0)")), "{text}");
+    assert!(text.lines().any(|l| l.starts_with("  WARNING version_uncertified: Codex 0.158.0 is not certified (certified: 0.154.0, 0.159.2)")), "{text}");
     assert!(text.lines().any(|l| l.starts_with("  to fix: pin the profile to a certified Codex binary by its resolved path")), "{text}");
 
     let text = doctor(&f);

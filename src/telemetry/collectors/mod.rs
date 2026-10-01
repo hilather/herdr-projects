@@ -272,6 +272,19 @@ fn codex_fields() -> Vec<Field> {
         absent("item_completed", "item.agent_path", "content_forbidden"),
         absent("item_completed", "item.receiver_agents", "content_forbidden"),
     ]);
+    // Installed 0.159.2 metadata: deliberately outside the sanitizer allowlist.
+    fields.extend([
+        absent("session_meta", "history_mode", "not_collected"),
+        absent("session_meta", "runtime_workspace_roots", "not_collected"),
+        absent("session_meta", "context_window", "not_collected"),
+        absent("session_meta", "creator_user_id", "not_collected"),
+        absent("session_meta", "creator_account_id", "not_collected"),
+        absent("task_started", "root_turn_id", "not_collected"),
+        absent("world_state", "full", "not_collected"),
+        absent("world_state", "state", "content_forbidden"),
+        absent("thread_settings_applied", "thread_id", "not_collected"),
+        absent("thread_settings_applied", "thread_settings", "content_forbidden"),
+    ]);
     fields
 }
 
@@ -296,7 +309,17 @@ fn capabilities(project: &Path) -> Result<Value> {
             (_, Some(Class::Path)) => "reported_home_redacted",
         };
         let certified = match f.certified { Certified::Live => "live", Certified::Fixture => "fixture", Certified::None => "none" };
-        out.push(json!({"kind": f.kind, "field": f.field, "available": collected, "basis": basis, "certified": certified, "caveat": f.caveat, "reason": f.reason}));
+        // Field evidence remains version-specific: the installed-version run
+        // observes counters, model and binding, not tools, forks or subagents.
+        let live_versions: Vec<&str> = if certified == "live" {
+            if (f.kind == "token_usage_record" && (f.field.starts_with("usage.") || f.field.starts_with("thread_token_usage.")))
+                || (f.kind == "token_count" && f.field.starts_with("info.total_token_usage."))
+                || (f.kind == "turn_context" && f.field == "model")
+                || (f.kind == "session_meta" && matches!(f.field.as_str(), "id" | "timestamp" | "cwd" | "cli_version")) {
+                vec!["0.154.0", "0.159.2"]
+            } else { vec!["0.154.0"] }
+        } else { Vec::new() };
+        out.push(json!({"kind": f.kind, "field": f.field, "available": collected, "basis": basis, "certified": certified, "live_versions": live_versions, "caveat": f.caveat, "reason": f.reason}));
     }
     for kind in ["session_meta", "turn_context", "task_started", "token_usage_record", "token_count", "task_complete", "turn_aborted", "custom_tool_call",
         "function_call", "custom_tool_call_output", "function_call_output", "item_completed"] {

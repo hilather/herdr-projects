@@ -79,7 +79,10 @@ usage, normalizing input as uncached + cache read + cache creation.
 
 ## Reviewing a report
 
-The report includes numeric ledger records/totals, own reported totals,
+The report selects accepted `basis=delta` accounting entries for numeric
+ledger records/totals. Cumulative thread entries are reconciliation evidence
+and must never be summed with deltas (LC1 corrected this double counting).
+It includes own reported totals,
 per-counter differences, unmapped OTLP attribute/resource keys, binding,
 version and a marker scan over telemetry.db including WAL/SHM. It runs collect,
 accounting sync, usage, attempts, collector bindings and OTLP records through

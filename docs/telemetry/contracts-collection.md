@@ -2164,3 +2164,19 @@ completed successfully, with existing unrelated warnings and none in changed
 files or lines. `git diff --check` passed. Native usage remains unavailable
 pending stable format evidence; live certification and a protobuf-to-JSON
 converter were not attempted.
+
+### Installed Codex 0.159.2 (LC1)
+
+Certified versions are 0.154.0 and 0.159.2. The latter's recorded report is
+[codex-live-0.159.2.md](codex-live-0.159.2.md), a draft pending the steward's
+passing live reconciliation. Codex capability fields include `live_versions`:
+only usage counters, model and session binding inputs gain 0.159.2 evidence;
+all other field evidence retains its prior scope.
+
+The new world_state and thread_settings_applied snapshots are uncollected;
+world_state content is never stored. New session_meta history_mode,
+runtime_workspace_roots, context_window and creator_* fields and task_started
+root_turn_id are explicitly unavailable. turn_token_usage and last_token_usage
+remain uncollected; thread_token_usage and token_count totals reconcile only.
+Accounting entries expose cumulative entries alongside deltas. Live reports
+must select delta basis before counting records or summing accepted counters.

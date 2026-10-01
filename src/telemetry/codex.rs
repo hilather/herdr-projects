@@ -19,7 +19,7 @@ pub(crate) mod gemini;
 pub(crate) mod opencode;
 
 /// Codex versions certified by a live run (docs/telemetry/codex-live-0.154.0.md).
-pub const CERTIFIED: &[&str] = &["0.154.0"];
+pub const CERTIFIED: &[&str] = &["0.154.0", "0.159.2"];
 /// Longest line parsed; longer lines are skipped whole without being retained.
 const MAX_LINE: u64 = 16 << 20;
 const MAX_DEPTH: usize = 4;

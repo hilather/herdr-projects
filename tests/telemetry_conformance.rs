@@ -115,7 +115,10 @@ const CASES: &[Case] = &[
     Case { name: "live2-fork", sid: LIVE2_FORK_SID, parts: &[LIVE2_FORK], version: "0.154.0", place: Place::Bound },
 ];
 
-fn case(name: &str) -> &'static Case { CASES.iter().chain([&LIVE3_CASE]).find(|c| c.name == name).unwrap() }
+static INSTALLED_CASE: Case = Case { name: "installed-resume", sid: "ID02",
+    parts: &["../codex-0.159.2/live-two-turn-resume.jsonl"], version: "0.159.2", place: Place::Bound };
+
+fn case(name: &str) -> &'static Case { CASES.iter().chain([&LIVE3_CASE, &INSTALLED_CASE]).find(|c| c.name == name).unwrap() }
 
 /// Write corpus case `name` into the fixture; returns the rollout path. A
 /// fork's `@ORIGIN@` becomes the `complete` case's session id and
@@ -134,6 +137,12 @@ fn plant(f: &Fixture, name: &str) -> PathBuf {
     if text.contains("@ORIGIN_END@") {
         let origin = path.with_file_name("rollout-2026-09-28T00-00-00-complete.jsonl");
         text = text.replace("@ORIGIN_END@", &fs::metadata(&origin).expect("plant `complete` before its fork").len().to_string());
+    }
+    if c.name == "installed-resume" {
+        let mut lines: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        lines[0]["payload"]["cwd"] = json!(cwd);
+        lines[0]["payload"]["timestamp"] = json!(jiff::Timestamp::from_millisecond(at).unwrap().to_string());
+        text = lines.iter().map(|v| format!("{v}\n")).collect();
     }
     fs::write(&path, text).unwrap();
     path
@@ -376,7 +385,7 @@ fn uncertified_version_is_gated_everywhere() {
         AND event_kind='codex.token_usage_record.v1' ORDER BY producer_sequence", source(&old))), [vec![1000], vec![500]]);
     let (capabilities, _) = f.cli_args(&["collectors", "capabilities", "--json"]);
     assert_eq!((&capabilities["adapters"][0]["certified_versions"], &capabilities["adapters"][0]["uncertified_version"]),
-        (&json!(["0.154.0"]), &json!("cli_version_uncertified")));
+        (&json!(["0.154.0", "0.159.2"]), &json!("cli_version_uncertified")));
 }
 
 fn contains_sentinel(bytes: &[u8]) -> Option<&'static str> {
@@ -498,7 +507,7 @@ fn leaves(value: &Value, prefix: &str, out: &mut BTreeSet<String>) {
 
 /// The capability table, hand-checked against contracts §5, the sanitizer
 /// allowlist and the live docs (docs/telemetry/codex-live-0.154.0*.md), printed as text.
-const CAPABILITIES: &str = "codex rollout_jsonl certified_versions=0.154.0
+const CAPABILITIES: &str = "codex rollout_jsonl certified_versions=0.154.0,0.159.2
   line.timestamp available=true basis=reported certified=live caveat=envelope_occurred_unix_ms
   session_meta.id available=true basis=reported certified=live
   session_meta.timestamp available=true basis=reported_excerpt certified=live
@@ -636,6 +645,16 @@ const CAPABILITIES: &str = "codex rollout_jsonl certified_versions=0.154.0
   item_completed.item.agents_states available=false basis=unavailable certified=none reason=not_collected
   item_completed.item.agent_path available=false basis=unavailable certified=none reason=content_forbidden
   item_completed.item.receiver_agents available=false basis=unavailable certified=none reason=content_forbidden
+  session_meta.history_mode available=false basis=unavailable certified=none reason=not_collected
+  session_meta.runtime_workspace_roots available=false basis=unavailable certified=none reason=not_collected
+  session_meta.context_window available=false basis=unavailable certified=none reason=not_collected
+  session_meta.creator_user_id available=false basis=unavailable certified=none reason=not_collected
+  session_meta.creator_account_id available=false basis=unavailable certified=none reason=not_collected
+  task_started.root_turn_id available=false basis=unavailable certified=none reason=not_collected
+  world_state.full available=false basis=unavailable certified=none reason=not_collected
+  world_state.state available=false basis=unavailable certified=none reason=content_forbidden
+  thread_settings_applied.thread_id available=false basis=unavailable certified=none reason=not_collected
+  thread_settings_applied.thread_settings available=false basis=unavailable certified=none reason=content_forbidden
 ";
 
 /// `collectors capabilities` cannot drift from the adapter: over the whole
@@ -654,7 +673,7 @@ fn capabilities_match_emitted_fields() {
     let adapter = &capabilities["adapters"][0];
     assert_eq!((&adapter["adapter"], &adapter["interface"]), (&json!("codex"), &json!("rollout_jsonl")));
     assert_eq!(adapter["fields"][2], json!({"kind": "session_meta", "field": "timestamp", "available": true, "basis": "reported_excerpt",
-        "certified": "live", "caveat": null, "reason": null}));
+        "certified": "live", "live_versions": ["0.154.0", "0.159.2"], "caveat": null, "reason": null}));
     let declared = |available: bool| adapter["fields"].as_array().unwrap().iter().filter(|f| f["available"] == available && f["kind"] != "line")
         .map(|f| format!("{}.{}", f["kind"].as_str().unwrap(), f["field"].as_str().unwrap())).collect::<BTreeSet<_>>();
 
@@ -1434,4 +1453,44 @@ fn live_run3_same_file_resume_with_a_model_switch_counts_each_record_once() {
         if let Ok(bytes) = fs::read(state.join(name)) { assert_eq!(leaks(&bytes), None, "{name}"); }
     }
     assert_eq!(leaks(&output), None, "{}", String::from_utf8_lossy(&output));
+}
+
+/// The sanitized installed-version rollout, collected through the public CLI.
+/// Accounting exposes a reconciliation entry alongside the two counted deltas.
+#[test]
+fn installed_codex_two_turn_resume_reconciles() {
+    let f = Fixture::new();
+    let path = plant(&f, "installed-resume");
+    let lines: Vec<Value> = fs::read_to_string(&path).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(f.cli("collect").0["collected"]["records"], 2);
+    f.cli_args(&["accounting", "sync"]);
+    let entries = f.cli_args(&["accounting", "entries"]).0;
+    let rows = entries["entries"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    let accepted: Vec<_> = rows.iter().filter(|e| e["provenance"].as_array().unwrap().iter().any(|p| p["disposition"] == "accepted")).collect();
+    // Reproduce the live harness's original erroneous sum, including cumulative.
+    assert_eq!(accepted.iter().map(|e| e["native"]["input_tokens"].as_i64().unwrap()).sum::<i64>(), 57_382);
+    let deltas = accepted_delta_entries(&entries);
+    assert_eq!(deltas.len(), 2);
+    assert_eq!(deltas.iter().map(|e| (e["native"]["input_tokens"].as_i64().unwrap(), e["native"]["cached_input_tokens"].as_i64().unwrap(), e["native"]["output_tokens"].as_i64().unwrap())).collect::<Vec<_>>(), [(14_329, 12_288, 5), (14_362, 14_208, 5)]);
+    let total = &lines[23]["payload"]["thread_token_usage"];
+    for key in ["input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens"] {
+        assert_eq!(deltas.iter().map(|e| e["native"][key].as_i64().unwrap()).sum::<i64>(), total[key].as_i64().unwrap(), "{key}");
+    }
+    assert_eq!(attempt_usage(&f.cli_args(&["usage", "--json"]).0)["input_tokens"], 28_691);
+    assert_eq!(f.sidecar().query_row("SELECT binding FROM rollout_sources", [], |r| r.get::<_, String>(0)).unwrap(), "bound");
+    assert_eq!(f.sidecar().query_row("SELECT count(*) FROM codex_discrepancy", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    assert!(!envelopes(&f, &source(&path)).iter().any(|(_, kind, _)| kind.contains("world_state") || kind.contains("thread_settings_applied")));
+    let before = ledger(&f);
+    f.cli("collect");
+    assert_eq!(ledger(&f), before);
+    remove_sidecar(&f);
+    f.cli("collect");
+    assert_eq!(ledger(&f), before);
+    let capabilities = f.cli_args(&["collectors", "capabilities", "--json"]).0;
+    let fields = capabilities["adapters"][0]["fields"].as_array().unwrap();
+    let evidence = |kind: &str, name: &str| fields.iter().find(|v| v["kind"] == kind && v["field"] == name).unwrap()["live_versions"].clone();
+    assert_eq!(evidence("turn_context", "model"), json!(["0.154.0", "0.159.2"]));
+    assert_eq!(evidence("token_usage_record", "usage.input_tokens"), json!(["0.154.0", "0.159.2"]));
+    assert_eq!(evidence("token_count", "rate_limits.primary.used_percent"), json!(["0.154.0"]));
 }

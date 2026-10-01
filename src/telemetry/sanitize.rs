@@ -69,6 +69,9 @@ pub fn codex_allowlist(kind: &str) -> Option<Vec<(String, Class)>> {
             ("item.agent_thread_id", Id), ("item.sender_thread_id", Id), ("item.receiver_thread_ids", IdList)]),
         // A8: an aborted turn's final event.
         "turn_aborted" => fields(&[("turn_id", Id), ("reason", Tag), ("duration_ms", Number)]),
+        // 0.159.2 introduces these content-bearing snapshots on start/resume.
+        // They are intentionally uncollected, including all world_state content.
+        "world_state" | "thread_settings_applied" => return None,
         _ => return None,
     })
 }

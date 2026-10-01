@@ -500,25 +500,10 @@ fn live(kind: &str) {
     let usage = f.cli_args(&["usage", "--json"]).0;
     let attempts = f.cli_args(&["attempts", "--json"]).0;
     let entries = f.cli_args(&["accounting", "entries"]).0;
-    let records: Vec<Value> = entries["entries"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|e| counters(&e["native"]))
-        .collect();
+    let counted = support::telemetry::accepted_delta_entries(&entries);
+    let records: Vec<Value> = counted.iter().map(|e| counters(&e["native"])).collect();
     let mut totals = BTreeMap::<String, u64>::new();
-    for entry in entries["entries"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|e| {
-            e["provenance"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|p| p["disposition"] == "accepted")
-        })
-    {
+    for entry in counted {
         let record = counters(&entry["native"]);
         for key in COUNTERS {
             if let Some(n) = record[key].as_u64() {
