@@ -320,18 +320,21 @@ fn cost(sidecar: Option<&rusqlite::Connection>, units: &[&Unit]) -> Result<Value
 fn model_allocation(sidecar: Option<&rusqlite::Connection>, units: &[&Unit]) -> Result<Value> {
     let Some(db) = sidecar else { return Ok(unavailable("collection_not_run")) };
     if !table(db, "session_graph_nodes")? || !table(db, "model_segments")? { return Ok(unavailable("accounting_not_synced")); }
-    let mut sessions = db.prepare("SELECT DISTINCT session_id FROM session_graph_nodes WHERE attempt_id=?1 ORDER BY session_id")?;
-    let mut segments = db.prepare("SELECT bucket,model FROM model_segments WHERE session_id=?1")?;
+    let mut allocations = BTreeMap::<String, (BTreeSet<String>, bool)>::new();
+    let mut stmt = db.prepare("SELECT n.attempt_id,m.bucket,m.model FROM session_graph_nodes n
+        JOIN model_segments m USING(session_id) WHERE n.attempt_id IS NOT NULL")?;
+    for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?)))? {
+        let (attempt, bucket, model) = row?;
+        let entry = allocations.entry(attempt).or_default();
+        match (bucket.as_str(), model) { ("model", Some(m)) => { entry.0.insert(m); } ("mixed", _) => entry.1 = true, _ => {} }
+    }
     let (mut single, mut mixed, mut unobserved) = (0usize, 0usize, 0usize);
     for unit in units {
         let (mut models, mut mixed_bucket) = (BTreeSet::<String>::new(), false);
         for attempt in &unit.task.attempts {
-            let ids: Vec<String> = sessions.query_map([&attempt.id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-            for session in ids {
-                for row in segments.query_map([&session], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))? {
-                    let (bucket, model) = row?;
-                    match (bucket.as_str(), model) { ("model", Some(m)) => { models.insert(m); } ("mixed", _) => mixed_bucket = true, _ => {} }
-                }
+            if let Some((observed, mixed)) = allocations.get(&attempt.id) {
+                models.extend(observed.iter().cloned());
+                mixed_bucket |= mixed;
             }
         }
         if models.len() > 1 || mixed_bucket { mixed += 1 } else if models.len() == 1 { single += 1 } else { unobserved += 1 }
@@ -349,7 +352,28 @@ pub fn run(project: &Path, args: &Args) -> Result<Value> {
         }
         return crate::telemetry::accounting::cache::compare(project, args);
     }
+    let r = request(args)?;
+    // Only the clock-independent default terminal M02 report is maintained.
+    // Assignment follow-up, windows, custom seeds and other metrics keep their
+    // original live evaluator; immutable as-of cells are separate from this cache.
+    if r.metrics.len() == 1 && r.metrics[0].0 == "M02" && r.cohort == Cohort::Terminal
+        && r.from.is_none() && r.to.is_none() && r.horizon.is_none() && r.class.is_none() && args.seed.is_none()
+        && let Some(db) = crate::telemetry::sidecar::read(project)? {
+        let db = db.unchecked_transaction()?;
+        if let Some(generations) = super::inputs::generations(&db)? {
+            let canonical = super::inputs::canonical(project)?;
+            let stamp = super::inputs::stamp("comparison", &canonical, &generations);
+            if let Some(body) = super::inputs::cached(&db, "comparison", None, &stamp)? { return Ok(body); }
+        }
+    }
     run_report(project, args, false)
+}
+
+/// Refresh uses the same evaluator and stores its body only after validating
+/// the pinned canonical identity and every input generation under the writer.
+pub(crate) fn maintained(project: &Path) -> Result<Value> {
+    run(project, &Args { metrics: vec!["M02".into()], by: "configuration".into(), cohort: None,
+        from: None, to: None, horizon_ms: None, task_class: None, seed: None, json: true })
 }
 
 /// Same cells and labels, without cost/model diagnostics the workspace does
@@ -460,7 +484,7 @@ fn run_report(project: &Path, args: &Args, workspace: bool) -> Result<Value> {
     }
 
     // Paired analysis for candidate groups: lane C's M42 (same read path as `telemetry report`), restricted to these arms.
-    let paired = if workspace { Value::Null } else { match crate::telemetry::quality::metrics(project, r.from)?.remove("M42") {
+    let paired = if workspace { Value::Null } else { match crate::telemetry::quality::groups::paired_metrics(project, r.from, None)?.remove("M42") {
         None => unavailable("paired_metric_absent"),
         Some(m42) => {
             let pairs: Vec<Value> = m42["pairs"].as_array().into_iter().flatten()

@@ -93,7 +93,7 @@ pub(crate) fn stamp(group: &str, canonical: &Value, generations: &BTreeMap<Strin
     let relevant = |table: &str| table == "schema" || match group {
         "native" => false,
         "operating" => table.starts_with("operating_"),
-        "central" => !table.starts_with("operating_"),
+        "central" | "comparison" => !table.starts_with("operating_"),
         "diagnostics" => matches!(table, "codex_usage" | "codex_usage_times" | "rollout_sources"),
         "usage" => matches!(table, "rollout_sources" | "codex_usage" | "codex_quarantine" | "accounting_stream" | "accounting_dirty_sessions" | "accounting_usage_totals" | "accounting_cache_totals" | "accounting_cache_frontier" | "accounting_source_summary"),
         "cost" => table.starts_with("valuation") || table.starts_with("rate_card") || table == "rollout_sources",

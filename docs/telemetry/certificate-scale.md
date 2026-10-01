@@ -2329,6 +2329,126 @@ rebuilds, dirty-session fan-out) and fixes the cause, then makes the worker
 fair if it is still needed. Card P8 takes the `compare` regression and live
 `health`. L8 is proved only in the TM5.4 live ramp (owner gate).
 
+### 4.21 P8: maintained M02 comparison and live health (100k follow-up)
+
+Branch `perf/compare-1m`, base `628b59f`. **Pending the steward's serial
+1M certification. This worker has not measured 1M.** The card permits only
+`scale_2_queries` at 1M; this checkout had no prepared 1M dataset. Permission
+to run the deterministic generation/ingest preparation, or a path to an
+existing fixture, was requested and remains pending. Do not interpret the
+100k numbers below as the requested same-dataset 1M comparison. Plan doc 10
+is not present in this checkout; the unchanged targets quoted in §4/§7 apply.
+
+**Cause and phase evidence.** Compare still called native `attempt_usage`
+per attempt, scanned the maintained session graph once per attempt, and
+computed the entire quality lane only to retain M42. A temporary SQLite
+PROFILE interposer on the preserved main CLI produced these 100k observations
+(one additional untimed diagnostic run; no instrumentation is committed):
+
+| Compare phase | SQL elapsed (ms) | statements |
+| --- | ---: | ---: |
+| Canonical lifecycle inputs | 76 | 4 |
+| Decisions/configurations/classifications | 85 | 5 |
+| Per-arm native cost | 70 | 11,788 |
+| Per-arm model allocation | 829 | 10,862 |
+| Pairing | 0 at SQLite's timer resolution | 2 |
+| Quality / verification flip rate | 0 at timer resolution | 6 |
+| Other SQL | 65 | 19,910 |
+
+Wall time was 1,643.62 ms. The remaining 518.62 ms includes statement
+preparation, Rust candidate selection/arm attribution, bootstrap evaluation,
+JSON processing and process overhead; those subphases were not individually
+timed. This is a 100k profile, **not** a claimed breakdown of the steward's
+13-second 1M sample. Health's corresponding diagnostic wall was 2,524.54 ms,
+including 853 ms model allocation, 66 ms native cost, 201 ms lifecycle and
+299 ms decision/classification SQL.
+
+P1 (`93a242c`) added `session_graph_nodes_session`. The unchanged per-attempt
+`WHERE attempt_id=? ORDER BY session_id` query now chooses a full scan through
+that non-covering session index, rather than the original table scan plus
+small DISTINCT sort. On the same 990-node 100k store, 9,937 lookups take
+898.61 ms through the chosen index versus 587.79 ms with `NOT INDEXED`, returning
+identical rows. Both remain full-history work per candidate; at 1M there are
+roughly ten times as many graph nodes. This identifies a merged query-plan
+regression, but the exact fraction of the 1M regression remains unmeasured.
+DG1b already made M30 candidate loading lazy; M02 does not load candidates.
+DG2's M10 branch is not entered for M02. DG3's M03 is not evaluated by compare.
+DG6 adds an unnecessary flip-rate evaluation through the broad quality call;
+it is negligible on this fixture, whose verification producer is unavailable.
+
+**Design and identical answers.** The live fallback joins the maintained graph
+and model segments once per arm, unions the same model sets per task, and
+retains the same mixed-bucket flag. Duplicate graph nodes remain idempotent.
+Pairing directly calls the original M41/M42 evaluator rather than evaluating
+unrelated quality metrics. Native cost acceptance/deduplication, arm attribution,
+class ordering, bootstrap seed/draws, suppression, pooling and ranking are
+unchanged. Analytics refresh maintains the complete default terminal M02 body
+in the existing disposable provider table. Computation uses its pinned read
+snapshots; the existing short writer validates canonical file/head identity,
+registry version and input generations before publishing. Live reads validate
+and consume the body in one sidecar snapshot. Operating heartbeats are excluded
+because compare does not read M03. Missing/stale bodies use the live evaluator;
+windows, assignment follow-up, custom seeds and other metrics keep that path.
+No schema, canonical write, metric revision/digest or as-of selector changes.
+
+Health's recommendation rule consumes this identical validated comparison.
+Collector age, moving windows, flake rules, quota expiry, waits, thresholds,
+notices and health-rules.v3 still evaluate live. A current 100k health diagnostic
+has zero native-cost/model-allocation statements and takes 919.79 ms; canonical
+and moving-window work remains. The 500-ms health target is **not met**.
+
+**Reproduction and paired measurements.** Both builds use §1's exact release
+command, locked/offline `-j 3`. One disk-backed seed-5100 fixture under
+`$PWD/bench-data/p8-100k`, `SCALE_EVENTS=100000 SCALE_ACTIVE=64`, was generated
+and ingested once. Initial main query samples precede changes; an explicit
+post-change analytics refresh warms the same inputs outside timing. Phase 2
+uses `SCALE_QUERY_SET=p8 SCALE_REPEATS=3 SCALE_PER_ROUND=1`, one process at a
+time and no build/test overlapping measurement. `SCALE_QUERY_BIN` selects the
+preserved main CLI for before; `SCALE_COMPARE_BIN` runs that CLI after each
+timed after comparison and asserts **identical stdout bytes** (three checks).
+The unchanged load-gate body is untouched. No dataset is committed.
+
+| 100k/64, n=3 | Before p50 / p95 ms | After p50 / p95 ms |
+| --- | ---: | ---: |
+| Compare M02 | 1,631.78 / 1,646.05 | 11.90 / 12.00 |
+| Health live states | 2,747.01 / 2,759.03 | 895.17 / 921.58 |
+
+Results-file load averages (1 / 5 / 15 minutes), start → end:
+before `3.37 / 4.14 / 3.31 → 4.27 / 4.31 / 3.38`;
+after `3.35 / 3.92 / 3.38 → 3.14 / 3.86 / 3.37`.
+These are shared-host samples, not authoritative 1M certification. The default
+comparison meets 500 ms at 100k; health and 1M L3 remain open.
+
+CLI E2E coverage collects a real rollout, checks the cold and maintained
+comparison bytes, appends a real usage record (1,120 → 1,680 native tokens),
+then proves a poisoned stale body is never served after collection advances
+input generations. After sync/refresh, warm bytes again equal cold evaluation.
+Model-only and canonical classification corrections invalidate evidence;
+pinned metric revisions remain reproducible. Existing exact expectations
+are unchanged. The fifteen requested suites plus the corrected compare-suite
+rerun establish **189 passing tests, 13 ignored**, with only four unresolved
+socket-bind failures (`Operation not permitted`):
+
+- `telemetry::attempts_show_attention_summary`
+- `telemetry_accounting::attention_intervals_union_and_censor`
+- `telemetry_health::recommendations_and_notices_change_no_canonical_state_and_no_dispatch`
+- `telemetry_workspace::thread_start_records_the_dispatch_reason_and_the_sidebar_suffix`
+
+The full run passed the unchanged `scale_gates_hold_under_load`. The new E2E
+initially violated a model-segment constraint, then tried to update an immutable
+classification. Its corrected fixture retains a valid model bucket and appends
+a new classification revision; all six compare workflows pass. Neither failure
+was a production failure or classified as socket-only. Clippy reports no warning
+on changed lines (97 existing unrelated warnings). The final release `scale_gates_hold_under_load` also passes unchanged in
+**12.51 s**. The table above uses the final release after build, including the
+operating-heartbeat dependency exclusion. All three final comparisons match
+main stdout byte for byte. Peak RSS is 87,704 → 16,644 KiB for compare and
+90,516 → 78,692 KiB for health. Benchmark datasets were removed before commit.
+
+Files: `src/telemetry/analytics/{compare,inputs,store}.rs`,
+`tests/telemetry_{compare,scale}.rs`, this certificate. No new crate, source
+process spawn, unit test or source-text assertion.
+
 ## 5. Inefficiencies found and fixed
 
 The first measurement (same generator, same host) missed the query and
@@ -2490,6 +2610,11 @@ owner. None is hidden by loosening the target.
   pending the steward's 1M certification** (§4.15, all phase load averages
   included). M10 previously had no producer; no general speedup or L3
   closure is claimed.
+  **P8 maintains default terminal M02 comparison bodies (§4.21). At 100k/64,
+  compare p95 1,646.05 → 12.00 ms and live health 2,759.03 → 921.58 ms,
+  at 1-minute loads 3.37 → 4.27 before / 3.35 → 3.14 after.
+  Pending the steward's 1M certification; this worker's 1M fixture preparation
+  remains pending clarification. Health still exceeds 500 ms; L3 stays open.**
   Owners: accounting lane, analytics (TM4.1).
 - **L4: the ticker's telemetry pass exceeds the 256 MiB envelope at 10,000
   bindings.** The collector itself stays within it (58–115 MB) and its byte

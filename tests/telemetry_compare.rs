@@ -543,3 +543,59 @@ fn experiment_report_is_intention_to_treat_and_causal_only_at_the_preregistered_
     assert_eq!((&d["value"], &d["interval"], &d["causal"]), (&unavailable("insufficient_data"), &unavailable("insufficient_data"),
         &json!({"status": "unavailable", "reason": "insufficient_data", "min_units": 2})));
 }
+
+/// Real collect/refresh/compare workflow: late producer inputs invalidate the
+/// supplemental body even before sync, and warm/cold CLI bytes always agree.
+#[test]
+fn maintained_comparison_never_serves_a_stale_body_after_late_collection() {
+    use std::io::Write;
+    let f = Fixture::new();
+    let path = f.rollout(&f.home, "compare-cache", &["head.jsonl"], &f.worktree(), f.decided + 1, "0.154.0");
+    f.cli("collect");
+    plant_aggregate_termination(&f);
+    f.cli_args(&["accounting", "sync"]);
+    let args = ["compare", "--metric", "M02", "--json"];
+    let (initial, cold) = f.cli_args(&args);
+    assert_eq!(initial["configurations"][0]["cost"]["total_tokens"], 1120);
+    f.cli_args(&["analytics", "refresh"]);
+    assert_eq!(f.cli_args(&args).1, cold);
+    assert_eq!(f.sidecar().query_row("SELECT count(*) FROM analytics_provider_rows WHERE provider='comparison'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    // Poison the old body to make any stale serving observable. The collector
+    // advances real input generations when it consumes the appended record.
+    f.sidecar().execute("UPDATE analytics_provider_rows SET body='{\"stale\":true}',suffix='',m40_revision=NULL,m40_offset=NULL,m40_bytes=NULL WHERE provider='comparison'", []).unwrap();
+    let tail = fs::read_to_string(std::path::Path::new(FIXTURES).join("tail.jsonl")).unwrap()
+        .replace("@SID@", SID).replace("@CWD@", &f.worktree())
+        .replace("@TS@", &jiff::Timestamp::from_millisecond(f.decided + 2).unwrap().to_string()).replace("@VERSION@", "0.154.0");
+    fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(tail.as_bytes()).unwrap();
+    f.cli("collect");
+    let (late, late_bytes) = f.cli_args(&args);
+    assert!(late.get("stale").is_none());
+    assert_eq!(late["configurations"][0]["cost"]["total_tokens"], 1680);
+    assert_ne!(late_bytes, cold, "the real appended usage must change arm diagnostics");
+    f.sidecar().execute("DELETE FROM analytics_provider_rows WHERE provider='comparison'", []).unwrap();
+    assert_eq!(f.cli_args(&args).1, late_bytes);
+    f.cli_args(&["accounting", "sync"]);
+    let synced = f.cli_args(&args).1;
+    f.cli_args(&["analytics", "refresh"]);
+    assert_eq!(f.cli_args(&args).1, synced);
+    // A model-only correction invalidates supplemental evidence, while
+    // independently pinned metric revisions remain reproducible.
+    let mut pinned = f.cli_args(&["query", "--metric", "M02", "--as-of-seq", "1000000", "--json"]).0;
+    pinned.as_object_mut().unwrap().remove("query_unix_ms");
+    f.sidecar().execute("UPDATE model_segments SET model='fixture-corrected-model' WHERE bucket='model'", []).unwrap();
+    let changed = f.cli_args(&args).1;
+    f.sidecar().execute("DELETE FROM analytics_provider_rows WHERE provider='comparison'", []).unwrap();
+    assert_eq!(f.cli_args(&args).1, changed);
+    f.cli_args(&["analytics", "refresh"]);
+    rusqlite::Connection::open(f.project.join(".state/state.db")).unwrap()
+        .execute("INSERT INTO task_classifications(classification_id,task_id,contract_revision,taxonomy,class,band,features,classifier,revision,reason,created_unix_ms)
+            SELECT ?1,task_id,contract_revision,taxonomy,class,'large',features,classifier,revision+1,'fixture correction',created_unix_ms+1
+            FROM task_classifications ORDER BY created_unix_ms DESC LIMIT 1", [format!("sha256:{}", hex("classification-correction"))]).unwrap();
+    let canonical_changed = f.cli_args(&args).1;
+    assert_ne!(canonical_changed, changed);
+    f.sidecar().execute("DELETE FROM analytics_provider_rows WHERE provider='comparison'", []).unwrap();
+    assert_eq!(f.cli_args(&args).1, canonical_changed);
+    let mut historical = f.cli_args(&["query", "--metric", "M02", "--as-of-seq", "1000000", "--json"]).0;
+    historical.as_object_mut().unwrap().remove("query_unix_ms");
+    assert_eq!(historical, pinned);
+}

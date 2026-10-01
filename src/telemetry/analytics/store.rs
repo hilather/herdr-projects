@@ -243,10 +243,17 @@ pub fn refresh(project: &Path, extra: Option<Cell>) -> Result<Value> {
     }
     // Comparison and provider bodies are serialized before taking the writer.
     let comparison = serde_json::to_string(&crate::telemetry::workspace::comparison(project)?)?;
-    let bodies = sources.bodies.iter().filter(|((_, group), _)| !super::inputs::clock(group))
+    // Supplemental compare evidence uses the same pinned read snapshots as
+    // provider bodies. A missing diagnostic source must not block metric refresh.
+    let maintained_comparison = super::compare::maintained(project).ok();
+    let mut bodies = sources.bodies.iter().filter(|((_, group), _)| !super::inputs::clock(group))
         .map(|((since, group), body)| Ok((group.clone(), super::inputs::window(*since),
             super::inputs::stamp(group, &sources.canonical_inputs, &sources.input_generations), serde_json::to_string(body)?)))
         .collect::<Result<Vec<_>>>()?;
+    if let Some(body) = maintained_comparison {
+        bodies.push(("comparison".to_owned(), super::inputs::window(None),
+            super::inputs::stamp("comparison", &sources.canonical_inputs, &sources.input_generations), serde_json::to_string(&body)?));
+    }
     drop(snapshot);
     let bodies = bodies.into_iter().map(|(group, window, inputs, body)| {
         let reference = super::compact::reference(&db, &body)?;
