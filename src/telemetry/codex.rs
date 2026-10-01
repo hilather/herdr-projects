@@ -251,6 +251,23 @@ fn digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
+/// Cheap ticker eligibility probe. Use only recorded execution homes, never
+/// discover an owner's agent directories. Full collection still validates and
+/// binds the same canonical inputs; this probe only avoids empty worker turns.
+pub fn collection_configured(project: &Path) -> Result<bool> {
+    let db=super::read_only_nowait(&project.join(".state/state.db"))?;
+    let table=|name:&str|db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",[name],|r|r.get::<_,bool>(0));
+    if table("attempt_inputs")? && db.query_row("SELECT EXISTS(SELECT 1 FROM attempt_inputs
+        WHERE json_extract(payload,'$.inputs.effective_profile.kind') IN ('codex','claude','gemini','opencode')
+        AND json_type(payload,'$.inputs.effective_profile.execution_home')='text')",[],|r|r.get::<_,bool>(0))? {return Ok(true);}
+    if table("native_profiles")? {
+        return Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM native_profiles
+            WHERE json_extract(report,'$.preparation.profile.kind')='codex'
+            AND json_type(report,'$.preparation.profile.execution_home')='text')",[],|r|r.get::<_,bool>(0))?);
+    }
+    Ok(false)
+}
+
 /// Scan every Codex execution home, ingest complete new lines, recompute bindings.
 /// `create` false: a project without Codex homes gets no sidecar.
 pub fn collect(project: &Path, budget: Budget, create: bool) -> Result<Option<Collected>> {

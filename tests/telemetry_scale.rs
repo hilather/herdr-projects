@@ -731,6 +731,42 @@ fn scale_gates_hold_under_load() {
     assert_eq!(canonical_digest(&d), canonical, "telemetry wrote the canonical store");
 }
 
+/// Real ticker CLI: recorded native sources opt an absent sidecar into collection.
+#[test]
+fn ticker_collects_recorded_sources_before_observing_a_new_sidecar() {
+    struct Ticker(std::process::Child);
+    impl Drop for Ticker { fn drop(&mut self) { let _=self.0.kill(); let _=self.0.wait(); } }
+    let mut d=generate(Fixture::new(),Scale{attempts:200,active:4,events:4_000,homes:4,seed:55});
+    // This workflow declares native usage only; quality/attention facts remain
+    // covered by the unchanged load workflow with its preinstalled producers.
+    d.producers=Producers::default();
+    let _cleanup=Cleanup(d.base.clone());
+    fs::write(d.project.join("PROJECT.md"),"initial ticker collection fixture\n").unwrap();
+    fs::write(d.project.join(".state/format.json"),"{}").unwrap();
+    rusqlite::Connection::open(d.state()).unwrap().execute("UPDATE project_control SET state='paused',factory_admission='off'",[]).unwrap();
+    // Remove only the isolated generated sidecar. Native files and canonical
+    // input receipts remain, so the ticker must discover those recorded sources.
+    for suffix in ["","-wal","-shm"] {let _=fs::remove_file(format!("{}{suffix}",d.sidecar().display()));}
+    let mut child=Ticker(command(&d,&["ticker","run"]).env("HERDR_PROJECTS_TELEMETRY_COLLECT_SECS","1")
+        .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    let deadline=Instant::now()+Duration::from_secs(30);
+    loop {
+        let ready=rusqlite::Connection::open_with_flags(d.sidecar(),rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()
+            .and_then(|db|db.query_row("SELECT count(*) FROM usage_entries WHERE basis='delta'",[],|r|r.get::<_,i64>(0)).ok())==Some(d.totals.records);
+        if ready {break;}
+        assert!(Instant::now()<deadline&&child.0.try_wait().unwrap().is_none(),"{}",fs::read_to_string(d.root.join(".ticker.log")).unwrap_or_default());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    fs::write(d.root.join(".ticker.stop"),b"").unwrap();
+    assert!(child.0.wait().unwrap().success());
+    let db=rusqlite::Connection::open_with_flags(d.sidecar(),rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    assert!(!db.query_row("SELECT active FROM operating_clock WHERE singleton=1",[],|r|r.get::<_,bool>(0)).unwrap());
+    assert_eq!(db.query_row("SELECT count(*) FROM operating_intervals",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    drop(db);
+    let violations=usage_gates(&d);
+    assert!(violations.is_empty(),"{violations:?}");
+}
+
 /// Real ticker CLI: kill after a committed prefix of one long rollout, then
 /// resume through the ticker and compare exact usage and ledger replay bytes.
 #[test]

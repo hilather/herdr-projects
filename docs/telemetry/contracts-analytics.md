@@ -175,7 +175,7 @@ fall back to the identical evaluator without a second rich lifecycle load.
 
 ### DG3: observed accepted throughput (M03)
 
-Registry v4 adds `M03.operating-v1`; historical absent `M03.v1` remains
+Registry v5 adds `M03.operating-v1`; historical absent `M03.v1` remains
 servable. Unique authoritative task acceptances are placed by their first
 acceptance evidence time in `[from,to)`; retries and additional receipts never
 count again, and replay candidates remain excluded. Query, report, export and
@@ -185,15 +185,28 @@ attributed to configuration arms from available observations.
 
 Sidecar stream `operating` version 1 stores `operating_intervals`,
 `operating_clock` and `operating_gaps`. The ticker telemetry worker observes
-canonical Active/paused state and control epoch on each available ticker pass
-(nominal 15 seconds), before expensive collection. It also observes paused
-projects and runs with collection disabled. Adjacent Active observations from
+canonical Active/paused state and control epoch at most once per nominal
+15-second cadence, after controller services and before expensive collection.
+Accelerated 250-ms controller ticks do not accelerate operating samples.
+`HERDR_PROJECTS_TELEMETRY_COLLECT_SECS=0` disables all ticker telemetry writes
+and sidecar creation. Automatic operating observations use only existing
+sidecars, including paused projects. A configured native-source collect can
+create the sidecar and start its first observed prefix; a project with neither
+a sidecar nor recorded native sources has no telemetry worker or writes.
+Explicit public `operating::observe` calls remain an opt-in producer API.
+Adjacent Active observations from
 the same run/control epoch extend one `[start,end)` interval. A gap longer
 than **N=3** nominal passes closes at the last observed endpoint; restart,
 control-epoch changes and pause/resume split intervals. No failed/missed pass
 is extrapolated. Short pause/resume between observations changes the canonical
-control epoch and therefore breaks continuity too. State reads and all sidecar
-writes run on the telemetry thread, never the controller. A busy worker misses
+control epoch and therefore breaks continuity too. Operating state reads and
+all sidecar
+writes run on the telemetry thread. Scheduling uses file-existence checks and
+a bounded-cadence canonical source-eligibility query for absent sidecars. That
+read defers on SQLite/file-lock contention instead of waiting on the
+controller. The
+operating reader releases its canonical file lock before opening or waiting
+on the sidecar writer. A busy worker misses
 a sample instead of creating an unbounded queue; the next observation detects
 the gap. Crash/stop tails remain censored. No post-stop wall time is counted.
 

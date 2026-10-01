@@ -368,7 +368,7 @@ Cards (gaps that stop those questions being answered):
 - **DG3 M03 accepted throughput** lacks operating hours
   (`operating_hours_not_recorded`). Record the ticker's active intervals per
   project (it already publishes pass metrics) as the denominator.
-- **DG3 M03 accepted throughput — done.** Registry v4 `M03.operating-v1`
+- **DG3 M03 accepted throughput — done.** Registry v5 `M03.operating-v1`
   uses durable ticker-observed Active intervals in operating stream 1. Query,
   report, export and revisions share exact tasks/hour; pauses, restarts, gaps
   and censored tails remain explicit. Configuration comparisons are unsupported

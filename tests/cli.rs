@@ -2387,6 +2387,58 @@ fn operator_verify_releases_project_ownership_during_the_check() {
     assert_eq!(runs(&second),1);
 }
 
+/// Serial local Git integrations and crash recovery, without sockets or agents.
+/// A store fixture rejects the second completion receipt after publication,
+/// leaving a real claimed job for the next ticker process to reconcile.
+#[cfg(all(feature="state-store",target_os="linux"))]
+#[test]
+fn ticker_integrates_two_local_results_and_recovers_lost_reply_without_telemetry() {
+    use herdr_projects::{migration,runtime,operations::DeliveryState};
+    use std::fs;
+    let lib="pub fn result() {}\n";
+    let f=VerifyFixture::new(&[("src/lib.rs",lib.into()),("src/one.txt","one\n".into())]);
+    f.git(&["checkout","-q","-b","two",&f.base]);
+    fs::write(f.repo.join("src/lib.rs"),lib).unwrap();fs::write(f.repo.join("src/two.txt"),"two\n").unwrap();
+    f.git(&["add","."]);f.git(&["commit","-qm","two"]);let c2=f.git(&["rev-parse","HEAD"]);
+    let clean=r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#.to_owned();
+    let one=f.submit("one",&[("clean",clean.clone())]);
+    const TARGET:&str="refs/heads/integration";
+    f.git(&["branch","integration",&f.base]);
+    let configured=hp(f.home.path(),&["--root",f.r(),"result","demo","configure-integration","--repository",f.repo.to_str().unwrap(),"--reference",TARGET]);
+    assert!(configured.status.success(),"{}",String::from_utf8_lossy(&configured.stderr));
+    let head=runtime::snapshot(&f.project).unwrap().head.to_string();
+    let enabled=hp(f.home.path(),&["--root",f.r(),"result","demo","auto","--verify","on","--integrate","on","--expected-head",&head]);
+    assert!(enabled.status.success(),"{}",String::from_utf8_lossy(&enabled.stderr));
+    let job=|submission:&str| {
+        let snapshot=runtime::snapshot(&f.project).unwrap();
+        snapshot.operations.iter().find(|op|op.kind=="integration.run"&&op.payload["submission_id"]==submission)
+            .and_then(|op|snapshot.deliveries.iter().find(|d|d.operation==op.id).map(|d|(op.clone(),d.clone())))
+    };
+    let integrated=||f.db().query_row("SELECT count(*) FROM integrated_commits",[],|r|r.get::<_,i64>(0)).unwrap();
+    let mut child=f.spawn();
+    f.wait(&mut child,150,&||job(&one).is_some_and(|(_,d)|d.state==DeliveryState::Confirmed));
+    let two=f.submit_at("two",&[("clean",clean)],&c2);
+    f.db().execute_batch("CREATE TRIGGER lose_integration_reply BEFORE UPDATE OF state ON operation_delivery
+        WHEN NEW.state='confirmed' AND EXISTS(SELECT 1 FROM operations o WHERE o.id=NEW.operation_id AND o.kind='integration.run' AND o.task_id='two')
+        BEGIN SELECT RAISE(ABORT,'fixture lost integration reply'); END;").unwrap();
+    f.wait(&mut child,150,&||integrated()==2&&job(&two).is_some_and(|(_,d)|d.state==DeliveryState::Claimed));
+    let (_,claimed)=job(&two).unwrap();
+    child.0.kill().unwrap();child.0.wait().unwrap();
+    f.db().execute_batch("DROP TRIGGER lose_integration_reply").unwrap();
+    migration::open_active(&f.project).unwrap().expire_claims(claimed.lease_until_ms.unwrap()+1).unwrap();
+    let mut child=f.spawn();
+    f.wait(&mut child,150,&||[&one,&two].iter().all(|s|job(s).is_some_and(|(_,d)|d.state==DeliveryState::Confirmed)));
+    f.stop(&mut child);
+    let landed=f.db().prepare("SELECT commit_oid FROM integrated_commits ORDER BY created_unix_ms,rowid").unwrap().query_map([],|r|r.get::<_,String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    assert_eq!(landed.len(),2);assert_eq!(f.git(&["rev-parse",TARGET]),landed[1]);
+    assert_eq!(f.git(&["rev-parse",&format!("{}^1",landed[0])]),f.base);
+    assert_eq!(f.git(&["rev-parse",&format!("{}^1",landed[1])]),landed[0]);
+    assert_eq!(f.git(&["show",&format!("{TARGET}:src/one.txt")]),"one");
+    assert_eq!(f.git(&["show",&format!("{TARGET}:src/two.txt")]),"two");
+    assert_eq!(job(&two).unwrap().1.attempts,1,"recovery observes the publication rather than integrating twice");
+    assert!(!f.project.join(".state/telemetry.db").exists());
+}
+
 #[cfg(all(feature="state-store",target_os="linux"))]
 #[test]
 fn ticker_auto_integrates_two_results_serially_and_recovers_stale_and_crash() {

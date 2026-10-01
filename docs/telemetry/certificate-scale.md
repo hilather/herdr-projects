@@ -1985,8 +1985,9 @@ certification.** No 1M run, live agent, provider, owner data directory or runnin
 Herdr service was used. Registry v4 adds `M03.operating-v1`; operating stream 1
 retains interval/clock/gap source facts and includes them in backup inventories.
 
-The telemetry worker observes every canonical project on each available ticker
-pass (nominal 15 s), including paused projects and when collection is disabled.
+The original DG3 worker observed every canonical project on each available
+ticker pass (nominal 15 s), including paused projects and when collection was
+disabled. **This scheduling/opt-in contract is superseded by DG3b in §4.17.**
 Consecutive Active endpoints in one run/control epoch merge. Pause/resume,
 restart or a gap longer than **N=3** passes closes the previous prefix; open
 tails are censored and never extrapolated. M03 clips and unions integer-ms
@@ -2080,6 +2081,209 @@ or assertion relaxed. Clippy reported no warnings in changed lines (existing
 warnings elsewhere remain). Bench datasets and preserved binaries were removed
 before committing. L1–L6 and L8 remain unchanged; 100k samples on this shared
 host do not establish authoritative 1M performance.
+
+### 4.17 DG3b: ticker isolation and explicit telemetry opt-in (100k only)
+
+Branch `telemetry/dg3-m03`, base `482f94b`, 2026-10-01. Registry remains v5.
+This repairs the DG3 operating producer integration under L7; **pending the
+steward's serial 1M certification and outside-sandbox socket regression run.**
+
+**Design and failure mechanism.** DG3 scheduled telemetry ahead of controller
+services and called `operating::observe` on every canonical project. This
+created sidecars for source-free projects, activated additional lane work, and
+held a canonical SQLite/OFD reader while opening/migrating/writing the sidecar
+on an idle-priority thread. That reader can pin canonical files while sidecar
+work waits. Accelerated 250-ms controller passes also scheduled operating
+writes instead of respecting the nominal 15-second cadence. The original
+integration fixture has no sidecar or recorded producer homes: DG3b removes
+its telemetry worker and writes entirely. Its repository is separate from the
+project, so the sidecar itself does not dirty the candidate repository. Tick
+joining already checks `is_finished`; it does not join an unfinished worker.
+The exact blocked frame in the steward's reported timeout is not established
+here because this sandbox refuses the fixture's socket bind.
+
+Telemetry now runs after controller services. Nominal cadence slots limit
+operating observations independently of collection cadence and accelerated
+controller ticks. `HERDR_PROJECTS_TELEMETRY_COLLECT_SECS=0` returns before any
+telemetry scan, worker or write. Existing sidecars are observed, including
+paused projects; absent sidecars require recorded native sources or explicit
+OTLP receiver configuration before a worker is admitted. Empty work never
+spawns a thread. A source-backed collect may opt a project in and then observe
+its first prefix. The cheap eligibility reader has zero lock-wait budget;
+contention defers collection instead of delaying the controller. The operating
+reader is dropped before opening or waiting on the sidecar writer, and its
+timestamp is captured with its state read.
+
+**Identical answers.** No evaluator, schema, registry, acceptance placement,
+coverage rule or as-of path changed. The operating transaction is factored
+without changing interval arithmetic: consecutive Active endpoints in the same
+session/control epoch merge; gaps longer than three passes split; pauses and
+restarts split; open tails stay censored. Existing observations retain identical
+M03 values. Projects without opted-in observations gain no invented duration.
+Disabled collection is again disabled telemetry. All existing telemetry golden
+values remain unchanged, and `scale_gates_hold_under_load` is unchanged.
+
+**Reproduction and measurements.** Built both binaries with §1's release
+command and ran `scale_2_queries` and `scale_9_analytics_refresh` serially with
+`SCALE_EVENTS=100000 SCALE_ACTIVE=64 SCALE_REPEATS=3 SCALE_PER_ROUND=1`, tags
+`dg3b-before|dg3b-after`. The same disk-backed `$PWD/bench-data/dg3b` dataset
+(seed 5100, 10,000 attempts, eight homes) was generated and ingested once:
+106,517 observations, 58,084,542 logical bytes, 53,725,172 rollout bytes.
+`TMPDIR=$PWD/bench-data/tmp`; one bench process at a time, no builds or tests
+overlapping samples. These surfaces do not exercise ticker scheduling, so
+this is a compatibility comparison, not evidence of a scheduler speedup.
+
+| Surface, ms (p50 / p95) | Before | After |
+| --- | ---: | ---: |
+| Report | 242.91 / 253.48 | 236.34 / 241.54 |
+| M02 terminal cohort | 278.76 / 293.41 | 290.39 / 290.86 |
+| M08 lane usage | 25.11 / 29.17 | 24.64 / 25.59 |
+| M13 coverage | 38.93 / 48.62 | 39.90 / 40.09 |
+| Pane, in process | 60.01 / 60.37 | 53.70 / 59.25 |
+| Digest section, in process | 53.90 / 65.14 | 52.71 / 52.84 |
+| Analytics refresh | 893.74 / 907.39 | 805.78 / 807.19 |
+
+Results-file load averages (1 / 5 / 15 minutes):
+
+| Phase | Start | End |
+| --- | --- | --- |
+| queries before | 1.64 / 3.00 / 3.74 | 3.65 / 3.31 / 3.82 |
+| queries after | 2.75 / 1.73 / 1.65 | 2.25 / 1.68 / 1.63 |
+| analytics-refresh before | 1.89 / 2.84 / 3.61 | 1.89 / 2.84 / 3.61 |
+| analytics-refresh after | 2.07 / 1.66 / 1.62 | 2.07 / 1.66 / 1.62 |
+
+Refresh peak RSS was 79,432 → 79,844 KiB. Both runs had zero usage-gate
+violations and unchanged canonical digests. Five- and fifteen-minute loads
+were lower afterward; these three samples do not establish a causal speedup.
+After report/M02 p95s are below doc 10's provisional 500-ms aggregate target,
+pane/digest below 250/100 ms, and memory below 256 MiB at 100k. This is neither
+doc 10's five repeated load runs nor the authoritative 1M certification.
+
+
+**Correctness and limitations.** Ran all 20 telemetry suites plus `cli`,
+`canonical_worker` and `controller`, with `--locked --offline -j 3`,
+`--no-fail-fast`, `RUST_TEST_THREADS=1` and `TMPDIR=$PWD/target/tmp`.
+The combined run returned 277 passed, 14 ignored, 64 socket-restricted failures
+and one failure in the new local recovery fixture. That fixture initially
+allowed the faulted task to run first and block serial progress; it now confirms
+the first publication before submitting the second and passes (106.83 s).
+The final reader adjustment was verified again through query and scale suites
+(19 passed, 13 ignored), including the unchanged load oracle. New E2Es exercise
+real CLI tickers for disabled byte-identical sidecars, untouched Active/paused
+projects, source-backed first collection, serial integration and lost-reply
+recovery. Existing pause/resume/restart assertions retain their cadence bounds;
+that workflow now explicitly opts into telemetry instead of setting the disable
+switch. Clippy has no warnings on changed lines; existing unrelated warnings
+remain. Bench data is removed before commit. L1–L6 and L8 stay open.
+
+The following tests failed only because socket bind is denied with
+`Operation not permitted` (some Python fixture servers report EPERM before the
+parent times out waiting for their socket). TCP receiver/integration fixtures
+are restricted too. None was bypassed or changed:
+
+`canonical_worker`:
+
+```text
+a_hidden_path_covering_the_execution_home_refuses_the_launch_before_creation
+a_launch_reaches_running_while_another_holder_takes_the_shared_root_intermittently
+a_legacy_thread_holding_the_planned_worktree_blocks_its_creation
+a_proven_worker_end_keeps_the_project_admitted_but_an_unexplained_pane_loss_pauses_it
+a_sandboxed_reviewer_uses_its_worker_channel_through_the_spool
+a_subdirectory_binding_runs_in_the_same_subdirectory_of_the_new_worktree
+a_worker_branch_reaching_a_corrupt_quarantined_object_is_refused
+an_isolated_codex_worker_commits_through_codex_workspace_write_sandbox
+an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_commits_and_submits
+an_isolated_worker_submits_only_through_its_own_spool
+an_untracked_working_directory_is_refused_before_the_approval_is_used
+canonical_attempt_sidebar_clears_after_termination_in_an_active_project
+canonical_attempt_sidebar_does_not_publish_to_a_replaced_terminal
+canonical_attempt_sidebar_refreshes_and_clears_on_pause_and_termination
+canonical_attempt_sidebar_restart_offers_no_historical_cleanup_or_native_request
+canonical_attempt_sidebar_uses_collected_usage_and_observed_waiting
+review_assignment_launches_with_blind_brief_and_records_session
+ticker_does_not_dispatch_a_launch_cancelled_before_creation
+ticker_launches_and_briefs_once_then_stops_a_cancelled_worker_while_paused_and_revoked
+ticker_launches_nothing_on_a_server_without_the_launch_contract_or_while_paused
+ticker_recovers_a_lost_creation_reply_without_creating_again
+ticker_retires_a_cancelled_gated_worker_without_starting_it
+```
+
+`cli`:
+
+```text
+canonical_ownership_cli_adopts_recorded_coordinator_without_prompting
+controller_captures_uncommitted_worker_edits_for_submission_and_verification
+hot_paths_skip_the_whole_store_check_and_the_ticker_checks_off_its_pass_then_pauses_admission_and_effects_on_corruption
+integration_releases_project_ownership_during_the_candidate_check
+launch_reserve_records_operator_reason
+native_ticker_claims_legacy_routine_and_restart_delivers_without_rerun
+operator_verify_releases_project_ownership_during_the_check
+outcome_success_path
+rejected_reservation_writes_no_decision
+ticker_auto_chain_releases_verified_integrated_and_fan_in_dependents
+ticker_auto_integrates_two_results_serially_and_recovers_stale_and_crash
+ticker_auto_verification_releases_project_ownership_during_the_check
+ticker_auto_verifies_once_and_recovers_after_kill
+ticker_canonical_notification_confirms_or_retains_ambiguity_after_owner_death
+ticker_canonical_observations_commit_cancel_and_restart_in_the_shared_pool
+ticker_coordinator_prime_confirms_or_recovers_once_across_restart
+ticker_coordinator_start_then_prime_recover_without_replaying_start
+ticker_local_and_remote_launches_acknowledge_once_and_recover_lost_replies
+ticker_native_briefs_confirm_or_recover_uncertainty_without_replay
+ticker_native_copy_publishes_announces_and_does_not_recopy_after_restart
+ticker_native_merged_finalization_resolves_and_replays_notice_after_restart
+ticker_notifications_recover_across_restart_and_reconcile_through_cli
+ticker_remote_briefs_confirm_or_recover_uncertainty_without_replay
+ticker_tokens_use_supervised_local_remote_and_coordinator_refreshes_after_restart
+```
+
+`controller`:
+
+```text
+a_malformed_ambiguous_notification_blocks_new_notifications
+a_notification_is_claimed_before_it_is_shown_and_never_shown_twice
+a_notification_is_refused_while_the_project_safety_settings_are_invalid
+a_notification_retry_is_not_delivered_before_it_is_due
+a_store_error_that_is_not_a_full_disk_or_busy_database_does_not_pause_admission
+interval_slots_are_anchored_at_the_start_counted_in_bulk_and_never_rescheduled
+missed_slots_are_skipped_or_coalesced_and_a_revision_never_reuses_an_occurrence
+the_ticker_runs_routines_only_while_active_and_never_revives_a_disabled_revision
+ticker_delivers_a_notification_once_only_while_active_and_unleased
+ticker_notifies_an_expired_wait_once_and_reserves_nothing
+ticker_reserves_a_ready_dependent_once_only_with_factory_admission_on
+ticker_runs_an_approved_routine_once_beside_one_edited_after_approval
+```
+
+`telemetry`:
+
+```text
+attempts_show_attention_summary
+```
+
+`telemetry_accounting`:
+
+```text
+attention_intervals_union_and_censor
+```
+
+`telemetry_health`:
+
+```text
+recommendations_and_notices_change_no_canonical_state_and_no_dispatch
+```
+
+`telemetry_otlp`:
+
+```text
+http_auth_limits_malformed_and_replay
+http_request_rate_is_bounded
+```
+
+`telemetry_workspace`:
+
+```text
+thread_start_records_the_dispatch_reason_and_the_sidebar_suffix
+```
 
 ## 5. Inefficiencies found and fixed
 
@@ -2331,7 +2535,12 @@ owner. None is hidden by loosening the target.
   observed operating intervals and M03 in §4.16, with 100k paired surface costs
   and a separate planted operating-signal sample. Report p95 was 466.51 →
   403.28 ms; refresh p95 was 1030.92 → 986.76 ms (different shared-host
-  loads; no causal speedup claim). Its 1M certification is pending.
+  loads; no causal speedup claim). DG3b (§4.17) restores explicit opt-in and
+  disabled-telemetry semantics and isolates operating reads from sidecar waits.
+  Its same-dataset 100k report p95 was 253.48 → 241.54 ms and refresh p95
+  907.39 → 807.19 ms; the results-file load averages are quoted there. These
+  compatibility samples do not measure controller speedup. Its 1M
+  certification is pending.
 - **L8: simulated capacity is not live capacity.** See the opening. Planted
   attempts and generated rollouts certify the telemetry path's behaviour at
   these volumes on this host, nothing about live workers or providers.

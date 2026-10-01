@@ -685,16 +685,11 @@ pub fn tick(_: &Path, _: super::codex::Budget) -> Result<()> {
     Ok(())
 }
 
-/// Optional ticker receiver: independent bounded thread, one listener per project.
-/// Configuration is scoped by slug; absent configuration performs no socket work.
-pub fn start_configured(project: &Path, config: &Path) -> Result<()> {
-    static RUNNING: std::sync::Mutex<
-        Option<BTreeMap<std::path::PathBuf, std::thread::JoinHandle<()>>>,
-    > = std::sync::Mutex::new(None);
+fn configured_settings(project: &Path, config: &Path) -> Result<Option<toml::Value>> {
     let path = config.join("config.toml");
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
     let mut text = String::new();
@@ -710,15 +705,24 @@ pub fn start_configured(project: &Path, config: &Path) -> Result<()> {
         .and_then(|t| t.get("otlp"))
         .and_then(|t| t.get("projects"))
         .and_then(|p| p.get(slug));
-    if settings
-        .and_then(|s| s.get("enabled"))
-        .and_then(toml::Value::as_bool)
-        != Some(true)
-    {
-        return Ok(());
-    }
+    Ok(settings.filter(|s| s.get("enabled").and_then(toml::Value::as_bool) == Some(true)).cloned())
+}
+
+/// Explicit receiver configuration also makes a project eligible for a ticker
+/// worker, even before its first OTLP observation has created a sidecar.
+pub fn configured(project: &Path, config: &Path) -> Result<bool> {
+    Ok(configured_settings(project, config)?.is_some())
+}
+
+/// Optional ticker receiver: independent bounded thread, one listener per project.
+/// Configuration is scoped by slug; absent configuration performs no socket work.
+pub fn start_configured(project: &Path, config: &Path) -> Result<()> {
+    static RUNNING: std::sync::Mutex<
+        Option<BTreeMap<std::path::PathBuf, std::thread::JoinHandle<()>>>,
+    > = std::sync::Mutex::new(None);
+    let Some(settings) = configured_settings(project, config)? else { return Ok(()); };
     let port = settings
-        .and_then(|s| s.get("port"))
+        .get("port")
         .and_then(toml::Value::as_integer)
         .unwrap_or(4318);
     let port = u16::try_from(port).context("invalid OTLP port")?;

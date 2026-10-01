@@ -479,9 +479,9 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
     // within and across passes instead of reloading the schema for each read.
     #[cfg(feature="state-store")]
     let _reads=herdr_projects::store::identity_inventory::reuse::pass();
-    memory.tick += 1;
     #[cfg(feature="state-store")]
-    telemetry_pass(ctx,log,&format!("{}:{}",std::process::id(),memory.started.as_nanosecond()));
+    let _telemetry_start=TELEMETRY_START.get_or_init(Instant::now);
+    memory.tick += 1;
     if let Some(reads)=memory.local_reports.as_mut(){reads.begin_pass();}
     if let Some(reads)=memory.local_observations.as_mut(){reads.begin_pass();}
     #[cfg(feature="state-store")]
@@ -649,6 +649,7 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
         any_reachable|=memory.routine_jobs.as_ref().is_some_and(|q|q.pending());
         any_reachable|=memory.copy_jobs.as_ref().is_some_and(|q|q.pending()||q.offered());
         publish_executor_metrics(&ctx.root,log,memory);
+        telemetry_pass(ctx,log,&format!("{}:{}",std::process::id(),memory.started.as_nanosecond()));
         return any_reachable;
     }
     #[cfg(not(feature="state-store"))]
@@ -662,6 +663,8 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
     }
 
 }
+#[cfg(feature="state-store")]
+static TELEMETRY_START:std::sync::OnceLock<Instant>=std::sync::OnceLock::new();
 #[cfg(feature="state-store")]
 static TELEMETRY_RUNNING:std::sync::Mutex<Option<std::thread::JoinHandle<()>>>=std::sync::Mutex::new(None);
 // Graceful shutdown preserves a whole telemetry pass, but crash-safe work must
@@ -686,48 +689,88 @@ fn drain_telemetry(log:&Log) {
     if let Some(pass)=running.take() {let _=pass.join();}
 }
 
-/// Operating observations on every available pass, followed by Codex usage
-/// collect off the poll path: at most once per interval per project
-/// (default 300 s, `HERDR_PROJECTS_TELEMETRY_COLLECT_SECS`, 0 disables), within
-/// the tick byte budget. Writes only the sidecar; never blocks canonical work.
-/// It runs on its own thread, one project at a time, so the pass never waits
-/// for it: its cost grows with retained history (docs/telemetry/certificate-scale.md
-/// §5). A project whose turn comes while another project's pass runs waits for
-/// a later ticker pass.
+#[cfg(feature="state-store")]
+#[derive(Clone,Copy,Default)]
+struct TelemetryTimes {observed:Option<u64>,collected:Option<Instant>}
+
+/// Operating observations on the nominal ticker cadence, and one due native
+/// collection per worker turn. Disabled telemetry does no work. Untouched
+/// projects need a configured collection source before any sidecar is created.
+/// Schedule after controller services; never wait for an unfinished worker.
 #[cfg(feature="state-store")]
 fn telemetry_pass(ctx:&Ctx,log:&Log,session:&str) {
+    use herdr_projects::telemetry::{codex,operating,sidecar};
+    // Canonical effects can shorten controller ticks to 250 ms. Neither the
+    // project scan nor operating writes should follow that accelerated cadence.
+    static SCAN:std::sync::Mutex<Option<(Instant,u64)>>=std::sync::Mutex::new(None);
+    // Last operating sample and collection, respectively; only this scheduler
+    // touches these clocks, so the worker never holds a scheduling mutex.
+    static LAST:std::sync::Mutex<std::collections::BTreeMap<PathBuf,TelemetryTimes>>=std::sync::Mutex::new(std::collections::BTreeMap::new());
     let secs=ctx.env.var("HERDR_PROJECTS_TELEMETRY_COLLECT_SECS").and_then(|v|v.parse().ok()).unwrap_or(300u64);
+    if secs==0 {return;}
     let Ok(mut running)=TELEMETRY_RUNNING.lock() else {return};
     if running.as_ref().is_some_and(|pass|!pass.is_finished()) {return;}
     if let Some(pass)=running.take() {let _=pass.join();}
-    let (line,root,session)=(log.clone(),ctx.root.clone(),session.to_owned());
-    let otlp_config = ctx.config_dir.clone();
+    // Cadence slots start before controller work. Comparing callback times
+    // directly can miss every other 15-s tick when a later poll is faster.
+    let slot=TELEMETRY_START.get_or_init(Instant::now).elapsed().as_secs()/TICK.as_secs();
+    let Ok(mut scan)=SCAN.lock() else {return};
+    if scan.is_some_and(|(at,old)|old==slot&&at.elapsed()<Duration::from_secs(secs)) {return;}
+    *scan=Some((Instant::now(),slot));
+    let Ok(mut last)=LAST.lock() else {return};
+    let mut observations=Vec::new();
+    let mut collections=Vec::new();
+    for slug in project::list_slugs(&ctx.root) {
+        let project=ctx.root.join(&slug);
+        if !project.join(".state/state.db").is_file() {continue;}
+        let existing=sidecar::path(&project).is_file();
+        let TelemetryTimes{observed,collected}=last.get(&project).copied().unwrap_or_default();
+        if existing && observed!=Some(slot) {
+            observations.push((slug.clone(),project.clone()));
+        }
+        if collected.is_none_or(|at|at.elapsed()>=Duration::from_secs(secs)) {
+            let configured=existing || match codex::collection_configured(&project).and_then(|native| {
+                if native {Ok(true)} else {herdr_projects::telemetry::otlp::configured(&project,&ctx.config_dir)}
+            }) {
+                Ok(configured)=>configured,
+                Err(error)=>{log.line(&format!("{slug}: telemetry sources: {error:#}"));false},
+            };
+            if configured {collections.push((slug,project,existing,collected));}
+        }
+    }
+    let due=collections.into_iter().min_by_key(|(_,_,_,at)|*at);
+    if observations.is_empty()&&due.is_none() {return;}
+    let (line,session)=(log.clone(),session.to_owned());
+    let otlp_config=ctx.config_dir.clone();
+    let scheduled_observations=observations.clone();
+    let scheduled_collection=due.as_ref().map(|(_,project,existing,_)|(project.clone(),*existing));
     let pass=std::thread::Builder::new().name("telemetry-pass".into()).spawn(move||{
-        use herdr_projects::telemetry::{codex,operating};
-        static LAST:std::sync::Mutex<std::collections::BTreeMap<PathBuf,Instant>>=std::sync::Mutex::new(std::collections::BTreeMap::new());
         herdr_projects::telemetry::background::idle_priority(|warning|line.line(warning));
-        let projects:Vec<_>=project::list_slugs(&root).into_iter().map(|slug|(slug.clone(),root.join(slug)))
-            .filter(|(_,project)|project.join(".state/state.db").is_file()).collect();
-        // Every project, including paused projects, gets an observation before
-        // any expensive lane. No sidecar writes or status reads on the controller.
-        for (slug,project) in &projects {
+        for (slug,project) in &observations {
             if let Err(error)=operating::observe_project(project,&session,TICK.as_millis() as i64) {line.line(&format!("{slug}: operating observation: {error:#}"));}
         }
-        if secs==0 {return;}
-        // At most one collection per worker turn, rotating by the oldest pass.
-        let Ok(mut last)=LAST.lock() else {return};
-        let due=projects.iter().filter(|(_,project)|last.get(project).is_none_or(|at|at.elapsed()>=Duration::from_secs(secs)))
-            .min_by_key(|(_,project)|last.get(project).copied());
-        let Some((slug,project))=due else {return};
-        last.insert(project.clone(),Instant::now());drop(last);
-        if let Err(error) = herdr_projects::telemetry::otlp::start_configured(project,&otlp_config) {line.line(&format!("{slug}: OTLP config: {error}"));}
-        if let Err(error)=codex::collect(project,codex::Budget::TICK,false) {line.line(&format!("{slug}: telemetry collect: {error:#}"));}
+        let Some((slug,project,existing,_))=due else {return};
+        if let Err(error)=herdr_projects::telemetry::otlp::start_configured(&project,&otlp_config) {line.line(&format!("{slug}: OTLP config: {error}"));}
+        if let Err(error)=codex::collect(&project,codex::Budget::TICK,false) {line.line(&format!("{slug}: telemetry collect: {error:#}"));}
+        // A source-backed collect can opt a previously untouched project in.
+        // Start its observed prefix now, without backfilling any earlier time.
+        if !existing&&sidecar::path(&project).is_file()
+            && let Err(error)=operating::observe_project(&project,&session,TICK.as_millis() as i64) {line.line(&format!("{slug}: operating observation: {error:#}"));}
         for lane in &herdr_projects::telemetry::LANES {
-            if let Err(error)=(lane.tick)(project,codex::Budget::TICK) {line.line(&format!("{slug}: telemetry {} tick: {error:#}",lane.stream));}
+            if let Err(error)=(lane.tick)(&project,codex::Budget::TICK) {line.line(&format!("{slug}: telemetry {} tick: {error:#}",lane.stream));}
         }
     });
     match pass {
-        Ok(pass)=>*running=Some(pass),
+        Ok(pass)=>{
+            let now=Instant::now();
+            for (_,project) in scheduled_observations {last.entry(project).or_default().observed=Some(slot);}
+            if let Some((project,existing))=scheduled_collection {
+                let times=last.entry(project).or_default();
+                times.collected=Some(now);
+                if !existing {times.observed=Some(slot);}
+            }
+            *running=Some(pass);
+        },
         Err(error)=>log.line(&format!("telemetry pass thread: {error}")),
     }
 }

@@ -812,7 +812,7 @@ fn ticker_records_operating_passes_pause_resume_and_restart() {
     fs::write(p.project.join("PROJECT.md"),"operating time fixture").unwrap();
     fs::write(p.project.join(".state/format.json"),"{}").unwrap();
     let start = || Ticker(Command::new(BIN).env_clear().env("HOME",p.tmp.path().join("home")).env("PATH","/usr/bin:/bin")
-        .env("HERDR_BIN_PATH","/bin/false").env("HERDR_PROJECTS_TELEMETRY_COLLECT_SECS","0")
+        .env("HERDR_BIN_PATH","/bin/false").env("HERDR_PROJECTS_TELEMETRY_COLLECT_SECS","3600")
         .args(["--root",p.root.to_str().unwrap(),"ticker","run"])
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap());
     let persisted = || -> Option<(i64,i64,i64,bool)> {
@@ -835,6 +835,7 @@ fn ticker_records_operating_passes_pause_resume_and_restart() {
         store.set_project_state(head,revision,state,jiff::Timestamp::now().as_millisecond(),None).unwrap();
     };
     state(ProjectState::Active);
+    p.json(&["collect"]); // Explicitly opt this project into telemetry.
     let mut ticker=start();
     let (_,first,_,_)=wait(&mut ticker,&|row|row.0==1);
     let (_,_,third,_)=wait(&mut ticker,&|row|row.2-first>=29_000);
@@ -859,4 +860,46 @@ fn ticker_records_operating_passes_pause_resume_and_restart() {
     assert_eq!(db.query_row("SELECT count(*) FROM operating_intervals WHERE close_reason='open'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
     let after:i64=db.query_row("SELECT sum(end_unix_ms-start_unix_ms) FROM operating_intervals",[],|r|r.get(0)).unwrap();
     assert!(after>=duration && after<=duration+16_000,"stop/restart never extrapolates a tail: {duration} -> {after}");
+}
+
+/// A real foreground ticker with no agent, sockets or producer homes. Enabled
+/// collection leaves untouched projects alone; disabling it also freezes an
+/// existing sidecar, including the operating clock and every lane table.
+#[test]
+fn ticker_telemetry_disabled_and_untouched_projects_have_no_writes() {
+    use herdr_projects::domain::ProjectState;
+    use std::time::{Duration,Instant};
+    struct Ticker(std::process::Child);
+    impl Drop for Ticker { fn drop(&mut self) { let _=self.0.kill(); let _=self.0.wait(); } }
+    for active in [false,true] {
+        for (secs,existing) in [("3600",false),("0",false),("0",true)] {
+            let p=Planted::new();
+            fs::write(p.project.join("PROJECT.md"),"isolated telemetry fixture").unwrap();
+            fs::write(p.project.join(".state/format.json"),"{}").unwrap();
+            let mut store=SqliteStore::open(&p.project.join(".state/state.db")).unwrap();
+            let head=store.read_snapshot(None).unwrap().head;
+            let revision=store.project_control().unwrap().unwrap().revision;
+            store.set_project_state(head,revision,if active {ProjectState::Active} else {ProjectState::Paused},jiff::Timestamp::now().as_millisecond(),None).unwrap();
+            drop(store);
+            if existing {
+                p.json(&["collect"]);
+                herdr_projects::telemetry::operating::observe(&p.project,"before-disable",true,1,1000,15000).unwrap();
+            }
+            let sidecar=p.project.join(".state/telemetry.db");
+            let before=existing.then(||fs::read(&sidecar).unwrap());
+            let mut ticker=Ticker(Command::new(BIN).env_clear().env("HOME",p.tmp.path().join("home")).env("PATH","/usr/bin:/bin")
+                .env("HERDR_BIN_PATH","/bin/false").env("HERDR_PROJECTS_TELEMETRY_COLLECT_SECS",secs)
+                .args(["--root",p.root.to_str().unwrap(),"ticker","run"])
+                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap());
+            let deadline=Instant::now()+Duration::from_secs(20);
+            while !p.root.join(".ticker-metrics.json").exists() {
+                assert!(Instant::now()<deadline&&ticker.0.try_wait().unwrap().is_none(),"{}",fs::read_to_string(p.root.join(".ticker.log")).unwrap_or_default());
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            fs::write(p.root.join(".ticker.stop"),b"").unwrap();
+            assert!(ticker.0.wait().unwrap().success()); // Drain any admitted telemetry.
+            if let Some(before)=before {assert_eq!(fs::read(&sidecar).unwrap(),before,"disabled sidecar changed (active={active})");}
+            else {assert!(!sidecar.exists(),"untouched sidecar created (active={active}, secs={secs})");}
+        }
+    }
 }

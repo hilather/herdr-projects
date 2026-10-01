@@ -31,6 +31,17 @@ pub fn observe(
         "invalid operating observation"
     );
     let mut db = super::sidecar::open(project, true)?.expect("created sidecar");
+    record(&mut db, session, active, control_epoch, at, cadence_ms)
+}
+
+fn record(
+    db: &mut Connection,
+    session: &str,
+    active: bool,
+    control_epoch: i64,
+    at: i64,
+    cadence_ms: i64,
+) -> Result<()> {
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let previous: Option<(i64, String, bool, i64, i64)> = tx.query_row(
         "SELECT last_unix_ms,session,active,control_epoch,cadence_ms FROM operating_clock WHERE singleton=1", [],
@@ -84,19 +95,27 @@ pub fn observe(
 }
 
 /// Read canonical project control only; operating observations grant no work.
+/// Automatic observation never creates a sidecar; collection opts projects in.
 pub fn observe_project(project: &Path, session: &str, cadence_ms: i64) -> Result<()> {
+    ensure!(!session.is_empty() && cadence_ms > 0, "invalid operating observation");
+    if !super::sidecar::path(project).is_file() { return Ok(()); }
     let db = super::read_only(&project.join(".state/state.db"))?;
     let (state, epoch): (String, i64) = db.query_row(
         "SELECT state,epoch FROM project_control WHERE singleton=1",
         [],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    observe(
-        project,
+    let at = jiff::Timestamp::now().as_millisecond();
+    // Release the canonical SQLite/OFD reader before opening or waiting on
+    // the sidecar writer. Sidecar contention must not pin canonical files.
+    drop(db);
+    let Some(mut sidecar) = super::sidecar::open(project, false)? else { return Ok(()); };
+    record(
+        &mut sidecar,
         session,
         state == "active",
         epoch,
-        jiff::Timestamp::now().as_millisecond(),
+        at,
         cadence_ms,
     )
 }
