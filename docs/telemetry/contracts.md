@@ -62,6 +62,33 @@ needs a new reviewed revision, not a silent reinterpretation.
   contracts-collection.md A6–A8), mode 0600, created on first collect. No
   cross-database transaction or foreign key; sidecar rows reference canonical
   IDs by value and record `orphan` when the canonical row is missing.
+- **Sidecar durability and bounded collection (P4).** Writer connections use
+  WAL with `synchronous=FULL`. `NORMAL` was evaluated and rejected: the core
+  TM2.6 certificate's R4 says valuation revision history and live attention
+  samples cannot be regenerated from rollouts, and imports must be retained
+  separately. Losing acknowledged transactions on power loss would weaken
+  that contract and earlier as-of evidence. Canonical commits are unchanged.
+  The ticker collector commits at complete-line boundaries after at most
+  2,000 input lines or reaching 8 MiB for ordinary first-collection and append
+  tails; one complete line can cross the byte threshold
+  (the existing 16 MiB parse/whole-line skip rule stays intact). This is a
+  bound on collector input per transaction, not a claim about WAL size or all
+  lane transactions. Foreground CLI collection retains its whole-rollout
+  transaction (256 MiB total budget). Byte-zero re-reads retain the original
+  budget-bounded transaction so `predates_ingest` gaps, which have no prefix
+  envelopes, cannot be incorrectly recovered after a kill. Each batch atomically stores
+  the observations, native ordinals/model/turn state and both cursors. A kill rolls back only the
+  unfinished batch; earlier prefixes remain durable and resume without
+  duplicate acceptance. Failed-write coverage remains pending until its
+  entire range has committed, even across batches. Binding updates commit
+  at most 1,000 sources (two writes each) under an immediate lock. Ledger
+  projections, quota state and their shared watermark remain atomic; analytics
+  revisions and lineage remain in their contracted immediate transaction.
+  Those larger semantic transactions are a residual contention risk.
+  The ticker worker alone uses Linux `SCHED_IDLE`, nice 19 and I/O idle class;
+  lane subprocesses inherit these priorities through the existing spawn gate.
+  Setting priority is advisory, with one failure log per process; collection
+  and every lane continue. Foreground CLI calls keep their caller's priority.
 - **Reads.** `attempts`, `usage`, `report`, the fleet pane, `doctor` and the
   collector's canonical read open `state.db` and `telemetry.db` strictly
   read-only and create no file (`telemetry::read_only`): first an advisory

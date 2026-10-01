@@ -306,17 +306,13 @@ fn evaluate_rule(ctx: &mut Ctx, rule: &'static Rule) -> Result<Vec<Outcome>> {
         }
         Eval::AfterTermination => {
             let metric = lane_metric(rule.source);
-            let v = crate::telemetry::sidecar::report(ctx.project)?;
-            let attempts: Vec<&Value> = v["attempts"].as_array().into_iter().flatten().collect();
-            let records: i64 = attempts.iter().filter_map(|a| a["after_termination"]["records"].as_i64()).sum();
-            let affected = attempts.iter().filter(|a| a["after_termination"]["records"].as_i64().is_some_and(|n| n > 0)).count();
-            let missing = attempts.iter().find(|a| a["after_termination"]["status"] == "unavailable");
-            if records == 0 {
-                if let Some(a) = missing { return Ok(vec![unknown(rule, a["after_termination"]["reason"].as_str().unwrap_or("unavailable"), metric, unbounded(now))]); }
-                if crate::telemetry::sidecar::read(ctx.project)?.is_none() { return Ok(vec![unknown(rule, "collection_not_run", metric, unbounded(now))]); }
+            let v = crate::telemetry::sidecar::after_termination_summary(ctx.project)?;
+            let records = v["records"].as_i64().unwrap_or(0);
+            if records == 0 && let Some(reason) = v["missing_reason"].as_str() {
+                return Ok(vec![unknown(rule, reason, metric, unbounded(now))]);
             }
             outcome(rule, if records > 0 { State::Warn } else { State::Ok }, vec![code(if records > 0 { "usage_after_termination" } else { "none_observed" })],
-                metric, unbounded(now), json!({"records": records, "attempts": affected, "accounting": "still counted in M08", "partial_observation": missing.is_some()}))
+                metric, unbounded(now), json!({"records": records, "attempts": v["attempts"], "accounting": "still counted in M08", "partial_observation": !v["missing_reason"].is_null()}))
         }
         Eval::Conflicts => {
             let metric = lane_metric(rule.source);
@@ -402,43 +398,55 @@ fn evaluate_rule(ctx: &mut Ctx, rule: &'static Rule) -> Result<Vec<Outcome>> {
         Eval::Quota => {
             let metric = lane_metric(rule.source);
             let Some(db) = crate::telemetry::sidecar::read(ctx.project)? else { return Ok(vec![unknown(rule, "collection_not_run", metric, unbounded(now))]) };
-            let v = crate::telemetry::accounting::quota::read(ctx.project, &db)?;
-            if v["status"] == "unavailable" { return Ok(vec![unknown(rule, v["reason"].as_str().unwrap_or("unavailable"), metric, unbounded(now))]); }
-            let windows: Vec<&Value> = v["windows"].as_array().into_iter().flatten().collect();
-            if windows.is_empty() { return Ok(vec![unknown(rule, "no_quota_observation", metric, unbounded(now))]); }
-            let current: Vec<(&Value, i64)> = windows.iter().filter(|w| w["resets_unix_ms"].as_i64().is_some_and(|r| r > now))
-                .filter_map(|w| Some((*w, milli(w["remaining"].as_str()?)?))).collect();
-            let Some(&(lowest, remaining)) = current.iter().min_by_key(|(w, m)| (*m, w["resets_unix_ms"].as_i64())) else {
-                let last = windows.iter().filter_map(|w| w["resets_unix_ms"].as_i64()).max();
+            if !crate::telemetry::accounting::quota::synced(&db)? {
+                return Ok(vec![unknown(rule, "ledger_not_synced", metric, unbounded(now))]);
+            }
+            let (windows, latest_reset): (i64, Option<i64>) = db.query_row("SELECT count(*),max(resets_unix_ms) FROM quota_windows", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            if windows == 0 { return Ok(vec![unknown(rule, "no_quota_observation", metric, unbounded(now))]); }
+            // Only the current windows, streamed in the quota read's original
+            // order. No dispatch-history M40 JSON or historical windows.
+            // Keep milli's exact validation; SQLite REAL casts would accept
+            // extra precision and malformed decimals that the rule excludes.
+            let mut stmt = db.prepare("SELECT remaining,used,unit,window_kind,window_minutes,window_start_unix_ms,resets_unix_ms,last_observed_unix_ms
+                FROM quota_windows WHERE resets_unix_ms>?1 ORDER BY account,limit_id,window_kind,resets_unix_ms")?;
+            let mut rows = stmt.query([now])?;
+            let (mut current, mut below_warn, mut lowest) = (0usize, 0usize, None::<(Value, i64, i64)>);
+            while let Some(row) = rows.next()? {
+                let remaining_text: String = row.get(0)?;
+                let Some(remaining) = milli(&remaining_text) else { continue };
+                let resets: i64 = row.get(6)?;
+                current += 1;
+                below_warn += usize::from(remaining < rule.warn);
+                if lowest.as_ref().is_none_or(|(_, m, r)| (remaining, resets) < (*m, *r)) {
+                    lowest = Some((json!({"remaining": remaining_text, "used": row.get::<_, String>(1)?, "unit": row.get::<_, String>(2)?,
+                        "window_kind": row.get::<_, String>(3)?, "window_minutes": row.get::<_, i64>(4)?, "window_start_unix_ms": row.get::<_, i64>(5)?,
+                        "resets_unix_ms": resets, "last_observed_unix_ms": row.get::<_, i64>(7)?}), remaining, resets));
+                }
+            }
+            let Some((lowest, remaining, _)) = lowest else {
                 return Ok(vec![outcome(rule, State::Unknown, vec![code("no_current_window")], metric, unbounded(now),
-                    json!({"windows": windows.len(), "latest_reset_unix_ms": last, "detail": "every observed window has reset: the new window's headroom is unknown"}))]);
+                    json!({"windows": windows, "latest_reset_unix_ms": latest_reset, "detail": "every observed window has reset: the new window's headroom is unknown"}))]);
             };
             let state = grade(rule, |_| false, |t| remaining < t);
             let reason = if remaining == 0 { "window_exhausted" } else if state == State::Ok { "headroom_ok" } else { "headroom_low" };
             let last = lowest["last_observed_unix_ms"].as_i64().unwrap_or(now);
             outcome(rule, state, vec![json!({"code": reason, "remaining": lowest["remaining"]})], metric,
                 json!({"from_unix_ms": lowest["window_start_unix_ms"], "to_unix_ms": lowest["resets_unix_ms"], "semantics": "quota_window", "observed_unix_ms": last}),
-                json!({"current_windows": current.len(), "below_warn": current.iter().filter(|(_, m)| *m < rule.warn).count(), "account_basis": v["account_basis"],
+                json!({"current_windows": current, "below_warn": below_warn, "account_basis": crate::telemetry::accounting::quota::ACCOUNT_BASIS,
                     "lowest": {"remaining": lowest["remaining"], "used": lowest["used"], "unit": lowest["unit"], "window_kind": lowest["window_kind"],
                         "window_minutes": lowest["window_minutes"], "resets_unix_ms": lowest["resets_unix_ms"], "last_observed_unix_ms": last, "age_ms": now - last},
-                    "semantics": v["semantics"]}))
+                    "semantics": "not_certified"}))
         }
         Eval::Waiting => {
             let metric = lane_metric(rule.source);
             let Some(db) = crate::telemetry::sidecar::read(ctx.project)? else { return Ok(vec![unknown(rule, "collection_not_run", metric, unbounded(now))]) };
-            let v = crate::telemetry::accounting::attention::read(ctx.project, &db)?;
-            let attempts: Vec<&Value> = v["attempts"].as_array().into_iter().flatten().collect();
-            if v["metrics"]["M32"]["value"]["reason"] == "attention_not_collected" { return Ok(vec![unknown(rule, "attention_not_collected", metric, unbounded(now))]); }
-            let open: Vec<&&Value> = attempts.iter().filter(|a| a["state"] == "open").collect();
-            let not_observed = open.iter().filter(|a| a["attention"]["status"] == "unavailable").count();
-            let waits: Vec<(i64, i64)> = open.iter().flat_map(|a| a["attention"]["intervals"].as_array().into_iter().flatten())
-                .filter(|i| i["end"] == "open_at_horizon" && i["closed_unix_ms"].is_null())
-                .filter_map(|i| Some((i["opened_unix_ms"].as_i64()?, i["last_observed_unix_ms"].as_i64()?))).collect();
-            let evidence = |longest: Option<(i64, i64)>| json!({"open_attempts": open.len(), "waiting_attempts": waits.len(), "not_observed": not_observed,
-                "longest_wait_ms": longest.map(|(o, l)| l - o), "scope": "human_routed_waits", "signal": v["signal"]["certified"]});
-            if open.is_empty() { return Ok(vec![outcome(rule, State::Ok, vec![code("no_open_attempts")], metric, unbounded(now), evidence(None))]); }
-            let longest = waits.iter().copied().max_by_key(|(o, l)| (l - o, -o));
-            if longest.is_none() && not_observed == open.len() {
+            let Some((open, not_observed, waits, longest)) = crate::telemetry::accounting::attention::open_wait_summary(ctx.project, &db)? else {
+                return Ok(vec![unknown(rule, "attention_not_collected", metric, unbounded(now))]);
+            };
+            let evidence = |longest: Option<(i64, i64)>| json!({"open_attempts": open, "waiting_attempts": waits, "not_observed": not_observed,
+                "longest_wait_ms": longest.map(|(o, l)| l - o), "scope": "human_routed_waits", "signal": crate::telemetry::accounting::attention::signal()["certified"]});
+            if open == 0 { return Ok(vec![outcome(rule, State::Ok, vec![code("no_open_attempts")], metric, unbounded(now), evidence(None))]); }
+            if longest.is_none() && not_observed == open {
                 return Ok(vec![outcome(rule, State::Unknown, vec![code("not_observed")], metric, unbounded(now), evidence(None))]);
             }
             let ms = longest.map_or(0, |(o, l)| l - o);

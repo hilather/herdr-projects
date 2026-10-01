@@ -51,7 +51,10 @@ Phases: `scale_0_generate`, `scale_1_ingest`, `scale_2_queries`
 (`SCALE_REPEATS`, `SCALE_PER_ROUND`), `scale_3_controller` (`SCALE_REPEATS`,
 `SCALE_BLOCK_S`, `SCALE_CADENCE_MS`, `SCALE_READER_MS`,
 `SCALE_SQLITE_MEMSTATUS`), `scale_4_freshness_burst` (`SCALE_CADENCE_MS`),
-`scale_5_faults`, `scale_6_fairness` and `scale_7_late_slow`. Each writes `results-<phase>[-<tag>].json` in the dataset
+`scale_5_faults`, `scale_6_fairness`, `scale_7_late_slow`,
+`scale_8_accounting_pass` and `scale_9_health_evaluate`
+(`SCALE_REPEATS`, `SCALE_TAG`, optional `SCALE_HEALTH_BIN` for a preserved
+pre-change CLI). Each writes `results-<phase>[-<tag>].json` in the dataset
 directory. The gate test (§3) runs in the ordinary suite:
 `cargo test --features state-store --test telemetry_scale`.
 
@@ -760,6 +763,98 @@ Clippy completed with zero warnings in changed lines; existing unrelated
 warnings remain. Temporary instrumentation, wrappers and all `bench-data/`
 datasets were removed before the final commit.
 
+### 4.7 P4 controller and health follow-up (100k only)
+
+**Pending the steward's serial 1M certification. L1 remains open.** Branch
+`perf/controller-overhead`, same host and release build command as §1,
+`SCALE_EVENTS=100000 SCALE_ACTIVE=64`. No 1M run was performed. The seed-5100
+initial dataset, including planted producer facts and fixture homes, was
+archived immediately after generation and restored at the same absolute
+paths before the final after-ingest run. Both controller runs start from
+that dataset after `scale_1_ingest`, before live appends, with identical
+workload knobs. All measurement files lived under `$PWD/bench-data/` on disk;
+no build overlapped a benchmark and only one benchmark process ran at once.
+
+`scale_3_controller`: `SCALE_REPEATS=5 SCALE_BLOCK_S=30
+SCALE_CADENCE_MS=15000 SCALE_READER_MS=5000`, SQLite memory statistics off.
+The harness's pass thread now applies the ticker worker's idle scheduling;
+controller and operator-reader scheduling stay unchanged. Alternating block
+order and ingress match §4.2; operator surfaces were not optimized by P4.
+
+| operation | before off p50 / p95 (ms) | before on p50 / p95 (ms) | after off p50 / p95 (ms) | after on p50 / p95 (ms) |
+| --- | --- | --- | --- | --- |
+| admission | 8.03 / 17.40 | 9.72 / 21.00 | 8.94 / 17.02 | 11.28 / 24.78 |
+| reconciliation | 3.30 / 28.46 | 4.23 / 32.60 | 3.72 / 17.28 | 4.20 / 17.57 |
+
+Telemetry-on overhead (p50 / p95): admission **+21.05% / +20.69% →
++26.17% / +45.59%**; reconciliation **+28.18% / +14.55% →
++12.90% / +1.68%**. Sample counts off/on: 1,446/1,461 before,
+1,496/1,483 after. The fixed doc 10 targets remain +5% / +10%; admission
+misses both and reconciliation misses p50 in this run. Neither a target
+pass nor a controller improvement is certified.
+
+| per-block coefficient of variation | before off / on | after off / on |
+| --- | --- | --- |
+| admission p50 | 20.66% / 27.26% | 10.33% / 14.52% |
+| admission p95 | 33.37% / 24.83% | 17.62% / 26.94% |
+| reconciliation p50 | 98.92% / 80.85% | 58.82% / 18.17% |
+| reconciliation p95 | 63.79% / 97.58% | 65.24% / 53.11% |
+
+Loadavg (1/5/15-minute averages) from `results-controller-before.json`:
+`6.14 6.71 6.45` → `2.44 4.10 5.38`; from
+`results-controller-after.json`: `4.95 10.12 10.71` → `4.70 6.08 8.59`.
+Block variability exceeds the before/after change in overhead (about
+5/25 percentage points for admission, 15/13 for reconciliation):
+**inconclusive for a controller improvement or regression** on this noisy,
+shared host. Both phases reported zero correctness violations. Idle
+scheduling cannot remove operator-surface CPU or all fsync contention.
+
+`scale_9_health_evaluate`, three foreground public CLI evaluations each,
+compares the preserved pre-change release CLI (`SCALE_HEALTH_BIN`) against
+the final CLI on the identical prepared after-ingest store, before the
+controller's live appends. Rules now count after-termination usage without
+whole-history usage JSON, stream current quota windows without M40 dispatch
+JSON, and derive waiting intervals one open attempt at a time. The same
+classification, exact decimal validation, tie order and attention horizon
+are retained; this measures health evaluation, not whole-pass memory.
+
+| health evaluation | before | after |
+| --- | --- | --- |
+| peak RSS, three-run range (KiB) | 178,332–179,052 | 139,856–139,952 |
+| maximum peak RSS (MiB) | 174.86 | 136.67 (21.84% lower) |
+| wall p50 / p95 (ms) | 8,064.42 / 9,295.59 | 6,553.62 / 7,954.06 |
+| wall CV | 14.08% | 19.07% |
+| loadavg start → end (1/5/15 minutes) | `6.93 11.95 11.30` → `6.61 11.38 11.13` | `5.88 10.98 11.01` → `5.59 10.50 10.85` |
+
+The RSS reduction is consistent in all three samples. The wall-time change
+is **inconclusive**: noise and falling load exceed the p50 improvement.
+Both health phases retained the canonical digest and reported zero gate
+violations. No 1M health or whole-pass RSS claim follows from these samples.
+
+Cold foreground collection (one sample each, CLI transaction scope retained)
+was 22.09 → 31.68 s, 4,523 → 3,155 rollout events/s, 2.319 → 1.617 MiB/s.
+Before prepare loadavg: `6.54 7.01 6.52` → `5.88 6.77 6.46`; after:
+`11.01 13.79 11.76` → `9.69 12.93 11.59`. These cold-cursor runs did not
+flush the page cache and do not establish a throughput improvement.
+Both ingests reported exact totals, zero gate violations and an unchanged
+canonical digest.
+
+P4 validation: the required fifteen telemetry suites had **172 passed,
+11 ignored, four sandbox-only failures** at Unix-socket binds (`Operation
+not permitted`): `telemetry::attempts_show_attention_summary`,
+`telemetry_accounting::attention_intervals_union_and_censor`,
+`telemetry_health::recommendations_and_notices_change_no_canonical_state_and_no_dispatch`,
+and `telemetry_workspace::thread_start_records_the_dispatch_reason_and_the_sidebar_suffix`.
+The unchanged `scale_gates_hold_under_load` and new real-ticker kill/resume
+workflow passed. The latter kills after a durable partial rollout prefix,
+checks both cursors agree, resumes to exact totals/one acceptance per record,
+reproduces a pinned as-of answer and byte-identical ledger rebuild, and
+checks telemetry leaves the canonical digest unchanged. The existing quota
+health workflow also checks expired/extra-precision windows and stable ties
+through public health evaluation and persisted alerts. Existing expected
+values and the gate body are unchanged. Clippy completed with no diagnostics
+on changed lines (existing warnings remain elsewhere).
+
 ## 5. Inefficiencies found and fixed
 
 The first measurement (same generator, same host) missed the query and
@@ -782,6 +877,10 @@ stream-version expectations (§9).
 | F9 | `main.rs` | with the pass on a thread (F8), SQLite's memory statistics made every allocation of both threads take one process-wide mutex | statistics off in every build of the binary, as the crate's tests already do; nothing reads them |
 | F10 (P3) | `workspace`, attempt/attention reads, analytics rendering projections | whole-history reports and repeated rich projections on every pane/digest read | one targeted shared projection, recorded history with `as_of`, bounded digest reads; 100k results in §4.6, pending steward 1M certification |
 | F11 (P3c) | analytics append, sidecar migration | whole-history serialization/rendering and redundant projection/migration work while holding the writer lock | pre-serialized bodies/lineage, cached SQL, changed/missing rendering rows only, read-first version check; §4.9 has 100k lock timings, pending steward 1M certification |
+
+| F10 (P4) | `telemetry/background.rs`, ticker and benchmark pass workers | background CPU/I/O competes with canonical controller commits | calling thread uses Linux SCHED_IDLE, nice 19 and I/O idle class; failures log once and never fail a pass; inherited by gated lane subprocesses |
+| F11 (P4) | `codex.rs` collector/binding | ordinary ticker tails and binding updates hold large write transactions | complete-line prefixes at 2,000 lines / 8 MiB input, atomic cursors and parser state; bindings in 1,000-source batches; FULL durability retained; foreground CLI and byte-zero replay scopes retained; larger semantic lane transactions remain |
+| F12 (P4) | health after-termination, quota and waiting rules | whole-history JSON built for small diagnostics, beyond F7's grouped count | reuse per-attempt after-termination query, SQL count/current-window stream, per-open-attempt attention derivation; exact decimal and tie semantics retained (§4.7) |
 
 F8 preserves graceful shutdown of the whole pass: stop-file and idle exits poll
 the running telemetry thread for up to 60 s (`TELEMETRY_SHUTDOWN_WAIT`), logging
@@ -848,9 +947,17 @@ owner. None is hidden by loosening the target.
   (seconds-long reconcile stalls). Absolute controller latencies stay below
   25 ms at p95 in the configured runs, against a 15 s ticker pass; no
   admission, reservation or commit failed and no controller operation was
-  reordered. Remedies (not built): incremental ledger sync and analytics
-  (L4), a pane that reads recorded revisions (L5), a lower CPU and I/O
-  priority for the telemetry thread, or the sidecar on another device.
+  reordered. **P4 follow-up: idle CPU/I/O scheduling and bounded ticker
+  collection/binding commits implemented (F10–F11). At 100k/64, admission
+  overhead p50/p95 +21.05%/+20.69% → +26.17%/+45.59%; reconciliation
+  +28.18%/+14.55% → +12.90%/+1.68%, inconclusive under block noise and
+  pending the steward's 1M certification (§4.7). L1 remains open.** FULL
+  durability stays in force: core R4's live attention and valuation history
+  are not re-collectable. Ordinary ticker tails are bounded, but byte-zero
+  replay and foreground collection retain their scopes; accounting and
+  analytics watermark/revision transactions remain atomic. Remaining
+  remedies: incremental lane work (L4), cheaper operator surfaces (L5, P3),
+  or a separate sidecar device.
   Owners: accounting and analytics lanes, TM4.8, ticker steward.
 - **L2: freshness.** By default the ticker collects once per 300 s per
   project, so a derived view is up to five minutes old by design. Even with
@@ -879,8 +986,13 @@ owner. None is hidden by loosening the target.
   not collection. **Accounting P1 follow-up: 40.4 → 18.5 MiB peak RSS
   over three 100k/64 incremental-pass samples, pending the steward's 1M
   certification** (§4.6; load before 6.55–6.19, after 1.64–1.59). Full
-  invalidation rebuilds remain; analytics/health and whole-pass RSS are not
-  certified by this change. Remaining remedy: incremental refresh (L2).
+  invalidation rebuilds remain; analytics and whole-pass RSS are not
+  certified by that change. **Health P4 follow-up: 174.86 → 136.67 MiB
+  maximum peak RSS over three 100k/64 samples (F12), pending the steward's
+  1M certification (§4.7).** Timing is inconclusive at 14–19% CV; health load
+  before `6.93 11.95 11.30` → `6.61 11.38 11.13`, after
+  `5.88 10.98 11.01` → `5.59 10.50 10.85`. Neither change certifies
+  whole-pass memory. Remaining remedy: incremental refresh (L2).
 - **L5: the fleet pane and the digest section take seconds, not 250 ms / 100
   ms.** At 64 active attempts with 10,000 retained ones, one snapshot builds
   the full attempt projection three times (the active list, `compare`,

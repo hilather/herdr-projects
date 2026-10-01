@@ -135,13 +135,17 @@ impl Ledger {
     }
 
     /// Advance the cursor to `offset`; gaps inside the range read this pass are recovered.
+    /// A failed-write range may span several committed prefixes: once its end
+    /// is reached, every byte up to it has been collected. Predates-ingest gaps
+    /// still require a re-read covering their start; final-event gaps require
+    /// their completing event.
     pub fn finish(&self, db: &Connection, producer: Option<&str>, offset: u64, now: i64) -> Result<()> {
         db.execute("INSERT INTO source_cursors(source,producer_id,byte_offset,observations,updated_unix_ms)
             VALUES(?1,?2,?3,(SELECT count(*) FROM source_observations WHERE producer_epoch=?1),?4)
             ON CONFLICT(source) DO UPDATE SET producer_id=excluded.producer_id,byte_offset=excluded.byte_offset,observations=excluded.observations,updated_unix_ms=excluded.updated_unix_ms",
             params![self.source, producer.map(|p| format!("codex:{p}")), offset as i64, now])?;
         // A missing final event is recovered only by the event itself (`turn_completed`), not by reading its range.
-        db.execute("UPDATE coverage_gaps SET recovery='recovered',observed_unix_ms=?4 WHERE source=?1 AND recovery='pending' AND start_offset>=?2 AND end_offset<=?3
+        db.execute("UPDATE coverage_gaps SET recovery='recovered',observed_unix_ms=?4 WHERE source=?1 AND recovery='pending' AND (start_offset>=?2 OR reason='sidecar_write_failed') AND end_offset<=?3
             AND reason<>'final_event_missing'", params![self.source, self.start as i64, offset as i64, now])?;
         Ok(())
     }

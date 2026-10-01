@@ -80,6 +80,9 @@ pub fn open(project: &Path, create: bool) -> Result<Option<Connection>> {
     let mut db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
     db.busy_timeout(std::time::Duration::from_secs(5))?;
     db.pragma_update(None, "journal_mode", "WAL")?;
+    // Retain FULL durability: valuation revisions and live attention samples
+    // are not reproducible from rollouts (certificate-core.md R4).
+    db.pragma_update(None, "synchronous", "FULL")?;
     migrate(&mut db)?;
     Ok(Some(db))
 }
@@ -202,6 +205,26 @@ pub(super) fn after_termination(db: &Connection, attempt: &str, terminated: Opti
         WHERE t.record_unix_ms>?2 AND EXISTS(SELECT 1 FROM rollout_sources s WHERE s.path_digest=u.path_digest AND s.binding='bound' AND s.attempt_id=?1)",
         rusqlite::params![attempt, at], |r| Ok((r.get(0)?, r.get(1)?)))?;
     Ok(if records == 0 { Value::Null } else { json!({"records": records, "first_unix_ms": first, "terminated_unix_ms": at}) })
+}
+
+/// Health's diagnostic count, using the same per-attempt after-termination
+/// rule without constructing unrelated usage/session JSON for all history.
+pub(crate) fn after_termination_summary(project: &Path) -> Result<Value> {
+    let attempts = super::codex::canonical_attempts(project)?;
+    let Some(db) = read(project)? else {
+        return Ok(json!({"records": 0, "attempts": 0, "missing_reason": "collection_not_run"}));
+    };
+    let (mut records, mut affected, mut missing) = (0i64, 0usize, None::<String>);
+    for attempt in attempts {
+        let value = after_termination(&db, &attempt.id, attempt.terminated_unix_ms())?;
+        let n = value["records"].as_i64().unwrap_or(0);
+        records += n;
+        affected += usize::from(n > 0);
+        if value["status"] == "unavailable" && missing.is_none() {
+            missing = value["reason"].as_str().map(str::to_owned);
+        }
+    }
+    Ok(json!({"records": records, "attempts": affected, "missing_reason": missing}))
 }
 
 pub(super) fn attempt_usage(db: &Connection, attempt: &str) -> Result<Value> {

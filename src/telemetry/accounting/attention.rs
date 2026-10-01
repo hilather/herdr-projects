@@ -51,9 +51,13 @@ struct Bound {
 }
 
 /// Attempts with a `runtime.launch_started` receipt (the latest per attempt), in attempt order.
-fn bindings(project: &Path) -> Result<Vec<Bound>> { bindings_selected(project, None) }
+fn bindings(project: &Path) -> Result<Vec<Bound>> { bindings_filtered(project, None, false) }
 
-fn bindings_selected(project: &Path, selected: Option<&BTreeSet<String>>) -> Result<Vec<Bound>> {
+fn bindings_selected(project: &Path, selected: Option<&BTreeSet<String>>) -> Result<Vec<Bound>> { bindings_filtered(project, selected, false) }
+
+fn bindings_scoped(project: &Path, open_only: bool) -> Result<Vec<Bound>> { bindings_filtered(project, None, open_only) }
+
+fn bindings_filtered(project: &Path, selected: Option<&BTreeSet<String>>, open_only: bool) -> Result<Vec<Bound>> {
     let path = project.join(".state/state.db");
     if !path.exists() { return Ok(Vec::new()); }
     let db = crate::telemetry::read_only(&path)?;
@@ -62,7 +66,9 @@ fn bindings_selected(project: &Path, selected: Option<&BTreeSet<String>>) -> Res
         "(SELECT min(l.unix_ms) FROM attempt_lifecycle l WHERE l.attempt_id=a.id AND l.state IN ('completed','failed','cancelled','lost'))"
     } else { "NULL" };
     let decided = if table("dispatch_decisions")? { "(SELECT d.decided_unix_ms FROM dispatch_decisions d WHERE d.attempt_id=a.id)" } else { "NULL" };
-    let filter = if selected.is_some() { " WHERE a.id IN (SELECT value FROM json_each(?1))" } else { " WHERE ?1 IS NULL" };
+    let mut conditions = vec![if selected.is_some() { "a.id IN (SELECT value FROM json_each(?1))" } else { "?1 IS NULL" }];
+    if open_only { conditions.push("a.termination_observed=0 AND a.state IN ('launching','running','awaiting_input')"); }
+    let filter = format!(" WHERE {}", conditions.join(" AND "));
     let sql = format!("WITH started AS (SELECT json_extract(payload,'$.attempt') AS attempt,max(sequence) AS sequence FROM events
         WHERE kind='runtime.launch_started' GROUP BY 1)
         SELECT a.id,a.task_id,a.state,a.termination_observed,e.payload,{ended},{decided} FROM started s JOIN events e ON e.sequence=s.sequence
@@ -355,6 +361,34 @@ fn attention_json(b: &Bound, derived: Option<&Derived>) -> Value {
                 "closed_unix_ms": i.closed, "end": i.end, "gap_reason": i.gap, "duration_ms": i.duration(), "counted": i.counted})).collect::<Vec<_>>(),
             "gaps": gaps(d), "interventions": d.interventions(), "uncertain_starts": d.uncertain(), "waiting_ms": d.waiting_ms(), "observed_ms": d.resolved_ms()}),
     }
+}
+
+/// Health's open-wait summary. Reuse interval derivation, one open attempt at
+/// a time, without materializing ended histories, fleet metrics or report JSON.
+pub(crate) type OpenWaitSummary = (usize, usize, usize, Option<(i64, i64)>);
+
+pub(crate) fn open_wait_summary(project: &Path, db: &Connection) -> Result<Option<OpenWaitSummary>> {
+    if !collected(db)? { return Ok(None); }
+    let bound = bindings_scoped(project, true)?;
+    // As attention::read, use the attention read's wall-clock horizon, not
+    // the earlier health evaluation timestamp used for look-back windows.
+    let now = jiff::Timestamp::now().as_millisecond();
+    let (mut missing, mut waiting, mut longest) = (0usize, 0usize, None::<(i64, i64)>);
+    let mut stmt = db.prepare("SELECT observed_unix_ms,state,gap,interval_ms FROM attention_samples WHERE attempt_id=?1 ORDER BY observed_unix_ms,rowid")?;
+    for b in &bound {
+        let samples = stmt.query_map([&b.attempt], |r| {
+            let state = match r.get::<_, Option<String>>(1)? { Some(state) => Ok(state), None => Err(r.get::<_, Option<String>>(2)?.unwrap_or_default()) };
+            Ok(Sample { at: r.get(0)?, state, interval: r.get(3)? })
+        })?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let d = derive(b, &samples, now);
+        missing += usize::from(!d.observed);
+        for i in d.intervals.iter().filter(|i| i.end == "open_at_horizon" && i.closed.is_none()) {
+            waiting += 1;
+            let candidate = (i.opened, i.last);
+            if longest.is_none_or(|(o, l)| (candidate.1 - candidate.0, -candidate.0) >= (l - o, -o)) { longest = Some(candidate); }
+        }
+    }
+    Ok(Some((bound.len(), missing, waiting, longest)))
 }
 
 /// `accounting attention`: per launched attempt its intervals, gaps and

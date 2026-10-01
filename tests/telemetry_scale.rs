@@ -731,6 +731,92 @@ fn scale_gates_hold_under_load() {
     assert_eq!(canonical_digest(&d), canonical, "telemetry wrote the canonical store");
 }
 
+/// Real ticker CLI: kill after a committed prefix of one long rollout, then
+/// resume through the ticker and compare exact usage and ledger replay bytes.
+#[test]
+fn ticker_batched_telemetry_resumes_after_kill() {
+    struct Ticker(std::process::Child);
+    impl Drop for Ticker { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+    let mut d = generate(Fixture::new(), Scale { attempts: 200, active: 4, events: 4_000, homes: 4, seed: 54 });
+    let _cleanup = Cleanup(d.base.clone());
+    fs::write(d.project.join("PROJECT.md"), "ticker batch fixture\n").unwrap();
+    fs::write(d.project.join(".state/format.json"), "{}").unwrap();
+    // This fixture exercises telemetry, with controller admission disabled.
+    rusqlite::Connection::open(d.state()).unwrap().execute("UPDATE project_control SET state='paused',factory_admission='off'", []).unwrap();
+    telemetry(&d, &["collect"]).ok();
+    telemetry(&d, &["accounting", "sync"]).ok();
+    telemetry(&d, &["analytics", "refresh"]).ok();
+    let revisions = telemetry(&d, &["analytics", "revisions", "--metric", "M08"]).ok().json();
+    let seq = revisions["revisions"].as_array().unwrap().last().unwrap()["revision"].as_i64().unwrap();
+    let pinned = |d: &Dataset| {
+        let mut v = telemetry(d, &["query", "--metric", "M08", "--as-of-seq", &seq.to_string(), "--json"]).ok().json();
+        v.as_object_mut().unwrap().remove("query_unix_ms");
+        for key in ["current_revision", "restated", "superseded_by"] { v["results"][0]["projection"].as_object_mut().unwrap().remove(key); }
+        v
+    };
+    let before = pinned(&d);
+    let file = d.active[0].path.clone();
+    let key = format!("sha256:{}", hex(file.to_str().unwrap()));
+    let initial = fs::metadata(&file).unwrap().len();
+    d.active[0].append(12_000, &mut d.totals, &mut d.mix);
+    let offset = || rusqlite::Connection::open(d.sidecar()).unwrap().query_row("SELECT byte_offset FROM collect_offsets WHERE path_digest=?1", [&key], |r| r.get::<_, u64>(0)).unwrap();
+    assert_eq!(offset(), initial);
+    let end = fs::metadata(&file).unwrap().len();
+    let start = || Ticker(command(&d, &["ticker", "run"]).env("HERDR_PROJECTS_TELEMETRY_COLLECT_SECS", "1")
+        .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    let log = || fs::read_to_string(d.root.join(".ticker.log")).unwrap_or_default();
+    let mut killed = start();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut observed_priority = false;
+    loop {
+        for entry in fs::read_dir(format!("/proc/{}/task", killed.0.id())).unwrap().flatten() {
+            if fs::read_to_string(entry.path().join("comm")).unwrap_or_default().trim() != "telemetry-pass" { continue; }
+            let tid: i32 = entry.file_name().to_str().unwrap().parse().unwrap();
+            // SAFETY: these syscalls query a live fixture child thread only.
+            let (policy, nice, io) = unsafe { (libc::sched_getscheduler(tid), libc::getpriority(libc::PRIO_PROCESS, tid as _),
+                libc::syscall(libc::SYS_ioprio_get, 1, tid)) };
+            let warnings = log();
+            if !(policy == libc::SCHED_IDLE || warnings.contains("SCHED_IDLE:"))
+                || !(nice == 19 || warnings.contains("nice 19:"))
+                || !(io == 3 << 13 || warnings.contains("I/O idle:")) { continue; }
+            // SAFETY: query the process leader, which must retain the test's policy.
+            assert_eq!(unsafe { libc::sched_getscheduler(killed.0.id() as _) }, unsafe { libc::sched_getscheduler(0) });
+            observed_priority = true;
+        }
+        if offset() > initial && offset() < end { break; }
+        assert!(Instant::now() < deadline && killed.0.try_wait().unwrap().is_none(), "no committed partial batch: {}", log());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    killed.0.kill().unwrap();
+    killed.0.wait().unwrap();
+    assert!(observed_priority);
+    let prefix = offset();
+    assert!(prefix > initial && prefix < end, "kill must leave a committed prefix: {prefix}/{end}");
+    let persisted: (u64, u64) = rusqlite::Connection::open(d.sidecar()).unwrap().query_row("SELECT o.byte_offset,c.byte_offset FROM collect_offsets o JOIN source_cursors c ON c.source=o.path_digest WHERE o.path_digest=?1", [&key], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(persisted, (prefix, prefix), "input and envelope cursors commit together");
+    let mut resumed = start();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let records: i64 = rusqlite::Connection::open(d.sidecar()).unwrap().query_row("SELECT count(*) FROM usage_entries WHERE basis='delta'", [], |r| r.get(0)).unwrap();
+        if offset() == end && records == d.totals.records { break; }
+        assert!(Instant::now() < deadline && resumed.0.try_wait().unwrap().is_none(), "ticker did not resume: {}", log());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    fs::write(d.root.join(".ticker.stop"), b"").unwrap();
+    assert!(resumed.0.wait().unwrap().success());
+    assert_eq!(usage_gates(&d), Vec::<String>::new());
+    assert_eq!(pinned(&d), before);
+    let ledger = ledger_rows(&d.sidecar());
+    for suffix in ["", "-wal", "-shm"] { let _ = fs::remove_file(format!("{}{suffix}", d.sidecar().display())); }
+    let canonical = canonical_digest(&d);
+    plant_producers(&d);
+    telemetry(&d, &["collect"]).ok();
+    telemetry(&d, &["accounting", "sync"]).ok();
+    assert_eq!(usage_gates(&d), Vec::<String>::new());
+    assert!(ledger == ledger_rows(&d.sidecar()), "batch replay changed ledger bytes");
+    assert_eq!(canonical_digest(&d), canonical);
+}
+
 /// A collect whose sidecar cannot grow: the write-ahead log is truncated and
 /// the process may not write past 1 MiB of any file (a full disk for the
 /// collector's spool), so the backlog's transaction fails part way.
@@ -903,6 +989,7 @@ fn scale_1_ingest() {
 fn scale_pass_child() {
     if std::env::var("SCALE_PASS_CHILD").as_deref() != Ok("1") { return; }
     let d = Dataset::load(&data_dir());
+    telemetry::background::idle_priority(|warning| eprintln!("{warning}"));
     rusqlite::Connection::open(d.sidecar()).unwrap().execute_batch("UPDATE analytics_cells SET checked_unix_ms=checked_unix_ms-120000").unwrap();
     let (ms, collected, errors, steps) = telemetry_pass_steps(&d.project);
     println!("pass: {}", json!({"ms": ms, "collected": collected, "errors": errors, "steps": steps.into_iter().map(|(k, v)| (k.to_owned(), json!(v))).collect::<serde_json::Map<_, _>>()}));
@@ -1043,6 +1130,7 @@ type PassLoop = (Vec<Value>, Vec<(i64, std::collections::BTreeMap<String, i64>)>
 
 fn pass_loop(project: PathBuf, cadence: Duration, stop: Arc<AtomicBool>, sids: Vec<String>) -> std::thread::JoinHandle<PassLoop> {
     std::thread::spawn(move || {
+        telemetry::background::idle_priority(|warning| eprintln!("{warning}"));
         let (mut passes, mut views) = (Vec::new(), Vec::new());
         let cpu0 = thread_cpu_ms();
         while !stop.load(Ordering::Relaxed) {
@@ -1635,4 +1723,40 @@ fn scale_8_accounting_pass() {
         "canonical_unchanged": canonical_digest(&d) == canonical}));
     assert!(violations.is_empty(), "{violations:?}");
     assert_eq!(canonical_digest(&d), canonical);
+}
+
+/// Three foreground health evaluations over the same prepared dataset. An
+/// optional preserved baseline CLI allows the identical persisted inputs to
+/// exercise the old rule implementation; each evaluation is a public workflow.
+#[test]
+#[ignore = "100k health resource measurement; on-disk SCALE_DATA required"]
+fn scale_9_health_evaluate() {
+    let dir = data_dir();
+    let d = Dataset::load(&dir);
+    let load = load_average();
+    let canonical = canonical_digest(&d);
+    let mut runs = Vec::new();
+    for _ in 0..env_usize("SCALE_REPEATS", 3) {
+        let args = ["telemetry", "demo", "health", "evaluate", "--json"];
+        let mut cmd = match std::env::var_os("SCALE_HEALTH_BIN") {
+            Some(bin) => {
+                let mut c = Command::new(bin);
+                c.env_clear().env("HOME", d.home()).env("PATH", "/usr/bin:/bin").env("HERDR_BIN_PATH", "/bin/false")
+                    .args(["--root", d.root.to_str().unwrap()]).args(args);
+                c
+            }
+            None => command(&d, &args),
+        };
+        cmd.stdout(Stdio::piped());
+        let run = measure(cmd).ok();
+        assert_eq!(run.json()["recorded"], true);
+        runs.push(json!({"wall_ms": run.wall_ms, "user_ms": run.user_ms, "sys_ms": run.sys_ms, "maxrss_kib": run.maxrss_kib}));
+    }
+    let violations = usage_gates(&d);
+    write_results(&dir, &format!("health-evaluate-{}", std::env::var("SCALE_TAG").unwrap_or_default()), &json!({
+        "scale": d.scale, "runs": runs, "wall_ms": dist(&runs.iter().map(|r| r["wall_ms"].as_f64().unwrap()).collect::<Vec<_>>()),
+        "loadavg_start": load, "loadavg_end": load_average(), "canonical_unchanged": canonical == canonical_digest(&d), "violations": violations,
+    }));
+    assert_eq!(canonical, canonical_digest(&d));
+    assert!(violations.is_empty(), "{violations:?}");
 }

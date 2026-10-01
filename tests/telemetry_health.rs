@@ -356,6 +356,26 @@ fn low_quota_headroom_and_throttled_service() {
     assert_eq!((&s["state"], codes(&s)), (&json!("unknown"), vec!["no_current_window".to_owned()]));
     let alert = open_alert(&p.alerts(), "quota_headroom").unwrap().clone();
     assert_eq!((&alert["state"], &alert["occurrences"]), (&json!("unknown"), &json!(3)), "headroom unknown after the reset keeps the alert open: {alert}");
+
+    // Historical windows and a decimal that the rule cannot represent in
+    // thousandths must not displace either eligible current window. Equal
+    // headroom/reset ties retain quota report order (account a precedes b).
+    let db = p.sidecar();
+    for (id, account, remaining, used, reset) in [("precise", "0", "0.0001", "99.9999", now + HOUR),
+        ("tie-b", "b", "7.5", "92.5", now + 2 * HOUR), ("tie-a", "a", "7.5", "90", now + 2 * HOUR)] {
+        db.execute("INSERT INTO quota_windows SELECT ?1,service,?2,limit_id,window_kind,unit,window_minutes,window_start_unix_ms,?5,start_evidence,
+            first_observed_unix_ms,last_observed_unix_ms,first_used,?4,?3,observed_increase,plan_type,observations,flagged FROM quota_windows WHERE account LIKE 'sha256:%' LIMIT 1",
+            rusqlite::params![id, account, remaining, used, reset]).unwrap();
+    }
+    let out = p.evaluate();
+    let s = state(&out, "quota_headroom");
+    assert_eq!(s["state"], "warn");
+    assert_eq!((&s["evidence"]["current_windows"], &s["evidence"]["below_warn"]), (&json!(2), &json!(2)));
+    assert_eq!((&s["evidence"]["lowest"]["remaining"], &s["evidence"]["lowest"]["used"]), (&json!("7.5"), &json!("90")));
+    assert_eq!(s["evidence_window"]["to_unix_ms"], now + 2 * HOUR);
+    let alert = open_alert(&p.alerts(), "quota_headroom").unwrap().clone();
+    assert_eq!((&alert["state"], &alert["occurrences"]), (&json!("warn"), &json!(4)));
+
 }
 
 /// A running attempt launched at T−8m10s, sampled `blocked` every 30 s from

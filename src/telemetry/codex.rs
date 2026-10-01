@@ -256,7 +256,7 @@ pub fn collect(project: &Path, budget: Budget, create: bool) -> Result<Option<Co
                 break;
             }
             let mut span = (0, 0);
-            let read = match tail(&mut db, &file, &digest(home.as_bytes()), &worktrees, remaining, &from_start, &tombstones, &mut done, &mut span) {
+            let read = match tail(&mut db, &file, &digest(home.as_bytes()), &worktrees, remaining, budget.bytes <= Budget::TICK.bytes, &from_start, &tombstones, &mut done, &mut span) {
                 Ok(read) => read,
                 // The pass rolled back: its range is a coverage gap and later
                 // sources wait for the next collect (contracts-collection.md A2).
@@ -726,13 +726,34 @@ fn final_event(tx: &Transaction, ledger: &ingest::Ledger, key: &str, cursor: &Cu
     Ok(true)
 }
 
-/// Ingest complete lines of one rollout after its stored offset, with their
-/// envelopes, in one sidecar transaction. `span`: the byte range this pass covers.
+/// Ingest one rollout, using bounded complete-line batches for ticker budgets. Each batch commits its
+/// observations, ordinal/model/turn state and both cursors together. A killed
+/// pass resumes at the last committed prefix, with the same native identities.
 #[allow(clippy::too_many_arguments)]
-fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance: u64, reread: &std::collections::BTreeSet<String>,
+fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance: u64, bounded: bool, reread: &std::collections::BTreeSet<String>,
     tombstones: &super::maintenance::Tombstones, done: &mut Collected, span: &mut (u64, u64)) -> Result<u64> {
+    let mut observed = None;
+    let (mut pulled, files) = (0, done.files);
+    let empty = std::collections::BTreeSet::new();
+    loop {
+        let (read, more) = tail_batch(db, file, home, worktrees, allowance - pulled, bounded,
+            if pulled == 0 { reread } else { &empty }, tombstones, done, span, &mut observed)?;
+        pulled += read;
+        // Public collect counts files, not transaction batches.
+        if done.files > files { done.files = files + 1; }
+        if !more || pulled == allowance || read == 0 { return Ok(pulled); }
+    }
+}
+
+/// Ticker budgets: at most 2,000 input lines or 8 MiB before the next line.
+/// Foreground CLI budgets retain whole-rollout transactions.
+/// One line may exceed the byte bound (the existing 16 MiB parse/skip limit).
+/// Keeping a line atomic preserves malformed/oversized/partial-line semantics.
+#[allow(clippy::too_many_arguments)]
+fn tail_batch(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance: u64, bounded: bool, reread: &std::collections::BTreeSet<String>,
+    tombstones: &super::maintenance::Tombstones, done: &mut Collected, span: &mut (u64, u64), observed: &mut Option<i64>) -> Result<(u64, bool)> {
     let key = digest(file.as_os_str().as_encoded_bytes());
-    let Ok(mut handle) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(file) else { return Ok(0) };
+    let Ok(mut handle) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(file) else { return Ok((0, false)) };
     let meta = handle.metadata()?;
     // Immediate: a concurrent collector (the ticker's and the CLI's) waits for
     // the write lock (busy timeout) instead of failing on a stale read snapshot.
@@ -741,6 +762,12 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
         |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))).optional()?;
     let reread_zero = stored.as_ref().is_some_and(|cursor| cursor.2 == 0)
         && tx.query_row("SELECT EXISTS(SELECT 1 FROM rollout_sources WHERE path_digest=?1)", [&key], |r| r.get::<_, bool>(0))?;
+    // A byte-zero replay must cover predates-ingest gaps atomically: those
+    // gaps intentionally have no historical envelopes proving their prefix.
+    // Keep the existing budget-bounded replay transaction; batch ordinary
+    // first collection and append-only tails instead.
+    let replaying = reread.contains(&key) || reread_zero || stored.as_ref().is_some_and(|(dev, ino, offset, ..)|
+        *dev as u64 != meta.dev() || *ino as u64 != meta.ino() || *offset as u64 > meta.len());
     let mut cursor = match stored {
         Some((dev, ino, offset, records, rate_limits, model, effort)) if !reread_zero && !reread.contains(&key) && dev as u64 == meta.dev() && ino as u64 == meta.ino() && offset as u64 <= meta.len() => {
             let state: Option<TurnState> = tx.query_row("SELECT x.uncertified_envelopes,x.last_turn_offset,x.last_turn_id,
@@ -761,7 +788,7 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
             Cursor { offset: 0, records: 0, rate_limits: 0, model: None, effort: None, session: None, uncertified: false, turn: None }
         }
     };
-    let now = jiff::Timestamp::now().as_millisecond();
+    let now = *observed.get_or_insert_with(|| jiff::Timestamp::now().as_millisecond());
     *span = (cursor.offset, meta.len());
     let ledger = ingest::Ledger::begin(&tx, &key, cursor.offset, now)?;
     if cursor.offset == meta.len() {
@@ -772,14 +799,16 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
             ledger.finish(&tx, None, cursor.offset, now)?;
         }
         if idle || (ledger.fresh && cursor.offset > 0) { tx.commit()?; }
-        return Ok(0);
+        return Ok((0, false));
     }
     cursor.session = tx.query_row("SELECT session_id,cli_version,session_unix_ms FROM rollout_sources WHERE path_digest=?1", [&key],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
     handle.seek(SeekFrom::Start(cursor.offset))?;
     let mut reader = BufReader::new(handle.take(allowance));
-    let (mut line, mut read) = (Vec::new(), 0u64);
+    let (mut line, mut read, mut lines) = (Vec::new(), 0u64, 0u64);
+    let mut batch_full = false;
     loop {
+        if bounded && !replaying && (lines >= 2_000 || read >= 8 << 20) { batch_full = true; break; }
         line.clear();
         let n = reader.by_ref().take(MAX_LINE).read_until(b'\n', &mut line)? as u64;
         if n == 0 { break; }
@@ -794,11 +823,13 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
                 if more == 0 || line.last() == Some(&b'\n') { break; }
             }
             if line.last() != Some(&b'\n') { break; }
+            lines += 1;
             ledger.oversized_line(&tx, cursor.offset, skipped, now)?;
             read += skipped;
             cursor.offset += skipped;
             continue;
         }
+        lines += 1;
         read += n;
         let at = cursor.offset;
         cursor.offset += n;
@@ -826,7 +857,7 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
         // A copy of a tombstoned session: nothing of this pass is kept.
         if first_meta && let Some((session, _, _)) = &cursor.session
             && tombstones.key(super::maintenance::SESSIONS, &format!("session:{session}")).is_some() {
-            return Ok(0);
+            return Ok((0, false));
         }
         let kind = match (tag.kind.as_deref(), tag.payload.as_ref().and_then(|p| p.kind.as_deref())) {
             (Some("event_msg" | "response_item"), inner) => inner,
@@ -853,9 +884,13 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
     }
     // Bytes pulled from disk, including a partial last line, count against the
     // budget. Allowance left over: the pass stopped at the file's end.
+    // Do not charge buffered read-ahead to this batch: the next batch seeks
+    // back to the committed cursor, rather than skipping those unread bytes.
+    let buffered = reader.buffer().len() as u64;
     let rest = reader.into_inner();
-    let (pulled, at_eof) = (allowance - rest.limit(), rest.limit() > 0);
+    let (pulled, at_eof) = (allowance - rest.limit() - buffered, !batch_full && rest.limit() > 0);
     let after = rest.into_inner().metadata()?;
+    let at_eof = at_eof || (batch_full && cursor.offset == after.len() && pulled < allowance);
     if read > 0 { done.files += 1; }
     done.bytes += pulled;
     tx.execute("INSERT INTO collect_offsets(path_digest,device,inode,byte_offset,records,rate_limits,model,effort,updated_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
@@ -875,7 +910,7 @@ fn tail(db: &mut Connection, file: &Path, home: &str, worktrees: &str, allowance
         reconcile(&tx, session, now)?;
     }
     tx.commit()?;
-    Ok(pulled)
+    Ok((pulled, batch_full && cursor.offset < after.len()))
 }
 
 /// Store one read record. `false`: its kind is read but its typed fields do not
@@ -1280,37 +1315,43 @@ fn terminated_turns(db: &Connection, attempts: &[CanonicalAttempt]) -> Result<()
 fn bind(db: &mut Connection, attempts: &[CanonicalAttempt]) -> Result<()> {
     let mut by_id = std::collections::BTreeMap::<&str, Vec<&CanonicalAttempt>>::new();
     for a in attempts.iter().filter(|a| a.codex()) { by_id.entry(a.id.as_str()).or_default().push(a); }
-    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    type Row = (String, String, Option<i64>, Option<String>, String, Option<String>, Option<String>);
-    let sources: Vec<Row> = tx.prepare("SELECT s.path_digest,s.home_digest,s.session_unix_ms,s.cwd_attempt,s.binding,s.attempt_id,b.basis
-        FROM rollout_sources s LEFT JOIN source_bindings b ON b.path_digest=s.path_digest")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?.collect::<rusqlite::Result<_>>()?;
-    for (key, home, at, cwd_attempt, stored, stored_attempt, stored_basis) in sources {
-        let rule1 = |h: &Option<String>| h.as_ref().is_some_and(|h| digest(h.as_bytes()) == home);
-        let (mut matches, mut refused) = (Vec::new(), None);
-        for a in cwd_attempt.as_deref().and_then(|id| by_id.get(id)).into_iter().flatten().copied() {
-            let Some(at) = at.filter(|at| a.decided_unix_ms.is_some_and(|decided| *at >= decided)) else { continue };
-            match &a.binding {
-                Binding::Predates if rule1(&a.home) => matches.push((a, "predates_binding")),
-                Binding::Active(h) if rule1(h) => matches.push((a, "collector_binding")),
-                Binding::Revoked(h, revoked) if rule1(h) && at < *revoked => matches.push((a, "collector_binding")),
-                Binding::Revoked(h, _) if rule1(h) => refused = refused.or(Some("binding_revoked")),
-                Binding::None => refused = refused.or(Some("no_binding")),
-                _ => {}
+    let mut after = String::new();
+    loop {
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        type Row = (String, String, Option<i64>, Option<String>, String, Option<String>, Option<String>);
+        let sources: Vec<Row> = tx.prepare("SELECT s.path_digest,s.home_digest,s.session_unix_ms,s.cwd_attempt,s.binding,s.attempt_id,b.basis
+            FROM rollout_sources s LEFT JOIN source_bindings b ON b.path_digest=s.path_digest
+            WHERE s.path_digest>?1 ORDER BY s.path_digest LIMIT 1000")?
+            .query_map([&after], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?.collect::<rusqlite::Result<_>>()?;
+        if sources.is_empty() { break; }
+        after = sources.last().expect("nonempty batch").0.clone();
+        for (key, home, at, cwd_attempt, stored, stored_attempt, stored_basis) in sources {
+            let rule1 = |h: &Option<String>| h.as_ref().is_some_and(|h| digest(h.as_bytes()) == home);
+            let (mut matches, mut refused) = (Vec::new(), None);
+            for a in cwd_attempt.as_deref().and_then(|id| by_id.get(id)).into_iter().flatten().copied() {
+                let Some(at) = at.filter(|at| a.decided_unix_ms.is_some_and(|decided| *at >= decided)) else { continue };
+                match &a.binding {
+                    Binding::Predates if rule1(&a.home) => matches.push((a, "predates_binding")),
+                    Binding::Active(h) if rule1(h) => matches.push((a, "collector_binding")),
+                    Binding::Revoked(h, revoked) if rule1(h) && at < *revoked => matches.push((a, "collector_binding")),
+                    Binding::Revoked(h, _) if rule1(h) => refused = refused.or(Some("binding_revoked")),
+                    Binding::None => refused = refused.or(Some("no_binding")),
+                    _ => {}
+                }
+            }
+            let (binding, attempt, basis) = match matches.as_slice() {
+                [] => ("unbound", None, refused.unwrap_or("no_match")),
+                [(one, basis)] => ("bound", Some(one.id.as_str()), *basis),
+                _ => ("ambiguous", None, "ambiguous"),
+            };
+            if stored != binding || stored_attempt.as_deref() != attempt {
+                tx.execute("UPDATE rollout_sources SET binding=?2,attempt_id=?3 WHERE path_digest=?1", params![key, binding, attempt])?;
+            }
+            if stored_basis.as_deref() != Some(basis) {
+                tx.execute("INSERT INTO source_bindings(path_digest,basis) VALUES(?1,?2) ON CONFLICT(path_digest) DO UPDATE SET basis=excluded.basis", params![key, basis])?;
             }
         }
-        let (binding, attempt, basis) = match matches.as_slice() {
-            [] => ("unbound", None, refused.unwrap_or("no_match")),
-            [(one, basis)] => ("bound", Some(one.id.as_str()), *basis),
-            _ => ("ambiguous", None, "ambiguous"),
-        };
-        if stored != binding || stored_attempt.as_deref() != attempt {
-            tx.execute("UPDATE rollout_sources SET binding=?2,attempt_id=?3 WHERE path_digest=?1", params![key, binding, attempt])?;
-        }
-        if stored_basis.as_deref() != Some(basis) {
-            tx.execute("INSERT INTO source_bindings(path_digest,basis) VALUES(?1,?2) ON CONFLICT(path_digest) DO UPDATE SET basis=excluded.basis", params![key, basis])?;
-        }
+        tx.commit()?;
     }
-    tx.commit()?;
     Ok(())
 }

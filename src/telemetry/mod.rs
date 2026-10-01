@@ -1,6 +1,7 @@
 //! Telemetry analytics and read-only projections (docs/telemetry/contracts.md).
 //! Never grants launch, accepts results or changes budgets.
 pub mod accounting;
+pub mod background;
 pub mod analytics;
 pub mod codex;
 pub mod collectors;
