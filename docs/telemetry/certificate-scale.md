@@ -1977,7 +1977,7 @@ Benchmark data is removed before commit. Files: `src/telemetry/sidecar.rs`,
 `migrations/telemetry/accounting/repair_compact_capture.sql`,
 `tests/telemetry_accounting.rs`, and this certificate.
 
-### 4.16 DG3: observed operating hours and M03 (100k only)
+### 4.18 DG3: observed operating hours and M03 (100k only)
 
 Branch `telemetry/dg3-m03`, base `663e7aa`, 2026-10-01. This addresses the
 operating-hours producer gap in L7. **Pending the steward's serial 1M
@@ -1987,7 +1987,7 @@ retains interval/clock/gap source facts and includes them in backup inventories.
 
 The original DG3 worker observed every canonical project on each available
 ticker pass (nominal 15 s), including paused projects and when collection was
-disabled. **This scheduling/opt-in contract is superseded by DG3b in §4.17.**
+disabled. **This scheduling/opt-in contract is superseded by DG3b in §4.19.**
 Consecutive Active endpoints in one run/control epoch merge. Pause/resume,
 restart or a gap longer than **N=3** passes closes the previous prefix; open
 tails are censored and never extrapolated. M03 clips and unions integer-ms
@@ -2082,7 +2082,7 @@ warnings elsewhere remain). Bench datasets and preserved binaries were removed
 before committing. L1–L6 and L8 remain unchanged; 100k samples on this shared
 host do not establish authoritative 1M performance.
 
-### 4.17 DG3b: ticker isolation and explicit telemetry opt-in (100k only)
+### 4.19 DG3b: ticker isolation and explicit telemetry opt-in (100k only)
 
 Branch `telemetry/dg3-m03`, base `482f94b`, 2026-10-01. Registry remains v5.
 This repairs the DG3 operating producer integration under L7; **pending the
@@ -2532,10 +2532,10 @@ owner. None is hidden by loosening the target.
   shared-worker pass latency remains an L2 performance limitation. The shared workstation remains noisy;
   the 100k query comparison is inconclusive for performance changes, and this
   card makes no claim to fix L1–L6 or to certify live capacity. DG3 adds durable
-  observed operating intervals and M03 in §4.16, with 100k paired surface costs
+  observed operating intervals and M03 in §4.18, with 100k paired surface costs
   and a separate planted operating-signal sample. Report p95 was 466.51 →
   403.28 ms; refresh p95 was 1030.92 → 986.76 ms (different shared-host
-  loads; no causal speedup claim). DG3b (§4.17) restores explicit opt-in and
+  loads; no causal speedup claim). DG3b (§4.19) restores explicit opt-in and
   disabled-telemetry semantics and isolates operating reads from sidecar waits.
   Its same-dataset 100k report p95 was 253.48 → 241.54 ms and refresh p95
   907.39 → 807.19 ms; the results-file load averages are quoted there. These
