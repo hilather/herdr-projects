@@ -305,9 +305,10 @@ fn capabilities(project: &Path) -> Result<Value> {
         }
     }
     let mut adapters = super::otlp::capabilities();
-    // Installed 2026.09.28 exposes protobuf traces and content transcripts,
-    // not a reviewed logs/metrics exporter or metadata-only usage file.
+    // Reviewed Cursor and Muse native surfaces lack a stable usage projection;
+    // Cursor also lacks a reviewed logs/metrics exporter.
     for (adapter, reason) in [
+        ("muse", "local_usage_schema_not_established"),
         ("cursor-agent", "stable_local_usage_format_not_evident"),
         ("otlp:cursor-agent", "protobuf_traces_only_no_usable_logs_or_metrics"),
     ] {
@@ -316,8 +317,12 @@ fn capabilities(project: &Path) -> Result<Value> {
             .map(|field| json!({"kind":"usage","field":field,"available":false,
                 "basis":"unavailable","certified":"none","caveat":null,"reason":reason}))
             .collect();
-        adapters.push(json!({"adapter":adapter,"interface":"none","certified_versions":[],
-            "uncertified_version":reason,"fields":fields}));
+        let mut capability = json!({"adapter":adapter,"interface":"none","certified_versions":[],
+            "uncertified_version":reason,"fields":fields});
+        if adapter == "muse" {
+            capability["reviewed_versions"] = json!(["1.4.0-R4161.1"]);
+        }
+        adapters.push(capability);
     }
     adapters.push(super::gemini::capabilities());
     adapters.insert(0, super::codex::claude::capabilities());

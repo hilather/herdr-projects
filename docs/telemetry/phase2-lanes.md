@@ -429,6 +429,12 @@ Cards (gaps that stop those questions being answered):
     local paths are evident but the usage-file schema is not established.
     Export requires protobuf/gRPC conversion and injected binding; see
     contracts-collection.md DG4e.
+  - **Done (DG4g): Muse Code 1.4.0-R4161.1 installed-format review.**
+    `otlp:muse` fixture-only model-call logs and approval-review token counters;
+    protobuf requires an external JSON converter and release-version resource.
+    Native `muse` is none: local usage projection/linkage not established from
+    installed strings. No owner-data access or CLI execution. See
+    contracts-collection.md DG4g for evidence, binding and limitations.
   - **Done (DG4f installed-format review): Cursor (`cursor-agent`) 2026.09.28.**
     Installed program reports `2026.09.28-64d2043`, default service
     `cursor-agent-cli`. Its configured OTel exporter sends protobuf traces;

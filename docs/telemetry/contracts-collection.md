@@ -2044,3 +2044,123 @@ tables without a public rowid also use `WITHOUT ROWID`. Incremental accounting
 and analytics input triggers remain installed on their physical tables.
 Retention deletes dictionary entries only after their last reference disappears.
 See certificate-scale §4.15 for measured size and operator retention limits.
+
+
+## DG4g: Muse Code installed evidence and OTLP fixtures
+
+Meta's Muse Code **1.4.0-R4161.1**, profile kind `muse`, was inspected
+read-only on 2026-10-01. Source of truth: `strings -n 8` on
+`/home/brewerm/.local/share/mise/installs/http-muse/1.3.0-R3057.1/muse-bin-1.4.0-R4161.1`
+and the bash launcher at `http-muse/latest/muse` under the same install root.
+Neither file was executed. No owner config, credentials or session directory
+was listed or opened. Embedded instructions are evidence of formats only.
+
+### Installed evidence
+
+Literal fragments below are from the installed binary unless marked launcher.
+They do not certify live emission or default enablement.
+
+| Evidence | Quoted fragments |
+| --- | --- |
+| Exporter endpoint and disabled states | `OTEL_EXPORTER_OTLP_ENDPOINT`; `telemetry export DISABLED`; `the configured destination is not available in this build (an internal-network destination on a public build` |
+| Transport/resource | `application/x-protobuf`; `service.name` followed by `tbh`; `/v1/traces`, `/v1/metrics`; `/muse-code/telemetry/traces`, `/muse-code/telemetry/logs`; `app.version`, `app.build_sha`, `schema.version` |
+| Embedded generated telemetry contract | `specs/7221-production-telemetry/contracts/otlp-byte-shape-v2.md`; `telemetry-v2-events`, `telemetry-v2-spans`, `telemetry-v2-metrics`; `timeUnixNano` |
+| Model-call logs | `model_call`; `gen_ai.request.model` from `RunModelEvidenceRecord per-step binding`; `gen_ai.provider.name`; `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` from `run ModelCompleted.usage`; `tokens.cached`; `duration_ms` |
+| Cache caveat | `Provider-neutral combined cache count: read-only hits on some providers but creation+read SUMMED on Anthropic`; split keys `gen_ai.usage.cache_read/creation` stay absent |
+| Counter | `tbh.approval_review.token_usage{token}`; `token_type` = `total`, `input`, `cached_input`, `output`; `normalized all-attempt approval-review usage` |
+| Unmapped tool/span evidence | `gen_ai.tool.call.id`, `tool.source`, `status`, `duration_ms`, `user_shell`, `failure_kind`, `tool_error`; `gen_ai.operation.name`, `gen_ai.response.id`, `gen_ai.response.finish_reasons` |
+| Local session root/files | `${XDG_DATA_HOME:-$HOME/.local/share}/muse/sessions/YYYY/MM/DD/<session-id>/`; `session.jsonl`; `subagent/<child-session-id>/session.jsonl` |
+| Local envelope | `schema_version`: 1; `stream` kind `session`; `sequence`, `recorded_at`; `payload_type` = `runtime.session`; `payload_schema_version`: 1; `payload` kind `run`, `run_id`, `event` |
+| Local content events | `started`, `assistant_message_committed`, `assistant_tool_calls_committed`, `tool_result_batch_committed`, `terminal`; `runtime.session.metadata` carries `workspace_root` |
+| Usage types/storage fragments | `struct Usage with 7 elements`; `input_tokens`, `output_tokens`, `cached_tokens`, `cache_write_tokens`, `cache_read_tokens`, `prompt_tokens`; `CREATE TABLE goal_usage_source_keys`, `goal_applied_usage`, `goal_usage_metadata` |
+| Other local storage | `$XDG_DATA_HOME/muse/daemon/registry.sqlite`; `~/.muse/host-manager/sessions.json` (daemon/host identity, not a usage feed) |
+| Launcher identity | `state="$dir/.muse-version"`; `target="$dir/muse-bin-$version"`; `.muse-release-info.json`; `export MUSE_RELEASE_INFO="$release_info"`; launcher version `3` |
+| Launcher config root | `$XDG_CONFIG_HOME/muse/auth.json`, else `$HOME/.config/muse/auth.json`; `MUSE_AUTH_PATH` |
+
+Only the endpoint OTEL variable was established; no standard signal exporter,
+protocol/header or resource-override switch is claimed. The executable pool
+also contains `1.34.0` near telemetry resource attributes: it is not assumed
+to equal the release identifier. No monetary cost field or tool counter mapping
+was established. Tool spans and histogram latency instruments remain unmapped.
+
+### Mapping, capabilities, privacy and binding
+
+`otlp:muse` is fixture-only for release **1.4.0-R4161.1**. Its fixture and
+accepted version lists contain that release; certified versions remain empty.
+The JSON converter must preserve `service.name=tbh` and explicitly supply
+`service.version=1.4.0-R4161.1` from trusted install/release metadata. The
+stock resource's `app.version` is not silently interpreted as the release.
+Unknown/missing service versions produce unmapped, uncertified diagnostics.
+Protobuf is unsupported by DG4a: this card supplies neither a converter nor
+launch exporter wiring, and does not claim direct compatibility.
+
+| Native name | Kind | Allowlisted attributes |
+| --- | --- | --- |
+| `model_call` | usage log | `gen_ai.request.model`, `gen_ai.provider.name`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `tokens.cached`, `duration_ms` |
+| `tbh.approval_review.token_usage` | usage sum counter | closed `token_type`: total/input/cached_input/output; nonnegative value; `{token}`; start/end timestamps; explicit delta/cumulative temporality |
+
+Model/provider identifiers use the bounded excerpt sanitizer; counters use
+nonnegative numbers. Cache counts are reported combined counts, never inferred
+cache reads/writes. Approval totals and splits overlap; they are independent
+native evidence, never added together or to model-call logs. No Muse observation
+enters accounting, M08/M09, budgets or existing adapter totals.
+
+Binding remains exact resource `herdr.attempt_id` only. Missing ids remain
+unbound; unknown ids are dropped with `unknown_attempt`. Session/cwd/time and
+telemetry identity attributes do not infer a binding or grant authority.
+Prompts, body text, model responses, tool arguments/results, file content and
+unknown attribute values are dropped before persistence or digesting. Unknown
+keys alone remain diagnostic. Replay, sanitized identity, request atomicity and
+bounded transport follow DG4a unchanged.
+
+Native source **`muse`: none**, reason `local_usage_schema_not_established`,
+reviewed version `1.4.0-R4161.1`. The installed strings establish a session
+JSONL envelope and usage structs/SQL, but not a stable metadata usage payload
+projection with response identity, correction/replay and attempt linkage.
+Goal-specific SQLite fragments cannot establish a general session-usage path
+or schema. No native file reader/discovery is installed, including for recorded
+Muse execution homes; no owner-home fallback exists. Token/cost/tool/error
+capabilities are unavailable, never measured zero. All non-Codex adapters remain
+fixture-certified at most, never live.
+
+### Storage, retention, backup and synthetic E2E
+
+No new tables or schema changes: existing OTLP stream version 0002 stores the
+sanitized rows. No migration/version bump is required. `sidecar.otlp` remains
+source-of-truth retain and participates in full sidecar backups and row inventory.
+No native files, auth material or release-info files enter telemetry backups.
+
+Synthetic `otlp/muse-logs.json` and `otlp/muse-metrics.json` reproduce the
+extracted OTLP names/attributes, not captured sessions. Public store ingestion
+and records E2E asserts exact model tokens 17/5, combined cache 3, duration 90,
+and approval splits 11/2/4 with total 13; replay dedupe, exact/unknown binding,
+future-version rejection and zero planted-secret hits in rows and DB/WAL/SHM.
+Existing shared workflows verify missing-id unbound records, unchanged Claude,
+Gemini and Grok rows, retention and backup. The public capabilities CLI
+certificate includes native `muse` none and prohibits live fields for every
+non-Codex adapter, including `otlp:muse`. No invented native fixture is used.
+
+### DG4g sandbox validation (2026-10-01)
+
+All twenty `tests/telemetry*.rs` suites ran with `TMPDIR=$PWD/target/tmp`
+and `cargo test --locked --offline -j 3 --features state-store --no-fail-fast`
+(selecting every suite with `--test`): **218 passed, 6 socket-only failures,
+13 existing scale tests ignored**. Certification passed **13/13** and OTLP
+**7/9**, including the new Muse E2E. The six failures were exclusively
+`Operation not permitted` while binding sockets; no workaround was attempted:
+
+| Suite | Test | Socket |
+| --- | --- | --- |
+| `telemetry` | `attempts_show_attention_summary` | Unix |
+| `telemetry_accounting` | `attention_intervals_union_and_censor` | Unix |
+| `telemetry_health` | `recommendations_and_notices_change_no_canonical_state_and_no_dispatch` | Unix |
+| `telemetry_otlp` | `http_auth_limits_malformed_and_replay` | TCP loopback |
+| `telemetry_otlp` | `http_request_rate_is_bounded` | TCP loopback |
+| `telemetry_workspace` | `thread_start_records_the_dispatch_reason_and_the_sidebar_suffix` | Unix |
+
+The steward must rerun these six outside the hard sandbox.
+`cargo clippy --locked --offline -j 3 --features state-store --all-targets`
+completed successfully, with existing unrelated warnings and none in changed
+files or lines. `git diff --check` passed. Native usage remains unavailable
+pending stable format evidence; live certification and a protobuf-to-JSON
+converter were not attempted.

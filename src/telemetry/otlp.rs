@@ -89,6 +89,8 @@ const MAPPINGS: &[(&str, &str, &str, &[&str])] = &[
         "tool",
         &["function_name", "success", "duration_ms"],
     ),
+    ("muse", "model_call", "usage", &["gen_ai.request.model", "gen_ai.provider.name", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "tokens.cached", "duration_ms"]),
+    ("muse", "tbh.approval_review.token_usage", "usage", &["token_type"]),
     ("grok", "grok_code.token.usage", "usage", &["type", "model"]),
     ("grok", "grok_code.cost.usage", "usage", &["model"]),
     ("grok", "grok_code.session.count", "usage", &[]),
@@ -99,10 +101,10 @@ const MAPPINGS: &[(&str, &str, &str, &[&str])] = &[
 
 pub fn capabilities() -> Vec<Value> {
     let mut out = Vec::new();
-    for harness in ["claude-code", "gemini-cli", "grok", "codex"] {
+    for harness in ["claude-code", "gemini-cli", "grok", "muse", "codex"] {
         let mut fields = Vec::new();
         for (_, name, _, attrs) in MAPPINGS.iter().filter(|m| m.0 == harness) {
-            for field in attrs.iter().copied().chain(if name.ends_with(".usage") || harness == "grok" {
+            for field in attrs.iter().copied().chain(if name.ends_with(".usage") || name.ends_with("token_usage") || harness == "grok" {
                 vec![
                     "value",
                     "timeUnixNano",
@@ -113,7 +115,7 @@ pub fn capabilities() -> Vec<Value> {
             } else {
                 vec!["timeUnixNano"]
             }) {
-                fields.push(json!({"kind":name,"field":field,"available":true,"basis":if matches!(field,"model"|"tool_name"|"function_name"|"error_category"|"outcome") {"reported_excerpt"} else {"reported"},"certified":"fixture","caveat":"native_scope_only_no_cross_surface_sum","reason":null}));
+                fields.push(json!({"kind":name,"field":field,"available":true,"basis":if matches!(field,"model"|"tool_name"|"function_name"|"error_category"|"outcome"|"gen_ai.request.model"|"gen_ai.provider.name"|"token_type") {"reported_excerpt"} else {"reported"},"certified":"fixture","caveat":"native_scope_only_no_cross_surface_sum","reason":null}));
             }
         }
         for field in [
@@ -134,6 +136,12 @@ pub fn capabilities() -> Vec<Value> {
             fields.insert(0,json!({"kind":"otlp","field":"*","available":false,"basis":"unavailable","certified":"none","caveat":null,"reason":"names_not_certified_use_rollout_adapter"}));
         }
         out.push(json!({"adapter":format!("otlp:{harness}"),"interface":"otlp_http_json","certified_versions":[],"uncertified_version":"fixture_only","fields":fields}));
+        if harness == "muse" {
+            let cap = out.last_mut().unwrap();
+            cap["fixture_versions"] = json!(["1.4.0-R4161.1"]);
+            cap["accepted_versions"] = json!(["1.4.0-R4161.1"]);
+            cap["native_source"] = json!({"certified":"none", "reason":"local_usage_schema_not_established"});
+        }
         if harness == "grok" {
             let cap = out.last_mut().unwrap();
             cap["fixture_versions"] = json!(["1.0.46"]);
@@ -240,9 +248,9 @@ pub fn ingest(project: &Path, endpoint: &str, bytes: &[u8]) -> Result<usize> {
         ensure!(resource.is_object(), "invalid resource group");
         let ra = attributes(resource.get("resource").unwrap_or(&json!({})))?;
         let service = ra.get("service.name").and_then(Value::as_str).unwrap_or("");
-        let harness = if service == "grok-cli" { "grok" } else { service };
-        let grok_version = ra.get("service.version").and_then(Value::as_str);
-        let known = matches!(service, "claude-code" | "gemini-cli" | "grok-cli");
+        let harness = if service == "grok-cli" { "grok" } else if service == "tbh" { "muse" } else { service };
+        let cli_version = ra.get("service.version").and_then(Value::as_str);
+        let known = matches!(service, "claude-code" | "gemini-cli" | "grok-cli" | "tbh");
         let adapter = if known {
             format!("otlp:{harness}")
         } else if harness == "codex" {
@@ -276,8 +284,9 @@ pub fn ingest(project: &Path, endpoint: &str, bytes: &[u8]) -> Result<usize> {
                 .context("missing native name")?;
                 let mapping = MAPPINGS
                     .iter()
-                    .find(|m| known && m.0 == harness && m.1 == name && metrics == (name.ends_with(".usage") || m.0 == "grok")
-                        && (harness != "grok" || grok_version == Some("1.0.46")));
+                    .find(|m| known && m.0 == harness && m.1 == name && metrics == (name.ends_with(".usage") || name.ends_with("token_usage") || m.0 == "grok")
+                        && (harness != "grok" || cli_version == Some("1.0.46"))
+                        && (harness != "muse" || cli_version == Some("1.4.0-R4161.1")));
                 let points = if metrics {
                     let data = entry
                         .get("sum")
@@ -304,9 +313,16 @@ pub fn ingest(project: &Path, endpoint: &str, bytes: &[u8]) -> Result<usize> {
                             })
                     });
                     let mut payload = json!({"adapter":adapter,"attempt_id":attempt,"binding":binding,"source_trust":"collector_observed","certified":"fixture", "timeUnixNano":timestamp(&point,"timeUnixNano")?});
+                    if harness == "muse" {
+                        payload["cli_version"] = if cli_version == Some("1.4.0-R4161.1") { json!("1.4.0-R4161.1") } else { Value::Null };
+                        if cli_version != Some("1.4.0-R4161.1") {
+                            payload["mapping_certified"] = json!("none");
+                            payload["reason"] = json!("cli_version_uncertified");
+                        }
+                    }
                     if harness == "grok" {
-                        payload["cli_version"] = if grok_version == Some("1.0.46") { json!("1.0.46") } else { Value::Null };
-                        if grok_version != Some("1.0.46") {
+                        payload["cli_version"] = if cli_version == Some("1.0.46") { json!("1.0.46") } else { Value::Null };
+                        if cli_version != Some("1.0.46") {
                             payload["mapping_certified"] = json!("none");
                             payload["reason"] = json!("cli_version_uncertified");
                         }
@@ -318,7 +334,8 @@ pub fn ingest(project: &Path, endpoint: &str, bytes: &[u8]) -> Result<usize> {
                         for field in *fields {
                             if let Some(raw) = attrs.get(*field) {
                                 let safe = match *field {
-                                    "model" | "tool_name" | "function_name" | "error_category" | "outcome" => identifier(raw),
+                                    "model" | "tool_name" | "function_name" | "error_category" | "outcome" | "gen_ai.request.model" | "gen_ai.provider.name" => identifier(raw),
+                                    "token_type" => raw.as_str().filter(|s| matches!(*s, "total" | "input" | "cached_input" | "output")).map(|s| json!(s)),
                                     "type" => raw
                                         .as_str()
                                         .filter(|s| {

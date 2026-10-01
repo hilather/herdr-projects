@@ -1,0 +1,91 @@
+{
+  "resourceMetrics": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "tbh"
+            }
+          },
+          {
+            "key": "service.version",
+            "value": {
+              "stringValue": "1.4.0-R4161.1"
+            }
+          },
+          {
+            "key": "herdr.attempt_id",
+            "value": {
+              "stringValue": "@ATTEMPT@"
+            }
+          }
+        ]
+      },
+      "scopeMetrics": [
+        {
+          "metrics": [
+            {
+              "name": "tbh.approval_review.token_usage",
+              "unit": "{token}",
+              "sum": {
+                "aggregationTemporality": 1,
+                "dataPoints": [
+                  {
+                    "attributes": [
+                      {
+                        "key": "token_type",
+                        "value": {
+                          "stringValue": "input"
+                        }
+                      }
+                    ],
+                    "asInt": "11",
+                    "timeUnixNano": "1771088000123456000"
+                  },
+                  {
+                    "attributes": [
+                      {
+                        "key": "token_type",
+                        "value": {
+                          "stringValue": "output"
+                        }
+                      }
+                    ],
+                    "asInt": "2",
+                    "timeUnixNano": "1771088000123456000"
+                  },
+                  {
+                    "attributes": [
+                      {
+                        "key": "token_type",
+                        "value": {
+                          "stringValue": "cached_input"
+                        }
+                      }
+                    ],
+                    "asInt": "4",
+                    "timeUnixNano": "1771088000123456000"
+                  },
+                  {
+                    "attributes": [
+                      {
+                        "key": "token_type",
+                        "value": {
+                          "stringValue": "total"
+                        }
+                      }
+                    ],
+                    "asInt": "13",
+                    "timeUnixNano": "1771088000123456000"
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

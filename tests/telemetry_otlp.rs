@@ -578,3 +578,44 @@ fn grok_1046_metrics_are_versioned_bound_and_content_free() {
     assert_eq!(grok["native_source"]["certified"], "none");
     assert!(grok["fields"].as_array().unwrap().iter().filter(|f| f["available"] == true).all(|f| f["certified"] == "fixture"));
 }
+
+#[test]
+fn muse_installed_contract_is_version_gated_and_content_free() {
+    let f = Fixture::reserved();
+    let logs = payload(&f, "muse-logs");
+    let metrics = payload(&f, "muse-metrics");
+    assert_eq!(otlp::ingest(&f.project, "/v1/logs", &logs).unwrap(), 1);
+    assert_eq!(otlp::ingest(&f.project, "/v1/metrics", &metrics).unwrap(), 4);
+    assert_eq!(otlp::ingest(&f.project, "/v1/logs", &logs).unwrap(), 0);
+    let rows = otlp::records(&f.project).unwrap();
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 5);
+    assert!(rows.iter().all(|r| r["adapter"] == "otlp:muse" && r["attempt_id"] == f.attempt && r["binding"] == "exact" && r["cli_version"] == "1.4.0-R4161.1" && r["certified"] == "fixture"));
+    let call = rows.iter().find(|r| r["native_name"] == "model_call").unwrap();
+    assert_eq!(call["attributes"], json!({"gen_ai.request.model":"synthetic-model","gen_ai.provider.name":"meta","gen_ai.usage.input_tokens":17,"gen_ai.usage.output_tokens":5,"tokens.cached":3,"duration_ms":90}));
+    let mut counts: Vec<_> = rows.iter().filter(|r| r["native_name"] == "tbh.approval_review.token_usage").map(|r| (r["attributes"]["token_type"].as_str().unwrap(), r["value"].as_i64().unwrap())).collect();
+    counts.sort();
+    assert_eq!(counts, vec![("cached_input",4),("input",11),("output",2),("total",13)]);
+    let mut missing: Value = serde_json::from_slice(&logs).unwrap();
+    missing["resourceLogs"][0]["resource"]["attributes"].as_array_mut().unwrap().retain(|a| a["key"] != "herdr.attempt_id");
+    assert_eq!(otlp::ingest(&f.project, "/v1/logs", &serde_json::to_vec(&missing).unwrap()).unwrap(), 1);
+    let (capabilities, _) = f.cli_args(&["collectors", "capabilities", "--json"]);
+    let cap = capabilities["adapters"].as_array().unwrap().iter().find(|a| a["adapter"] == "otlp:muse").unwrap();
+    assert_eq!(cap["accepted_versions"], json!(["1.4.0-R4161.1"]));
+    assert_eq!(cap["certified_versions"], json!([]));
+    assert!(cap["fields"].as_array().unwrap().iter().filter(|f| f["available"] == true).all(|f| f["certified"] == "fixture"));
+    let unbound = String::from_utf8(logs.clone()).unwrap().replace(&f.attempt, "not-an-attempt");
+    assert_eq!(otlp::ingest(&f.project, "/v1/logs", unbound.as_bytes()).unwrap(), 1);
+    let unknown = String::from_utf8(logs).unwrap().replace("1.4.0-R4161.1", "future");
+    assert_eq!(otlp::ingest(&f.project, "/v1/logs", unknown.as_bytes()).unwrap(), 1);
+    let rows = otlp::records(&f.project).unwrap();
+    assert!(rows.as_array().unwrap().iter().any(|r| r["binding"] == "unbound" && r["attempt_id"].is_null()));
+    assert!(rows.as_array().unwrap().iter().any(|r| r["binding"] == "unknown_attempt" && r["attempt_id"].is_null()));
+    assert!(rows.as_array().unwrap().iter().any(|r| r["kind"] == "unmapped" && r["reason"] == "cli_version_uncertified"));
+    assert!(!rows.to_string().contains("MUSE_SECRET_CONTENT"));
+    for entry in fs::read_dir(f.project.join(".state")).unwrap().flatten() {
+        if entry.file_type().unwrap().is_file() {
+            assert!(!fs::read(entry.path()).unwrap().windows(b"MUSE_SECRET_CONTENT".len()).any(|w| w == b"MUSE_SECRET_CONTENT"));
+        }
+    }
+}

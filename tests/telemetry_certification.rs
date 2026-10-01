@@ -911,7 +911,7 @@ fn candidate_group_cost_includes_every_arm() {
 /// Codex is the only live-certified collector. Since the 2026-09-30 owner
 /// decision (harness coverage, phase2-lanes.md DG4) the OTLP receiver adds
 /// `otlp:<harness>` adapters and DG4b the native `claude-code` adapter, but
-/// those are fixture-certified at most; Cursor's reviewed surfaces are
+/// those are fixture-certified at most; Cursor and Muse native reviewed surfaces are
 /// unavailable (`none`). Only adapters with a recorded live report may claim a `live` field. An uncertified Codex version is
 /// never summed.
 #[test]
@@ -921,7 +921,7 @@ fn accounting_fields_match_the_adapter_certificate() {
     let adapters = capabilities["adapters"].as_array().unwrap();
     let names: Vec<&str> = adapters.iter().map(|a| a["adapter"].as_str().unwrap()).collect();
     assert_eq!(names[0], "codex", "{names:?}");
-    assert!(names[1..].iter().all(|n| *n == "claude-code" || *n == "gemini-cli" || *n == "opencode" || *n == "cursor-agent" || n.starts_with("otlp:")), "only declared adapters besides Codex: {names:?}");
+    assert!(names[1..].iter().all(|n| *n == "claude-code" || *n == "gemini-cli" || *n == "opencode" || *n == "cursor-agent" || *n == "muse" || n.starts_with("otlp:")), "only declared adapters besides Codex: {names:?}");
     assert!(names.contains(&"otlp:grok"), "Grok fixture adapter must be advertised: {names:?}");
     // Recorded live evidence registry. Adding an adapter/version requires a
     // reviewed report, not merely a successful invocation of the live test.
@@ -939,10 +939,14 @@ fn accounting_fields_match_the_adapter_certificate() {
         }
     }
     for (name, reason) in [
+        ("muse", "local_usage_schema_not_established"),
         ("cursor-agent", "stable_local_usage_format_not_evident"),
         ("otlp:cursor-agent", "protobuf_traces_only_no_usable_logs_or_metrics"),
     ] {
         let adapter = adapters.iter().find(|a| a["adapter"] == name).unwrap();
+        if name == "muse" {
+            assert_eq!(adapter["reviewed_versions"], json!(["1.4.0-R4161.1"]));
+        }
         assert_eq!(adapter["interface"], "none");
         assert_eq!(adapter["certified_versions"], json!([]));
         let fields = adapter["fields"].as_array().unwrap();
