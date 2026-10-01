@@ -3201,11 +3201,16 @@ fn outcome_success_path() {
     let (configuration,classification,submitted_ms):(String,String,i64)=f.db().query_row("SELECT d.chosen_configuration_id,d.classification_id,s.created_unix_ms
         FROM dispatch_decisions d JOIN result_submissions s ON s.attempt_id=d.attempt_id WHERE d.attempt_id=?1",[&attempt],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
     let report=cli(&["telemetry","demo","attempts","--json"]);
+    // Claude attempts are collected since DG4b, so the attention summary is the
+    // sampler's real observation; its observed span depends on wall-clock timing.
+    let observed=report["attempts"][0]["attention"]["observed_ms"].as_i64().unwrap();
+    assert!(observed>0,"{report}");
     assert_eq!(report,serde_json::json!({"attempts":[{
         "accepted":true,
         "active_ms":marks[3].2-marks[2].2,
         "attempt_id":attempt,
-        "attention":{"reason":"attention_not_collected","status":"unavailable"},
+        "attention":{"basis":"fixture","censored_intervals":0,"gaps":{},"intervals":0,"interventions":0,"observed_ms":observed,
+            "reason_type":"blocked_untyped","source":"herdr-agent-list-v1","uncertain_starts":0,"waiting_ms":0},
         // min(1,8) + 2 x 1 uncertain (trailing-slash scope) + 1 verify_then_integrate = 4.
         "classification":{"band":"medium","class":"code","classification_id":classification},
         "configuration_id":configuration,
@@ -3218,7 +3223,7 @@ fn outcome_success_path() {
         "task_id":"a",
         "terminal_state":"completed",
         "terminal_unix_ms":marks[3].2,
-        "usage":{"reason":"adapter_absent","status":"unavailable"},
+        "usage":{"reason":"not_bound","status":"unavailable"},
         "verification":{"policies":[{"policy_id":"clean","state":"accepted"}],"state":"accepted"}
     }]}));
 }
