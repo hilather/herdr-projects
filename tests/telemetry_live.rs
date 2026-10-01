@@ -96,6 +96,13 @@ fn command(bin: &Path, home: &Path, cwd: &Path) -> Command {
         .env("GROK_HOME", home.join(".grok"))
         .current_dir(cwd)
         .stdin(Stdio::null());
+    // Optional steward-supplied login token (e.g. Claude Code's
+    // CLAUDE_CODE_OAUTH_TOKEN from `claude setup-token`): read from a private
+    // file into this child's environment only, never logged or reported.
+    if let (Ok(file), Ok(name)) = (std::env::var("HERDR_LIVE_TOKEN_FILE"), std::env::var("HERDR_LIVE_TOKEN_ENV")) {
+        let token = std::fs::read_to_string(&file).expect("HERDR_LIVE_TOKEN_FILE readable");
+        cmd.env(name, token.trim());
+    }
     cmd
 }
 fn ready(process: &mut Process) -> Value {

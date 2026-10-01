@@ -13,7 +13,7 @@ CODEX_HOME and GROK_HOME inside that prepared home. Prepare `runtime` as 0700.
 
 | Harness | Login destination inside prepared home | Flags to confirm before spending |
 | --- | --- | --- |
-| Claude Code | `.claude/.credentials.json`; TODO steward confirm installed login mechanism (some platforms use a keychain) | TODO confirm noninteractive prompt, `--output-format json`, tools disabled and resume-last flags |
+| Claude Code | none: owner decision 2026-10-01, a long-lived `claude setup-token` token in a private 0600 file outside the home, passed via `HERDR_LIVE_TOKEN_FILE` + `HERDR_LIVE_TOKEN_ENV=CLAUDE_CODE_OAUTH_TOKEN` (the owner's OAuth credentials are never copied, so refresh-token rotation cannot sign them out) | TODO confirm noninteractive prompt, `--output-format json`, tools disabled and resume-last flags |
 | Grok | TODO steward confirm login filename under `.grok`; do not guess or enumerate owner data | TODO confirm headless prompt, usage summary output and resume-last flags |
 | Muse | TODO steward confirm login filenames under `.config/muse` | TODO confirm headless prompt, numeric usage JSON and whether resume exists |
 | Codex | `.codex/auth.json` | TODO confirm `exec --json`, selected model, tool restrictions and `exec resume --last` for installed version |
@@ -21,6 +21,8 @@ CODEX_HOME and GROK_HOME inside that prepared home. Prepare `runtime` as 0700.
 The steward must resolve TODOs using known deployment documentation before
 running. The fixed prompt includes `HERDR_LIVE_PRIVACY_LC0`; it requests one
 word and no tools. CLI flags, rather than the prompt, must enforce tool policy.
+
+Optional `HERDR_LIVE_TOKEN_FILE` (a private 0600 file) and `HERDR_LIVE_TOKEN_ENV` (the variable name) pass a login token to the harness process only; it is never logged or reported.
 
 Set absolute `HERDR_LIVE_HOME`, `HERDR_LIVE_BIN`, and `HERDR_LIVE_OUT` (a new
 report filename outside the prepared home), plus `HERDR_LIVE=1`.
