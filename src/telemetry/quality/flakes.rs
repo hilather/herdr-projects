@@ -131,7 +131,7 @@ fn ratio(n: i64, d: i64) -> Value {
 /// (object format, tree, policy id, digest) pair counts once, regardless of reruns.
 pub fn report(project: &Path, since: Option<i64>, to: Option<i64>) -> Result<Value> {
     let Some(db) = super::super::sidecar::read(project)? else {
-        return Ok(json!({"status": "unavailable", "reason": "collection_not_run"}));
+        return Ok(json!({"status": "unavailable", "reason": "verification_not_collected"}));
     };
     if !available(&db)? {
         return Ok(json!({"status": "unavailable", "reason": "verification_not_collected"}));

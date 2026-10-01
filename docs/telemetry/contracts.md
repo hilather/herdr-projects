@@ -672,3 +672,7 @@ Canonical metadata follows canonical retention/backup, never telemetry
 pruning. Empty `verification-load.lock` is an ephemeral verifier-owned lock
 file; live kernel locks are not backup data. No telemetry backup includes
 canonical metadata; sidecar derived copies follow their surviving source.
+
+Flake projections are derived only by quality collect or the quality lane tick,
+never by migration or unrelated commands. Rebuilding the sidecar requires
+replaying quality collection before comparing its verification metrics.

@@ -1518,12 +1518,15 @@ fn scale_producers_restate_and_replay() {
     assert_eq!(usage_gates(&d), Vec::<String>::new());
     late_slow(&mut d, 2);
     let rows = ledger_rows(&d.sidecar());
+    // Compare the same pipeline on both sidecars, including quality collection.
+    telemetry(&d, &["quality", "collect"]).ok();
     let quality = telemetry(&d, &["quality", "report"]).ok().json();
     for suffix in ["", "-wal", "-shm"] { fs::remove_file(format!("{}{suffix}", d.sidecar().display())).ok(); }
     plant_producers(&d);
     telemetry(&d, &["collect"]).ok();
     telemetry(&d, &["accounting", "sync"]).ok();
     assert_eq!(usage_gates(&d), Vec::<String>::new());
+    telemetry(&d, &["quality", "collect"]).ok();
     assert_eq!(telemetry(&d, &["quality", "report"]).ok().json(), quality);
     assert_eq!(ledger_rows(&d.sidecar()), rows);
     assert_eq!(canonical_digest(&d), canonical);

@@ -721,7 +721,7 @@ fn verification_flips_load_buckets_and_test_attribution_are_read_only() {
         ('9','b','p',"rejected",Some("timeout"),Some(9.0),"fail"),
         ('a','a','q',"rejected",Some("checks_failed"),None,"fail"),
     ];
-    assert_eq!(f.cli_args(&["quality","flaky"]).0, json!({"status":"unavailable","reason":"collection_not_run"}));
+    assert_eq!(f.cli_args(&["quality","flaky"]).0, json!({"status":"unavailable","reason":"verification_not_collected"}));
     for (id,tree,policy,state,reason,load,changed) in cases {
         let sub = hex(id);
         db.execute("INSERT INTO result_submissions(submission_id,project_store,idempotency_key,payload_digest,payload,task_id,contract_revision,contract_digest,attempt_id,repository,base_oid,candidate_oid,object_format,artifact_manifest,claimed_checks,created_unix_ms)
@@ -773,6 +773,31 @@ fn verification_flips_load_buckets_and_test_attribution_are_read_only() {
     assert_eq!(saved.query_row("SELECT count(*) FROM quality_verification_runs",[],|r|r.get::<_,i64>(0)).unwrap(),8);
     assert_eq!(saved.query_row("SELECT count(*) FROM quality_test_results",[],|r|r.get::<_,i64>(0)).unwrap(),21);
     assert_eq!(canonical_bytes(&f.project),canonical);
+    // Rebuilding through unrelated lanes migrates the tables but never derives flakes.
+    for suffix in ["", "-wal", "-shm"] {
+        std::fs::remove_file(format!("{}{suffix}", f.project.join(".state/telemetry.db").display())).ok();
+    }
+    f.cli("collect");
+    f.cli_args(&["accounting","sync"]);
+    assert_eq!(f.cli_args(&["quality","flaky"]).0, json!({"status":"unavailable","reason":"verification_not_collected"}));
+    assert_eq!(f.count("quality_verification_runs"), 0);
+    assert_eq!(f.cli_args(&["quality","collect"]).0["verification_runs"]["observed"], 8);
+    assert_eq!(f.cli_args(&["quality","flaky"]).0, report);
+    assert_eq!(f.cli_args(&["quality","collect"]).0["verification_runs"]["observed"], 0);
+    assert_eq!(f.cli_args(&["quality","flaky"]).0, report);
+    assert_eq!(canonical_bytes(&f.project), canonical);
     let later = (at+1).to_string();
     assert_eq!(f.cli_args(&["quality","flaky","--since",&later]).0["value"],json!({"status":"unavailable","reason":"empty_denominator"}));
+}
+
+#[test]
+fn empty_verification_collection_is_available_after_quality_collect() {
+    let f = Fixture::new();
+    f.cli("collect");
+    assert_eq!(f.cli_args(&["quality","flaky"]).0, json!({"status":"unavailable","reason":"verification_not_collected"}));
+    assert_eq!(f.cli_args(&["quality","collect"]).0["verification_runs"]["observed"], 0);
+    let report = f.cli_args(&["quality","flaky"]).0;
+    assert_eq!(report["status"], "available");
+    assert_eq!(report["value"], json!({"status":"unavailable","reason":"empty_denominator"}));
+    assert_eq!(report["failure_rate_by_load"], json!([]));
 }

@@ -401,7 +401,10 @@ declare no minimum.
 DG6a–c are telemetry only. DG6d/e (stress or rerun policy) remain unbuilt.
 `quality collect` scans at most 10,000 new canonical runs per call into
 quality stream version 3, migration `0003_verification_flakes.sql`; the
-existing tick scans at most 256. An immutable canonical insertion-row
+existing quality lane tick scans at most 256. These are the only paths that
+derive flake rows: migrations create empty tables and unrelated commands
+never backfill them. A sidecar rebuild must replay the same quality collection
+steps before comparing reports. An immutable canonical insertion-row
 cursor (`quality_verification_cursor`) advances over excluded runs too,
 atomically with the projections, making collection incremental and replay
 idempotent without repeatedly scanning infrastructure-failure history. The canonical
@@ -420,7 +423,7 @@ verification_flip_rate`. Group key is `(object_format, tree_oid, policy_id,
 policy_digest)` within this project. Numerator: groups containing accepted
 and rejected checks. Denominator: groups with at least two eligible runs.
 One pair counts once regardless of repeat count or verdict alternations.
-No denominator is unavailable, never zero. A stream created by another collector remains `verification_not_collected`
+No denominator is unavailable, never zero. An absent sidecar or a stream created by another collector remains `verification_not_collected`
 until the quality collector records its first scan, even when empty.
 `by_policy` carries the exact
 ratios separately for each policy id and digest. Windowing uses completion
