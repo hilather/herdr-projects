@@ -462,7 +462,7 @@ fn verify_interaction_tolerates_agents_writing_into_their_execution_home() {
         let home = lab.home.join(format!("agent-home-{kind}"));
         assert!(if kind == "codex" { home.join(".codex/tmp/arg0").exists() } else { home.join(".claude/projects").exists() });
         let revalidated = lab.ok(&["profile", "revalidate", "demo", digest]);
-        assert_eq!(revalidated["launchable"], true, "{kind}: {revalidated}");
+        assert_eq!(revalidated["preparation"]["launchable"], true, "{kind}: {revalidated}");
     }
 }
 
