@@ -146,7 +146,8 @@ pub struct CapturedSubmission {
 /// captured candidate (objects staged from its repository), and an artifact
 /// manifest holding the blob of every output the contract declares at the
 /// candidate. Replays under the same key while the candidate is unchanged. The
-/// submission is as untrusted as any other: verification still decides.
+/// submission is as untrusted as any other: verification still decides. With
+/// automatic verification on it is enqueued at once; the worker need not exit.
 pub fn submit_captured(project: &Path, attempt: &str, message: Option<&str>) -> Result<CapturedSubmission> {
     use sha2::{Digest, Sha256};
     use crate::execution_guard::GatedSpawn;
@@ -195,7 +196,15 @@ pub fn submit_captured(project: &Path, attempt: &str, message: Option<&str>) -> 
         ],
     }))?;
     document.push(b'\n');
-    let held = crate::migration::runtime_mutation(&project)?;
-    let submission = crate::store::submit_untrusted_result_bytes(&held, &project, &document)?;
+    let submission = {
+        let held = crate::migration::runtime_mutation(&project)?;
+        crate::store::submit_untrusted_result_bytes(&held, &project, &document)?
+    };
+    // Automatic verification takes a submission up from the pending projection on
+    // the ticker's next service turn. Enqueue its job now (a no-op unless the
+    // owner enabled automation) so the submission enters verification and
+    // integration without waiting for that turn, and without the worker exiting.
+    // The ticker's own turn remains the recovery path, so a failure here is not one.
+    let _ = crate::store::service_project_verification_jobs(&project);
     Ok(CapturedSubmission { contract_revision: contract.contract_revision, contract_digest: contract.digest, artifacts, submission, capture })
 }

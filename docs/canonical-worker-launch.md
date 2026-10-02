@@ -867,7 +867,16 @@ test.
    revision and digest, base and candidate OIDs, artifact manifest = the blob of every
    declared output at the candidate; objects staged from the repository) and records it
    under a key bound to the candidate, so repeating it replays. With
-   `--integration-ref` automatic verification and integration then proceed.
+   `--integration-ref` automatic verification and integration then proceed: with
+   automatic verification on, `submit-captured` enqueues the verification job itself (as a
+   spooled submission does on the ticker's next turn), so the worker need not exit and the
+   attempt stays as it was.
+   Commands, background jobs and ticker services that need project ownership wait up to two
+   seconds for a short holder (a launch stage, a service turn) instead of failing at once,
+   and a failed canonical worker job (brief, preparation, termination) is retried after two
+   seconds, not thirty. Configuring integration and enabling automation before a reserved
+   launch therefore cannot park its preparation behind a lock race; a failure that remains
+   is written to the ticker log (`.ticker.log`) with its reason.
 5. **`launch run` re-acknowledges an edited owner configuration.** The `project_control`
    step compares the digest control acknowledges with the current configuration and, when
    they differ, reconciles and sets the project active again with the expected revision

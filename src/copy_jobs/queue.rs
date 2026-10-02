@@ -10,7 +10,11 @@ const RETENTION:Duration=Duration::from_secs(180);
 fn failure_delay(identity:&Identity)->Duration {
     // Launch retries observe durable boundaries under the original 30s lease.
     // Generic backoff would consume that entire lease after one lost reply.
-    if identity.operation.starts_with("canonical-launch:") {Duration::from_secs(1)} else {Duration::from_secs(30)}
+    if identity.operation.starts_with("canonical-launch:") {Duration::from_secs(1)}
+    // A brief, preparation or termination that lost a lock race or hit a
+    // transient failure is retried soon; the claim it serves is short-lived.
+    else if identity.operation.starts_with("canonical-worker:") {Duration::from_secs(2)}
+    else {Duration::from_secs(30)}
 }
 struct Entry {work:Option<Request>,resources:Vec<Resource>,not_before:Instant,touched:Instant,last:u64,needed:bool}
 struct Pending {key:Key,identity:Identity,ticket:crate::executor::Ticket,resources:Vec<Resource>}

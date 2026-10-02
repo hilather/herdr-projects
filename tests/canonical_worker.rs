@@ -285,6 +285,22 @@ sys.stdout.buffer.write(json.dumps({'result':json.loads(reply)['result']}).encod
             pause = (pause * 2).min(Duration::from_millis(250));
         }
     }
+    /// `wait` that names the stage and reports the jobs, the attempt and the
+    /// ticker log when it times out.
+    fn wait_for(&self, ticker: &mut Ticker, stage: &str, attempt: &AttemptId, seconds: u64, predicate: &dyn Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(seconds);
+        let mut pause = Duration::from_millis(20);
+        while !predicate() {
+            assert!(ticker.0.try_wait().unwrap().is_none(), "ticker exited while waiting for: {stage}");
+            if Instant::now() >= deadline {
+                let jobs = self.cli(&["result", "demo", "jobs"]);
+                panic!("timed out after {seconds}s waiting for: {stage}\nattempt: {:?}\njobs: {}{}\nticker log:\n{}", self.attempt(attempt).state,
+                    String::from_utf8_lossy(&jobs.stdout), String::from_utf8_lossy(&jobs.stderr), fs::read_to_string(self.path("root/.ticker.log")).unwrap_or_default());
+            }
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(250));
+        }
+    }
     fn stop(&self, mut ticker: Ticker) {
         let stop = self.path("root/.ticker.stop");
         fs::write(&stop, b"").unwrap();
@@ -545,8 +561,8 @@ fn an_operator_finishes_a_worker_that_never_submitted_and_the_result_lands_autom
     lab.ok(&["result", "demo", "auto", "--verify", "on", "--integrate", "on", "--expected-head", &lab.head().to_string()]);
     lab.serve();
     let mut ticker = lab.spawn();
-    lab.wait(&mut ticker, 120, &|| fs::read_to_string(worktree.join("work.txt")).is_ok_and(|t| t == "worker change\n"));
-    assert_eq!(lab.ok(&["result", "demo", "show"]), json!([]), "the worker never submitted");
+    lab.wait_for(&mut ticker, "the worker to launch and edit work.txt", &attempt, 120, &|| fs::read_to_string(worktree.join("work.txt")).is_ok_and(|t| t == "worker change\n"));
+    assert_eq!(lab.ok_live(&|| ["result", "demo", "show"].map(String::from).to_vec()), json!([]), "the worker never submitted");
 
     let done = lab.ok_live(&|| ["result", "demo", "submit-captured", attempt.as_str()].map(String::from).to_vec());
     let candidate = done["capture"]["candidate_oid"].as_str().unwrap().to_owned();
@@ -554,15 +570,18 @@ fn an_operator_finishes_a_worker_that_never_submitted_and_the_result_lands_autom
         (Some(base.as_str()), Some(1), Some(contract.as_str()), Some(false)), "{done}");
     let blob = lab.git(&["rev-parse", &format!("{candidate}:work.txt")]);
     assert_eq!(done["artifacts"], json!([["work.txt", blob]]), "{done}");
-    let shown = lab.ok(&["result", "demo", "show"]);
+    let shown = lab.ok_live(&|| ["result", "demo", "show"].map(String::from).to_vec());
     assert_eq!(shown.as_array().map(|a| (a.len(), a[0]["candidate_oid"].clone(), a[0]["attempt_id"].clone(), a[0]["artifact_manifest"].clone())),
         Some((1, json!(candidate), json!(attempt.as_str()), json!([{"path": "work.txt", "oid": blob}]))), "{shown}");
     // Repeating the command changes nothing.
     let again = lab.ok_live(&|| ["result", "demo", "submit-captured", attempt.as_str()].map(String::from).to_vec());
     assert_eq!((again["submission"]["replayed"].as_bool(), again["capture"]["captured"].as_bool(), again["submission"]["submission_id"].clone()), (Some(true), Some(false), done["submission"]["submission_id"].clone()), "{again}");
-    assert_eq!(lab.ok(&["result", "demo", "show"]).as_array().unwrap().len(), 1);
+    assert_eq!(lab.ok_live(&|| ["result", "demo", "show"].map(String::from).to_vec()).as_array().unwrap().len(), 1);
+    // The submission enters automatic verification at once, while the worker is still running.
+    let jobs = lab.ok_live(&|| ["result", "demo", "jobs"].map(String::from).to_vec());
+    assert!(jobs.as_array().is_some_and(|jobs| jobs.iter().any(|job| job["kind"] == "verification.run" && job["submission_id"] == done["submission"]["submission_id"])), "no verification job after submit-captured: {jobs}\n{:?}", lab.attempt(&attempt).state);
     // Automatic verification and integration take it from here.
-    lab.wait(&mut ticker, 120, &|| lab.git_ok(&["rev-parse", "--verify", "-q", "integration^2"]));
+    lab.wait_for(&mut ticker, "the verified candidate to be integrated", &attempt, 120, &|| lab.git_ok(&["rev-parse", "--verify", "-q", "integration^2"]));
     lab.stop(ticker);
     assert_eq!(lab.git(&["rev-parse", "integration^2"]), candidate);
     assert_eq!(lab.git(&["cat-file", "-p", &format!("{candidate}:work.txt")]), "worker change");

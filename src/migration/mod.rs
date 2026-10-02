@@ -219,6 +219,7 @@ fn load(project:&Path)->Result<Journal> {
     ensure!(journal.plan.sources.iter().all(|s|safe_relative(&s.path)),"unsafe journal path");
     Ok(journal)
 }
+const RUNTIME_WAIT:std::time::Duration=std::time::Duration::from_secs(2);
 pub(crate) struct Maintenance { _locks:Vec<crate::execution_guard::LockFile>,_project:Option<crate::execution_guard::ProjectGuard>,_root:Option<crate::execution_guard::RootGuard> }
 impl Maintenance {
     pub(crate) fn inherit_routine_execution(&self)->Result<Vec<crate::runner::InheritedLock>> {
@@ -243,8 +244,10 @@ impl Maintenance {
         no_pending_cutover(project)?;
         Ok(Self{_locks:vec![record],_project:Some(guard),_root:None})
     }
+    /// Waits briefly for a short holder (a launch stage, a service turn) instead
+    /// of failing at once: a caller that lost the race must not be sent away for a retry cycle.
     fn runtime(project:&Path)->Result<Self> {
-        let guard=crate::execution_guard::ProjectGuard::acquire(project)?;
+        let guard=crate::execution_guard::ProjectGuard::acquire_within(project,RUNTIME_WAIT)?;
         let record=crate::execution_guard::exclusive_file(&project.join(".state/lock"))?;
         Ok(Self{_locks:vec![record],_project:Some(guard),_root:None})
     }
