@@ -558,6 +558,23 @@ fn launch_run_with_a_dedicated_server_after_verify_interaction_reserves_both_kin
     let state = herdr_projects::runtime::snapshot(&lab.project).unwrap();
     assert_eq!(state.attempts.len(), 2);
     assert_eq!(state.control.unwrap().state, ProjectState::Active);
+
+    // Each task's dedicated server is still running while its attempt holds the
+    // worker, so `launch stop` refuses; with --force it stops the server and
+    // removes its socket directory. Nothing is left running or on disk.
+    let servers = || String::from_utf8(Command::new("/usr/bin/pgrep").args(["-f", &format!("{} server", lab.home.join("bin/herdr").display())]).output().unwrap().stdout).unwrap().lines().count();
+    assert_eq!(servers(), 2, "one dedicated server per task");
+    let refused = lab.fail(&["launch", "demo", "stop", "--task", "plan-codex"]);
+    assert!(refused.contains("still holds its worker"), "{refused}");
+    for (task, _) in jobs {
+        let report = lab.ok(&["launch", "demo", "stop", "--task", task, "--force"]);
+        assert_eq!((report["stopped"].as_bool(), report["socket_directory_removed"].as_bool()), (Some(true), Some(true)), "{report}");
+        let again = lab.ok(&["launch", "demo", "stop", "--task", task, "--force"]);
+        assert_eq!(again["stopped"], false, "stopping twice is harmless: {again}");
+    }
+    assert_eq!(servers(), 0, "no stand-in Herdr server is left running");
+    let left: Vec<_> = fs::read_dir(lab.runtime.path()).unwrap().flatten().map(|e| e.file_name()).collect();
+    assert!(left.is_empty(), "no socket directory is left behind: {left:?}");
 }
 
 /// socket: agents that write into their execution home (`.codex/tmp/arg0` on

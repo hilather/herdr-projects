@@ -478,6 +478,45 @@ fn launch_sets_the_intended_permission_mode_over_a_stale_one_in_the_home() {
     assert_eq!(written["owner_extra"], "kept", "{written}");
 }
 
+/// `launch run` records the dedicated Herdr server it starts for a task; once the
+/// task's worker has terminated the ticker stops that server and removes its
+/// socket directory.
+#[test]
+fn ticker_stops_the_dedicated_herdr_server_of_a_finished_task() {
+    let mut lab = Lab::new("unknown_usage='allow_with_warning'");
+    let (_, attempt) = lab.reserve("Retained instructions");
+    lab.serve();
+    let launched = || { let s = lab.state(); s.operations.iter().any(|o| o.kind == "runtime.worker_brief" && s.deliveries.iter().any(|d| d.operation == o.id && d.state == DeliveryState::Confirmed)) };
+    let mut ticker = lab.spawn();
+    lab.wait(&mut ticker, 120, &launched);
+    // The server `launch run` would have started: a `server` process whose
+    // environment names its socket, recorded beside the run's logs.
+    let sockets = lab.path("run-sockets");
+    fs::create_dir_all(sockets.join("rdedicated")).unwrap();
+    let socket = sockets.join("rdedicated/s");
+    fs::write(&socket, b"").unwrap();
+    let mut server = Command::new("/usr/bin/python3").args(["-c", "import time; time.sleep(300)", "server"]).env("HERDR_SOCKET_PATH", &socket).spawn().unwrap();
+    let run = lab.path("root/.herdr-run");
+    let dir = run.join("demo-work/herdr");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("server.json"), json!({"pid": server.id(), "socket": socket}).to_string()).unwrap();
+    // While the attempt holds its worker nothing is stopped.
+    lab.wait(&mut ticker, 60, &|| lab.count("agent.list") >= 3);
+    assert!(server.try_wait().unwrap().is_none() && socket.exists());
+    // The operator cancels the attempt; the ticker proves the worker's termination and then the server goes.
+    let running = lab.attempt(&attempt);
+    lab.ok_live(&|| ["task", "demo", "cancel-attempt", attempt.as_str(), "--expected-revision", &running.revision.to_string(), "--expected-head", &lab.head().to_string(), "--reason", "finished"].map(String::from).to_vec());
+    lab.wait(&mut ticker, 60, &|| lab.attempt(&attempt).termination_observed);
+    let until = Instant::now() + Duration::from_secs(30);
+    while server.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < until, "the ticker never stopped the finished task's server: {}", fs::read_to_string(lab.path("root/.ticker.log")).unwrap_or_default());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    lab.stop(ticker);
+    assert!(!socket.exists() && !sockets.join("rdedicated").exists(), "its socket directory is removed");
+    assert!(!run.join("demo-work/herdr/server.json").exists());
+}
+
 #[test]
 fn ticker_recovers_a_lost_creation_reply_without_creating_again() {
     let mut lab = Lab::new("unknown_usage='allow_with_warning'");

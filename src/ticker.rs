@@ -594,6 +594,10 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
                 Ok(lines)=>for line in lines {log.line(&format!("{slug}: {line}"));},
                 Err(error)=>log.line(&format!("{slug}: submission spool: {error:#}")),
             }
+            // A dedicated Herdr server `launch run` started goes away with its
+            // task's worker.
+            #[cfg(target_os="linux")]
+            for line in crate::launch_run::sweep_servers(ctx,slug) {log.line(&format!("{slug}: {line}"));}
             // Migrated projects ingest Remember obligations and deliver due
             // reminders as stable rows into the SQLite inbox (never legacy
             // inbox files). Failures log and retry next tick; a failed

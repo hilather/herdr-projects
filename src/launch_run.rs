@@ -19,6 +19,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Beside a dedicated server's logs: its process id and socket.
+const SERVER_RECORD: &str = "server.json";
+
 pub struct Args {
     pub task: String,
     pub profile: String,
@@ -168,7 +171,7 @@ fn herdr_server(run: &mut Run, herdr: &Path, task: &str, existing: Option<&Path>
     )?;
     let log = fs::File::create(directory.join("server.log"))?;
     // Its own process group: the server outlives this command.
-    Command::new(herdr)
+    let child = Command::new(herdr)
         .arg("server")
         .env_clear()
         .env("HOME", directory.join("home"))
@@ -186,6 +189,9 @@ fn herdr_server(run: &mut Run, herdr: &Path, task: &str, existing: Option<&Path>
         .process_group(0)
         .spawn_gated()
         .context("Herdr server could not be started")?;
+    // The record `launch stop` and the ticker's sweep use to find (and prove
+    // they have found) this server again.
+    fs::write(directory.join(SERVER_RECORD), serde_json::to_vec_pretty(&json!({"pid":child.id(),"socket":socket}))?)?;
     let deadline = Instant::now() + Duration::from_secs(20);
     while std::os::unix::net::UnixStream::connect(&socket).is_err() {
         ensure!(Instant::now() < deadline, "Herdr server did not open {} (see server.log beside it)", socket.display());
@@ -378,4 +384,93 @@ fn report(run: &Run, task: &str, profile: &VersionedReference, kind: &str, herdr
             format!("Watch it with `scheduler {} inspect` and `operations {} inspect`; the worker's edits are captured with `result {} capture <attempt>`.", run.slug, run.slug, run.slug)
         ]
     })
+}
+
+/// Whether `pid` is still the dedicated server `launch run` started on `socket`:
+/// a `herdr server` process of ours whose environment names that socket. A
+/// recycled process id never matches.
+fn is_our_server(pid: i32, socket: &Path) -> bool {
+    let read = |name: &str| fs::read(format!("/proc/{pid}/{name}")).unwrap_or_default();
+    let cmdline = read("cmdline");
+    let args: Vec<&[u8]> = cmdline.split(|b| *b == 0).filter(|a| !a.is_empty()).collect();
+    let wanted = format!("HERDR_SOCKET_PATH={}", socket.display());
+    args.last() == Some(&b"server".as_slice()) && read("environ").split(|b| *b == 0).any(|e| e == wanted.as_bytes())
+}
+
+fn signal(pid: i32, signal: i32) -> bool {
+    // SAFETY: kill(2) on a process id this module just proved to be its server.
+    unsafe { libc::kill(pid, signal) == 0 }
+}
+
+/// Stop the dedicated Herdr server of `task` and remove its socket directory.
+/// Refuses while the task's attempt still holds its worker, unless `force`.
+/// A task with no dedicated server (an operator-managed `--herdr-socket`) is
+/// left alone. Idempotent.
+pub fn stop(ctx: &Ctx, slug: &str, task: &str, force: bool) -> Result<Value> {
+    let project = ctx.root.join(slug).canonicalize().with_context(|| format!("project {slug} not found"))?;
+    let task_id = TaskId::new(task.to_owned()).map_err(anyhow::Error::msg)?;
+    let directory = ctx.root.join(".herdr-run").join(format!("{slug}-{task}")).join("herdr");
+    let record = directory.join(SERVER_RECORD);
+    let Ok(text) = fs::read_to_string(&record) else {
+        return Ok(json!({"task":task,"stopped":false,"reason":"no dedicated Herdr server is recorded for this task"}));
+    };
+    let record_value: Value = serde_json::from_str(&text).context("server record is unreadable")?;
+    let snapshot = runtime::snapshot(&project)?;
+    let held = snapshot.tasks.iter().find(|t| t.id == task_id).and_then(|t| t.active_attempt.as_ref())
+        .and_then(|id| snapshot.attempts.iter().find(|a| &a.id == id)).filter(|a| a.retains_capacity());
+    if let (Some(attempt), false) = (held, force) {
+        bail!("attempt {} of task {task} still holds its worker; stop it first (or pass --force)", attempt.id.as_str());
+    }
+    let pid = record_value["pid"].as_i64().context("server record has no pid")? as i32;
+    let socket = PathBuf::from(record_value["socket"].as_str().context("server record has no socket")?);
+    let mut stopped = false;
+    if pid > 1 && is_our_server(pid, &socket) {
+        signal(pid, libc::SIGTERM);
+        let until = Instant::now() + Duration::from_secs(5);
+        while Path::new(&format!("/proc/{pid}")).exists() && is_our_server(pid, &socket) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if is_our_server(pid, &socket) {
+            signal(pid, libc::SIGKILL);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        stopped = true;
+    }
+    // The socket directory is the short private one named by the socket itself.
+    if let Some(dir) = socket.parent().filter(|d| d.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('r')) && socket.file_name().is_some_and(|n| n == "s")) {
+        let _ = fs::remove_file(&socket);
+        let _ = fs::remove_dir(dir);
+    }
+    fs::remove_file(&record)?;
+    Ok(json!({"task":task,"stopped":stopped,"socket":socket,"socket_directory_removed":!socket.exists()}))
+}
+
+/// Stop the dedicated server of every task of `slug` whose attempts are all
+/// finished (worker termination observed). The ticker calls this each pass; it
+/// does nothing unless a server record exists. One line per stopped server or
+/// failure, for the ticker log.
+pub fn sweep_servers(ctx: &Ctx, slug: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let prefix = format!("{slug}-");
+    let Ok(entries) = fs::read_dir(ctx.root.join(".herdr-run")) else { return lines };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(task) = name.strip_prefix(&prefix) else { continue };
+        if !entry.path().join("herdr").join(SERVER_RECORD).is_file() {
+            continue;
+        }
+        let Ok(project) = ctx.root.join(slug).canonicalize() else { continue };
+        let Ok(snapshot) = runtime::snapshot(&project) else { continue };
+        let Some(record) = snapshot.tasks.iter().find(|t| t.id.as_str() == task) else { continue };
+        // A task that never reserved an attempt has not used its server yet.
+        if record.active_attempt.is_some() || !snapshot.attempts.iter().any(|a| a.task.as_str() == task) {
+            continue;
+        }
+        match stop(ctx, slug, task, false) {
+            Ok(report) if report["stopped"] == true => lines.push(format!("stopped the dedicated Herdr server of finished task {task}")),
+            Ok(_) => {}
+            Err(error) => lines.push(format!("dedicated Herdr server of task {task} not stopped: {error:#}")),
+        }
+    }
+    lines
 }

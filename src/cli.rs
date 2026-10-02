@@ -175,6 +175,14 @@ enum LaunchCommand {
         /// Stop before reserving. A new binding pauses the project until no attempt is unfinished, so prepare every task first, then run each again to reserve
         #[arg(long)] prepare_only: bool,
     },
+    /// Stop the dedicated Herdr server `launch run` started for a task and
+    /// remove its socket directory. The ticker does this by itself once the
+    /// task's worker has terminated; this is the explicit form.
+    Stop {
+        #[arg(long)] task: String,
+        /// Stop it even while the task's attempt still holds a worker
+        #[arg(long)] force: bool,
+    },
 }
 
 #[cfg(feature="state-store")]
@@ -1267,6 +1275,7 @@ pub fn run() -> Result<()> {
                     serde_json::to_value(herdr_projects::launch_preparation::draft(&project,&load(&selection)?,expected_head,std::time::Duration::from_secs(validity_seconds),deadline,Default::default())?)?,
                 LaunchCommand::Run { task, profile, repository, sign_with, validity_seconds, title, plan_output, prompt_file, contract_file, integration_ref, base, max_active_workers, herdr_socket, prepare_only } =>
                     crate::launch_run::run(&ctx, &slug, crate::launch_run::Args { task, profile, repository, sign_with, validity_seconds, title, plan_output, prompt_file, contract_file, integration_ref, base, max_active_workers, herdr_socket, prepare_only })?,
+                LaunchCommand::Stop { task, force } => crate::launch_run::stop(&ctx, &slug, &task, force)?,
                 LaunchCommand::Reserve { selection, approval_digest, expected_head } => {
                     let approval=herdr_projects::domain::VersionedReference{id:format!("approval-{approval_digest}"),revision:1,digest:approval_digest};
                     serde_json::to_value(herdr_projects::launch_preparation::reserve(&project,&load(&selection)?,&approval,expected_head,deadline,Default::default())?)?
