@@ -99,6 +99,29 @@ fn agent_source(version: &str, login: &str, trust: &str) -> String {
     )
 }
 
+/// A stand-in agent that, like the real ones, writes into its execution home:
+/// on `--version` (when it is given a HOME) and during the session. `version_extra`
+/// is extra Rust run on `--version` with `home` bound, for hostile variants.
+fn writing_agent_source(version: &str, login: &str, trust: &str, version_dir: &str, version_file: &str, session_file: &str, version_extra: &str) -> String {
+    format!(
+        r#"fn main(){{
+ let home=std::env::var("HOME").unwrap_or_default();
+ if std::env::args().nth(1).as_deref()==Some("--version"){{
+  if !home.is_empty(){{std::fs::create_dir_all(format!("{{home}}/{version_dir}")).unwrap();std::fs::write(format!("{{home}}/{version_dir}/{version_file}"),"probe").unwrap();}}
+  {version_extra}
+  println!({version:?});return
+ }}
+ if std::fs::read_to_string(format!("{{home}}/{login}")).unwrap_or_default().trim()!="shared-login"{{eprintln!("not logged in");std::process::exit(7)}}
+ let cwd=std::env::current_dir().unwrap();
+ if !std::fs::read_to_string(format!("{{home}}/{trust}")).unwrap_or_default().contains(cwd.to_str().unwrap()){{eprintln!("untrusted directory");std::process::exit(8)}}
+ let session=format!("{{home}}/{session_file}");
+ std::fs::create_dir_all(std::path::Path::new(&session).parent().unwrap()).unwrap();
+ std::fs::write(session,"{{}}").unwrap();
+ loop{{std::thread::park()}}
+}}"#
+    )
+}
+
 struct Lab {
     _top: tempfile::TempDir,
     home: PathBuf,
@@ -162,6 +185,19 @@ impl Lab {
         lab.git(&["branch", "integration"]);
         fs::write(lab.project.join("PROJECT.md"), "Shadow trial project. Follow the task.\n").unwrap();
         lab
+    }
+    /// Replace the stand-in agent `name` with one built from `source`.
+    fn build_agent(&self, name: &str, source: &str) {
+        let file = self.home.join(format!("bin/{name}.rs"));
+        fs::write(&file, source).unwrap();
+        let built = Command::new("rustc").args(["--edition", "2021", "-o"]).arg(self.home.join("bin").join(name)).arg(&file).output().unwrap();
+        assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+        fs::set_permissions(self.home.join("bin").join(name), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fn prepare(&self, profile: &str, kind: &str) -> Output {
+        let (herdr, agent, home) = (self.home.join("bin/herdr"), self.home.join("bin").join(kind), self.home.join(format!("agent-home-{kind}")));
+        self.cli(&["profile", "prepare", "demo", profile, "--herdr-executable", herdr.to_str().unwrap(),
+            "--agent-executable", agent.to_str().unwrap(), "--execution-home", home.to_str().unwrap()])
     }
     fn git(&self, args: &[&str]) -> String {
         let out = Command::new("/usr/bin/git").env_clear().env("PATH", "/usr/bin:/bin").env("HOME", &self.home)
@@ -408,4 +444,52 @@ fn launch_run_with_a_dedicated_server_after_verify_interaction_reserves_both_kin
     let state = herdr_projects::runtime::snapshot(&lab.project).unwrap();
     assert_eq!(state.attempts.len(), 2);
     assert_eq!(state.control.unwrap().state, ProjectState::Active);
+}
+
+/// socket: agents that write into their execution home (`.codex/tmp/arg0` on
+/// `--version`, a rollout during the session; `.claude.json`/`.claude/projects`)
+/// must not fail verification; the retained evidence revalidates.
+#[test]
+fn verify_interaction_tolerates_agents_writing_into_their_execution_home() {
+    let lab = Lab::new();
+    lab.build_agent("codex", &writing_agent_source("codex-cli 0.159.2", ".codex/auth.json", ".codex/config.toml", ".codex/tmp", "arg0", ".codex/sessions/x.jsonl", ""));
+    lab.build_agent("claude", &writing_agent_source("2.1.0 (Claude Code)", ".claude/.credentials.json", ".claude.json", ".claude/projects", "probe.jsonl", ".claude/projects/session.jsonl", ""));
+    for (profile, kind) in [("codex-sol", "codex"), ("claude-sonnet", "claude")] {
+        let report = lab.verify(profile, kind);
+        assert_eq!(report["preparation"]["launchable"], true, "{kind}: {report}");
+        let digest = report["preparation"]["reference"]["digest"].as_str().unwrap();
+        // The home's contents changed (the agent wrote into it); revalidation still accepts it.
+        let home = lab.home.join(format!("agent-home-{kind}"));
+        assert!(if kind == "codex" { home.join(".codex/tmp/arg0").exists() } else { home.join(".claude/projects").exists() });
+        let revalidated = lab.ok(&["profile", "revalidate", "demo", digest]);
+        assert_eq!(revalidated["launchable"], true, "{kind}: {revalidated}");
+    }
+}
+
+/// A home written to by the version probe is accepted by `profile prepare`.
+#[test]
+fn prepare_accepts_a_home_the_version_probe_wrote_into() {
+    let lab = Lab::new();
+    lab.build_agent("codex", &writing_agent_source("codex-cli 0.159.2", ".codex/auth.json", ".codex/config.toml", ".codex/tmp", "arg0", ".codex/sessions/x.jsonl", ""));
+    let out = lab.prepare("codex-sol", "codex");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(lab.home.join("agent-home-codex/.codex/tmp/arg0").exists(), "the probe really wrote into the home");
+}
+
+/// A home swapped (renamed away and recreated at the same path) or made
+/// group-writable while the agent is probed is still refused.
+#[test]
+fn prepare_refuses_a_swapped_or_repermissioned_execution_home() {
+    let lab = Lab::new();
+    let swap = r#"{ let h=std::path::Path::new(&home);let moved=format!("{home}.moved");std::fs::rename(h,&moved).unwrap();std::fs::create_dir(h).unwrap();std::fs::set_permissions(h,std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap(); }"#;
+    lab.build_agent("codex", &writing_agent_source("codex-cli 0.159.2", ".codex/auth.json", ".codex/config.toml", ".codex/tmp", "arg0", ".codex/sessions/x.jsonl", swap));
+    let out = lab.prepare("codex-sol", "codex");
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("execution home changed"), "{}", String::from_utf8_lossy(&out.stderr));
+    fs::remove_dir_all(lab.home.join("agent-home-codex")).unwrap();
+    fs::rename(lab.home.join("agent-home-codex.moved"), lab.home.join("agent-home-codex")).ok();
+    fs::create_dir_all(lab.home.join("agent-home-codex")).unwrap();
+    let chmod = r#"std::fs::set_permissions(&home,std::os::unix::fs::PermissionsExt::from_mode(0o770)).unwrap();"#;
+    lab.build_agent("codex", &writing_agent_source("codex-cli 0.159.2", ".codex/auth.json", ".codex/config.toml", ".codex/tmp", "arg0", ".codex/sessions/x.jsonl", chmod));
+    let out = lab.prepare("codex-sol", "codex");
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("execution home changed"), "{}", String::from_utf8_lossy(&out.stderr));
 }

@@ -60,6 +60,11 @@ fn stamp(m: &std::fs::Metadata) -> (u64, u64, u64, i64, i64, i64, i64, u32) {
         m.mode(),
     )
 }
+/// Agents write into their execution home, so only identity (not contents,
+/// mtime or ctime) is compared: a swapped or re-permissioned home still differs.
+fn home_identity(m: &std::fs::Metadata) -> (u64, u64, u32, u32) {
+    (m.dev(), m.ino(), m.mode(), m.uid())
+}
 fn executable(
     path: &Path,
     deadline: Instant,
@@ -251,7 +256,7 @@ fn prepare_locked(
     ensure!(
         executable(agent_path, deadline, &cancellation)? == agent_identity
             && executable(herdr_path, deadline, &cancellation)? == herdr_identity
-            && stamp(&std::fs::symlink_metadata(execution_home)?) == stamp(&home),
+            && home_identity(&std::fs::symlink_metadata(execution_home)?) == home_identity(&home),
         "profile installation or execution home changed during probing"
     );
     let profile = FrozenProfile {
