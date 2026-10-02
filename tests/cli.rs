@@ -3270,7 +3270,7 @@ fn outcome_success_path() {
         "launching_unix_ms":marks[1].2,
         "queue_to_launch_ms":marks[1].2-marks[0].2,
         "reserved_unix_ms":marks[0].2,
-        "result":{"candidate_oid":a_candidate,"created_unix_ms":submitted_ms,"state":"submitted","submission_id":a},
+        "result":{"candidate_oid":a_candidate,"created_unix_ms":submitted_ms,"state":"submitted","submission_id":a,"submissions":1},
         "running_unix_ms":marks[2].2,
         "task_id":"a",
         "terminal_state":"completed",
