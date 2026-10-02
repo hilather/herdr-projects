@@ -342,6 +342,17 @@ sys.stdout.buffer.write(json.dumps({'result':json.loads(reply)['result']}).encod
     }
     /// Run a fresh ticker until the server has seen `passes` more `method`
     /// requests, then stop it.
+    /// Run a ticker for `seconds` (several passes) and stop it: for checks that
+    /// nothing further happens once no session is left to probe.
+    fn run_quiet(&self, seconds: u64) {
+        let mut ticker = self.spawn();
+        let until = Instant::now() + Duration::from_secs(seconds);
+        while Instant::now() < until {
+            assert!(ticker.0.try_wait().unwrap().is_none(), "ticker exited");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        self.stop(ticker);
+    }
     fn run_for(&self, method: &str, passes: usize) {
         let seen = self.count(method);
         let mut ticker = self.spawn();
@@ -679,7 +690,7 @@ fn accepted_editing_worker_completes_automatically_after_integration() {
     let replay = lab.ok_live(&|| ["task", "demo", "complete", "work", "--expected-revision", "0"].map(String::from).to_vec());
     assert_eq!(replay["replayed"], true);
     lab.stop(ticker);
-    lab.run_for("completion-restart", 2);
+    lab.run_quiet(5);
     assert_eq!(lab.events("attempt.completion_requested").len(), 1);
     assert_eq!(lab.events("runtime.worker_terminated").len(), 1);
 }
@@ -707,7 +718,9 @@ fn rejected_editing_worker_stays_running_and_can_resubmit() {
         let report = herdr_projects::telemetry::outcome::attempts(&lab.project).unwrap();
         report["attempts"].as_array().unwrap().iter().any(|a| a["attempt_id"] == attempt.as_str() && a["verification"]["state"] == "rejected")
     });
-    assert_eq!(lab.attempt(&attempt).state, AttemptState::Running);
+    // The worker submits before its brief's acceptance window closes, so the
+    // rejection can land while the attempt is still launching.
+    lab.wait_for(&mut ticker, "the rejected attempt running", &attempt, 60, &|| lab.attempt(&attempt).state == AttemptState::Running);
     assert!(lab.attempt(&attempt).retains_capacity());
     assert!(lab.events("attempt.completion_requested").is_empty());
     fs::write(worktree.join("resubmit"), "go").unwrap();
@@ -741,7 +754,7 @@ fn editing_worker_requires_operator_completion_when_automation_is_off() {
                 "--repository", &repository, "--idempotency-key", "manual-integrate", "--work-dir", lab.path("manual-integrate").to_str().unwrap()]);
             assert_eq!(integrated["state"], "integrated");
         }
-        lab.run_for("manual-completion", 3);
+        lab.run_quiet(5);
         assert_eq!(lab.attempt(&attempt).state, AttemptState::Running);
         assert!(lab.attempt(&attempt).retains_capacity());
         assert!(lab.events("attempt.completion_requested").is_empty());
