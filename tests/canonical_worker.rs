@@ -621,7 +621,8 @@ fn main() {
             let oid = line.split_whitespace().next().unwrap();
             format!("{{\"oid\":\"{oid}\",\"relative_path\":\"{}/{}\"}}", &oid[..2], &oid[2..])
         }).collect::<Vec<_>>().join(",");
-        let document = TEMPLATE.replace("CANDIDATE", &candidate).replace("BLOB", &blob)
+        let template = fs::read_to_string(TEMPLATE_PATH).unwrap();
+        let document = template.replace("CANDIDATE", &candidate).replace("BLOB", &blob)
             .replace("\"OBJECTS\"", &format!("[{objects}]")).replace("KEY", &format!("editing-{index}"));
         fs::write("submission.json", document).unwrap();
         let mut submitted = false;
@@ -640,6 +641,10 @@ fn main() {
 fn editing_submission_lab(route: &str, policy: &str, verify: bool, integrate: bool) -> (Lab, AttemptId, PathBuf) {
     let mut lab = Lab::new("unknown_usage='allow_with_warning'\n");
     let (contract, base) = lab.install_work_contract_policy(route, policy);
+    // Reservation freezes the executable digest. Supply attempt-specific data
+    // through a fixture file instead of rebuilding the worker afterward.
+    let template_path = lab.path("submission-template.json");
+    lab.write_agent(SUBMITTING_EDITING_AGENT, &[("ROOT", lab.path("root").canonicalize().unwrap().display().to_string()), ("TEMPLATE_PATH", template_path.display().to_string())]);
     let (_, attempt) = lab.reserve("Retained instructions");
     let worktree = lab.planned_worktree(&attempt);
     let repository = lab.repo.canonicalize().unwrap().display().to_string();
@@ -649,7 +654,7 @@ fn editing_submission_lab(route: &str, policy: &str, verify: bool, integrate: bo
     let template = json!({"idempotency_key":"KEY", "task_id":"work", "contract_revision":1, "contract_digest":contract,
         "attempt_id":attempt.as_str(), "repository":repository, "base_oid":base, "candidate_oid":"CANDIDATE", "object_format":"sha256",
         "artifact_manifest":[{"path":"work.txt", "oid":"BLOB"}], "claimed_checks":[], "objects":"OBJECTS"}).to_string();
-    lab.write_agent(SUBMITTING_EDITING_AGENT, &[("ROOT", lab.path("root").canonicalize().unwrap().display().to_string()), ("TEMPLATE", template)]);
+    fs::write(template_path, template).unwrap();
     (lab, attempt, worktree)
 }
 
@@ -695,6 +700,7 @@ fn accepted_verify_only_editing_worker_completes_without_integration_automation(
 #[test]
 fn rejected_editing_worker_stays_running_and_can_resubmit() {
     let (mut lab, attempt, worktree) = editing_submission_lab("verify_only", r#"{"version":1,"checks":["/usr/bin/false"]}"#, true, false);
+    herdr_projects::telemetry::sidecar::open(&lab.project, true).unwrap().unwrap();
     lab.serve();
     let mut ticker = lab.spawn();
     lab.wait_for(&mut ticker, "rejected verification", &attempt, 120, &|| {

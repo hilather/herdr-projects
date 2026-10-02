@@ -719,3 +719,18 @@ ledger source (cache-exclusive input normalized to `otlp-devin-exclusive-v1`)
 and the Devin `api_request` clause of `otlp_ledger_sources`; rows preserved, no
 new table, `sidecar.otlp` retention/backup coverage unchanged. No canonical
 schema change. See [contracts-collection.md DG4k](contracts-collection.md#dg4k-devin-cli-3000113-otlp-mapping-fixture-certification).
+
+### Automatic completion service
+
+Ticker completion selection uses the scoped store opener with a two-second SQL
+deadline, the retained-attempt index, and at most eight eligible requests per
+pass. It exits early when verification automation is off or no worker is running;
+whole-store integrity checks belong to the periodic ticker check. Only a newly
+recorded completion request reports scheduled work.
+
+`attempt.completion_refused` is a canonical diagnostic event (payload version 1):
+`task`, `reason`, and `evidence` record a refusal and its task revision plus
+submission, verification and integrated-operation counts for the active attempt.
+Unchanged evidence suppresses retries and duplicate ticker log messages; changed
+evidence permits another request. This uses the existing event ledger and its
+backup/retention classification, with no schema change.

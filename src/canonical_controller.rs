@@ -112,7 +112,12 @@ fn finish_poll(ctx:&Ctx,path:&Path,turn:u64,reachable:bool,observation_error:Opt
     let replan_work=service("replan request service",&|path|Ok(herdr_projects::store::service_project_replans(path)?.pending));
     let verification_work=service("verification job service",&|path|Ok(herdr_projects::store::service_project_verification_jobs(path)?.pending));
     let integration_work=service("integration job service",&|path|Ok(herdr_projects::store::service_project_integration_jobs(path)?.pending));
-    let completion_work=service("result completion service",&|path|herdr_projects::store::service_project_result_completions(path));
+    let completion_work=if root_owned {true} else {
+        match herdr_projects::store::service_project_result_completions(path) {
+            Ok((pending,diagnostic))=>{if let Some(reason)=diagnostic {errors.push(format!("result completion service: {reason}"));}pending},
+            Err(error)=>{errors.push(format!("result completion service: {error:#}"));true},
+        }
+    };
     let routine_work=match scheduled {Ok(report)=>{if let Some(error)=report.diagnostic {errors.push(format!("routine scheduling: {error}"));}report.active},Err(error)=>{errors.push(format!("routine scheduling: {error:#}"));false}};
     // An admission failure is diagnostic only. Already-prepared dispatch still runs.
     let (progress,unknown_effects)=match result {

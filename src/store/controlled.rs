@@ -508,3 +508,10 @@ impl Drop for ControlledStore {
 
 #[cfg(test)]
 mod tests;
+
+impl ControlledStore {
+    pub(crate) fn service_result_completions(&mut self)->Result<(bool,Option<String>)> {
+        self.control.check()?;
+        self.store.service_result_completions().map_err(|error|self.error(error))
+    }
+}

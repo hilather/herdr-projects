@@ -570,33 +570,60 @@ impl SqliteStore {
 /// Reuse operator completion under project ownership. Selection is bounded;
 /// each request rechecks automation, result evidence and revision in its write
 /// transaction. Cancellation and already requested completion remain authoritative.
-pub fn service_project_result_completions(project:&Path)->anyhow::Result<bool> {
+/// Returns newly scheduled work and a diagnostic for newly recorded refusals.
+pub fn service_project_result_completions(project:&Path)->anyhow::Result<(bool,Option<String>)> {
     let _guard=crate::migration::runtime_mutation(project)?;
-    let mut db=crate::migration::open_active(project)?;
-    let version:u32=db.connection.query_row("PRAGMA user_version",[],|row|row.get(0))?;
-    if version<45 {return Ok(false);}
-    let mut accepted=ACCEPTED_SUBMISSION.replace("?1","t.id").replace("?2","a.id");
-    accepted.push_str(&format!(" AND {AUTO_SUBMISSION_READY}"));
-    if super::seeded_defects::registry_present(&db.connection)? {
-        accepted.push_str(" AND NOT EXISTS(SELECT 1 FROM seeded_candidates x WHERE x.submission_id=s.submission_id AND x.arm='seeded')");
-    }
-    if super::candidate_groups::groups_present(&db.connection)? {
-        accepted.push_str(&format!(" AND NOT {} AND NOT EXISTS(SELECT 1 FROM candidate_groups g WHERE g.task_id=s.task_id AND g.contract_revision=s.contract_revision
-            AND NOT EXISTS(SELECT 1 FROM candidate_selections x WHERE x.group_id=g.group_id AND x.outcome='selected' AND x.submission_id=s.submission_id))",super::candidate_groups::HELD_ARM));
-    }
-    let tasks:Vec<(String,u64)>=db.connection.prepare(&format!("SELECT t.id,t.revision FROM tasks t JOIN attempts a ON a.id=t.active_attempt
-        WHERE a.state='running' AND a.termination_observed=0 AND EXISTS({accepted})
-          AND EXISTS(SELECT 1 FROM attempt_inputs n JOIN events e ON e.entity=n.operation_id AND e.kind='runtime.launch_started' WHERE n.attempt_id=a.id)
-          AND NOT EXISTS(SELECT 1 FROM events e WHERE e.entity=a.id AND e.kind='attempt.completion_requested')
-          AND NOT EXISTS(SELECT 1 FROM attempt_cancellations c WHERE c.attempt_id=a.id)
-        ORDER BY t.id LIMIT 9"))?.query_map([],|row|Ok((row.get(0)?,row.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
-    for (task,revision) in tasks.iter().take(8) {
-        let task=TaskId::new(task.clone()).map_err(anyhow::Error::msg)?;
-        match db.request_completion_mode(&task,*revision,jiff::Timestamp::now().as_millisecond(),true) {
-            Ok(_)|Err(StoreError::Conflict)|Err(StoreError::Invalid(_))=>{},
-            Err(error)=>return Err(error.into()),
+    let control=controlled::ReadControl::new(std::time::Instant::now()+Duration::from_secs(2),Default::default());
+    crate::migration::open_active_scoped(project,control)?.service_result_completions().map_err(Into::into)
+}
+
+impl SqliteStore {
+    pub(crate) fn service_result_completions(&mut self)->Result<(bool,Option<String>)> {
+        let db=self;
+        let version:u32=db.connection.query_row("PRAGMA user_version",[],|row|row.get(0))?;
+        if version<45 {return Ok((false,None));}
+        if !db.connection.query_row("SELECT EXISTS(SELECT 1 FROM result_automation_control WHERE verify=1)",[],|row|row.get::<_,bool>(0))?
+            || !db.connection.query_row("SELECT EXISTS(SELECT 1 FROM attempts INDEXED BY attempts_retained_by_id WHERE termination_observed=0 AND state='running')",[],|row|row.get::<_,bool>(0))? {return Ok((false,None));}
+        // Only changes to this task's completion evidence rearm a refusal.
+        let evidence="printf('%d:%d:%d:%d',t.revision,
+            (SELECT count(*) FROM result_submissions s WHERE s.attempt_id=a.id),
+            (SELECT count(*) FROM verification_runs v WHERE v.task_id=t.id AND v.attempt_id=a.id),
+            (SELECT count(*) FROM integration_operations i JOIN verified_results r ON r.result_id=i.verified_result_id
+                JOIN result_submissions s ON s.submission_id=r.submission_id WHERE s.attempt_id=a.id AND i.state='integrated'))";
+        let mut accepted=ACCEPTED_SUBMISSION.replace("?1","t.id").replace("?2","a.id");
+        accepted.push_str(&format!(" AND {AUTO_SUBMISSION_READY}"));
+        if super::seeded_defects::registry_present(&db.connection)? {
+            accepted.push_str(" AND NOT EXISTS(SELECT 1 FROM seeded_candidates x WHERE x.submission_id=s.submission_id AND x.arm='seeded')");
         }
+        if super::candidate_groups::groups_present(&db.connection)? {
+            accepted.push_str(&format!(" AND NOT {} AND NOT EXISTS(SELECT 1 FROM candidate_groups g WHERE g.task_id=s.task_id AND g.contract_revision=s.contract_revision
+                AND NOT EXISTS(SELECT 1 FROM candidate_selections x WHERE x.group_id=g.group_id AND x.outcome='selected' AND x.submission_id=s.submission_id))",super::candidate_groups::HELD_ARM));
+        }
+        let tasks:Vec<(String,u64,String)>=db.connection.prepare(&format!("SELECT t.id,t.revision,{evidence} FROM attempts a INDEXED BY attempts_retained_by_id CROSS JOIN tasks t ON t.active_attempt=a.id AND t.id=a.task_id
+            WHERE a.state='running' AND a.termination_observed=0 AND EXISTS({accepted})
+              AND EXISTS(SELECT 1 FROM attempt_inputs n JOIN events e ON e.entity=n.operation_id AND e.kind='runtime.launch_started' WHERE n.attempt_id=a.id)
+              AND NOT EXISTS(SELECT 1 FROM events e WHERE e.entity=a.id AND e.kind='attempt.completion_requested')
+              AND NOT EXISTS(SELECT 1 FROM attempt_cancellations c WHERE c.attempt_id=a.id)
+              AND NOT EXISTS(SELECT 1 FROM events e WHERE e.entity=a.id AND e.kind='attempt.completion_refused' AND json_extract(e.payload,'$.evidence')={evidence})
+            ORDER BY a.id LIMIT 8"))?.query_map([],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+        let mut scheduled=false;
+        let mut refusals=Vec::new();
+        for (task,revision,evidence) in &tasks {
+            let task=TaskId::new(task.clone()).map_err(StoreError::Corrupt)?;
+            match db.request_completion_mode(&task,*revision,jiff::Timestamp::now().as_millisecond(),true) {
+                Ok(change)=>scheduled |= !change.replayed,
+                Err(error @ (StoreError::Conflict|StoreError::Invalid(_)))=>{
+                    let attempt=db.connection.query_row("SELECT active_attempt FROM tasks WHERE id=?1",[task.as_str()],|row|row.get::<_,String>(0))?;
+                    let reason=error.to_string();
+                    let payload=serde_json::json!({"version":1,"task":task,"reason":reason,"evidence":evidence}).to_string();
+                    db.connection.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('attempt.completion_refused',?1,?2,1,?3)",params![attempt,integer(*revision)?,payload])?;
+                    refusals.push(format!("{}: {reason}",task.as_str()));
+                },
+                Err(error)=>return Err(error),
+            }
+        }
+        // The controller logs this diagnostic once; the recorded cursor suppresses
+        // retries until new canonical evidence arrives.
+        Ok((scheduled,(!refusals.is_empty()).then(||refusals.join("; "))))
     }
-    // A new stop request needs another controller turn, as do remaining rows.
-    Ok(!tasks.is_empty())
 }
