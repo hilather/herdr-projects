@@ -1,3 +1,6 @@
+> **This repository has moved to [hilather/herdr-farm](https://github.com/hilather/herdr-farm).**
+> The project is now called herdr-farm. This repository is archived and read-only; see the new repository for current code, docs and releases, and its `docs/renaming.md` for upgrading an existing install.
+
 # herdr-farm
 
 herdr-farm coordinates coding agents in [Herdr](https://herdr.dev). Keep one coordinator conversation, give workers isolated tasks and worktrees, and inspect results, approvals and usage from a local project store. This repository is maintained as [hilather/herdr-farm](https://github.com/hilather/herdr-farm).
