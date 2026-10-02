@@ -871,10 +871,9 @@ test.
    automatic verification on, `submit-captured` enqueues the verification job itself (as a
    spooled submission does on the ticker's next turn), so the worker need not exit and the
    attempt stays as it was.
-   Commands, background jobs and ticker services that need project ownership wait up to two
-   seconds for a short holder (a launch stage, a service turn) instead of failing at once,
-   and a failed canonical worker job (brief, preparation, termination) is retried after two
-   seconds, not thirty. Configuring integration and enabling automation before a reserved
+   A canonical worker job (brief, preparation, termination) that lost a lock race or hit a
+   transient failure is retried after two seconds, not thirty; project ownership itself is
+   still taken without waiting, so status reads and exclusion checks never block. Configuring integration and enabling automation before a reserved
    launch therefore cannot park its preparation behind a lock race; a failure that remains
    is written to the ticker log (`.ticker.log`) with its reason.
 5. **`launch run` re-acknowledges an edited owner configuration.** The `project_control`

@@ -173,21 +173,6 @@ impl ProjectGuard {
         let ProjectGuard{_project,_root,project,identity,..}=self;drop(_project);
         CheckGuard{_fence:fence,_root,project,identity}
     }
-    /// As [`ProjectGuard::acquire`], retrying while another effect or a
-    /// root-exclusive operation holds the root or the project, until `wait`
-    /// passes. Those holders are short (a stage of a launch, a service turn), so
-    /// a caller that merely lost a race should wait for them rather than fail and
-    /// be retried much later. Only contention is retried.
-    pub fn acquire_within(project:&Path,wait:std::time::Duration)->Result<Self> {
-        let until=std::time::Instant::now()+wait;
-        loop {
-            match Self::acquire(project) {
-                Ok(guard)=>return Ok(guard),
-                Err(error) if std::time::Instant::now()<until&&error.chain().any(|cause|matches!(cause.downcast_ref::<std::fs::TryLockError>(),Some(std::fs::TryLockError::WouldBlock)))=>std::thread::sleep(EXCLUSIVE_POLL),
-                Err(error)=>return Err(error),
-            }
-        }
-    }
     pub fn acquire(project:&Path)->Result<Self> {
         let project=project.canonicalize()?;
         let root_path=project.parent().context("project has no root")?.to_path_buf();
