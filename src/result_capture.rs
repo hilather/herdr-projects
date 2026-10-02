@@ -176,16 +176,15 @@ pub fn submit_captured(project: &Path, attempt: &str, message: Option<&str>) -> 
         artifacts.push((output.clone(), oid));
     }
     let loose = |oid: &str| format!("{}/{}", &oid[..2], &oid[2..]);
-    // Stage the base and the candidate with every tree and blob of each: the
-    // verifier materializes them in a fresh repository holding only the staged
-    // objects, checks the candidate out and diffs it against the base.
-    // Staging reads packed objects too.
-    let mut objects: Vec<String> = Vec::new();
-    for oid in git(&["rev-list", "--objects", "--no-object-names", "--no-walk", &capture.base_oid, &capture.candidate_oid])?.lines() {
+    // Only new reachable objects cross the untrusted submission boundary.
+    // The verifier obtains the base closure from the signed owner repository.
+    let mut objects: Vec<String> = vec![capture.base_oid.clone(), capture.candidate_oid.clone()];
+    for oid in git(&["rev-list", "--objects", "--no-object-names", &capture.candidate_oid, &format!("^{}", capture.base_oid)])?.lines() {
         if !objects.iter().any(|o| o == oid) { objects.push(oid.to_owned()); }
     }
+    objects.sort();
     ensure!(objects.len() <= SUBMISSION_OBJECT_LIMIT,
-        "the base and candidate trees hold {} objects; a submission carries at most {SUBMISSION_OBJECT_LIMIT}", objects.len());
+        "the candidate delta and commit anchors hold {} objects; a submission carries at most {SUBMISSION_OBJECT_LIMIT}", objects.len());
     // The key binds the staged object set as well as the candidate, so a
     // submission recorded with a different set is not replayed for this one.
     let key = format!("captured-{}", &format!("{:x}", Sha256::digest(format!("{attempt}\0{}\0{}", capture.candidate_oid, objects.join(",")).as_bytes()))[..32]);

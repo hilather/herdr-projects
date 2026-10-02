@@ -20,7 +20,10 @@ use std::{
 };
 
 /// The most Git objects one result submission may stage.
-pub const SUBMISSION_OBJECT_LIMIT: usize = 64;
+// Reserve 256 document bytes per object entry (SHA-256 paths included).
+pub const SUBMISSION_OBJECT_LIMIT: usize = SUBMISSION_LIMIT / 256;
+/// Aggregate retained compressed bytes, independent of the trusted base size.
+pub const SUBMISSION_BYTE_LIMIT: u64 = OBJECT_LIMIT * 4;
 
 // Bound the total pack/index snapshot bytes per submission, copied lazily once.
 const PACK_COPY_LIMIT: u64 = 1024 * 1024 * 1024;
@@ -166,7 +169,7 @@ fn parse_submission(raw: &[u8]) -> Result<ParsedSubmission> {
         || document.artifact_manifest.len() > 64
         || document.claimed_checks.len() > 32
     {
-        return Err(invalid("result submission exceeds bounds"));
+        return Err(invalid("result submission exceeds bounds (at most 1024 objects, 64 artifacts, 32 checks)"));
     }
     let mut seen = std::collections::BTreeSet::new();
     for object in &document.objects {
@@ -780,6 +783,7 @@ fn stage_objects(
     // A single exit from reconstruction ensures cleanup on every refusal, too.
     let reconstruction = (|| -> Result<Vec<StagedObject>> {
         let mut staged = Vec::new();
+        let mut total = 0u64;
         for object in &submission.objects {
             let source_path =
                 crate::migration::safe_join(&source, &object.relative_path).map_err(map_join)?;
@@ -797,6 +801,10 @@ fn stage_objects(
                 }
                 Err(error) => return Err(error),
             };
+            total = total.saturating_add(bytes.len() as u64);
+            if total > SUBMISSION_BYTE_LIMIT {
+                return Err(invalid("result objects exceed 64 MiB aggregate byte limit"));
+            }
             let byte_sha256 = sha256_hex(&bytes);
             let dest = dir.join(&byte_sha256);
             if dest.is_file() {

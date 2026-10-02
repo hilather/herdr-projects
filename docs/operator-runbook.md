@@ -150,3 +150,29 @@ still holds a worker). Servers you started (`--herdr-socket`) are never touched.
 Rerunning `launch run` after editing the owner configuration re-acknowledges it
 (`project_control` is reported as `done`); profiles must be prepared and verified
 against the edited bytes first, as their evidence is pinned to the configuration digest.
+
+### Submitting work against a large base
+
+`result PROJECT submit-captured ATTEMPT` and the canonical brief's POSIX sh
+script submit only objects new since the frozen base, plus both commit anchors.
+A base with hundreds of unchanged files is supported. Keep the signed contract's
+owner repository available with that exact base commit: verification imports its
+base into a fresh private repository, checks retained object hashes and complete
+candidate connectivity, and checks out the exact candidate before acceptance.
+It never imports a candidate from a worker worktree or quarantine.
+
+Submission bounds are 1024 delta/anchor objects, 16 MiB per compressed object,
+64 MiB aggregate retained bytes and 256 KiB of JSON. An object-count refusal
+prints the count and limit; byte-limit refusals identify their bound. Split a
+change exceeding these derived limits into smaller tasks. The unchanged trusted
+base does not count against them. Retry unchanged submissions under the same key
+for idempotent replay. A missing base reports `owner repository base is
+unavailable or invalid`; a corrupt or incomplete candidate reports `candidate
+object hash mismatch or missing referenced object`. Restore the owner base or
+correct the submitted closure; never supply an alternate pointing at a worker.
+
+Validation: `cargo test --locked --offline -j 3 --features state-store --test
+canonical_worker --test factory_harness` covers large-base automatic integration,
+replay, wrong object bytes, and an unstaged candidate blob. The canonical worker
+suite needs Unix socket permissions; compile it with `--no-run` in a restricted
+sandbox and run it on the steward's host.

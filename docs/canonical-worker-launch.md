@@ -900,3 +900,34 @@ attempt is unfinished, so with several workers every task is prepared before any
 reserved (a binding that would pause a project under a live worker is refused first).
 See
 [operator-runbook.md](operator-runbook.md).
+
+### Large repository result submissions
+
+The closing POSIX sh script and `result submit-captured` list the candidate's
+reachable objects excluding everything reachable from the frozen base, then add
+both commit anchors. The object list is sorted/deduplicated; unchanged files do
+not consume the submission budget. Replay still binds the exact document and
+retained bytes to its idempotency key.
+
+We choose option (b), importing the base from the repository in the signed
+contract. A standalone pack (a) would repeatedly transport the unchanged tree;
+combining packs and base reuse (c) adds a second ingress format without improving
+this workflow. Existing loose-object ingress already snapshots packed objects
+into private retained bytes. No schema or retention classification changes are
+needed: these remain existing `result_objects` and factory-object artifacts.
+
+The verifier initializes a private repository, fetches only the pinned base
+from that owner repository with object checking enabled, and overlays retained
+submission bytes. It never uses the attempt worktree or quarantine as an object
+source, and leaves no alternate. Full strict fsck checks object hashes and
+connectivity before checkout. A wrong hash or a missing referenced tree/blob is
+refused with `candidate object hash mismatch or missing referenced object`.
+The checkout must resolve to exactly the claimed candidate.
+
+The delta budget is derived from ingress bounds: the 256 KiB JSON budget
+divided by a 256-byte object-entry allowance gives 1024 object entries. Each
+compressed loose object is limited to 16 MiB; four times that per-object budget
+gives a 64 MiB aggregate retained-byte limit. Both producers report the object count when exceeded;
+ingress reports byte-bound refusals. The trusted base is independent of that
+budget; fetching it uses the verifier's existing 30-second Git command deadline.
+Large changes beyond these bounds need smaller task submissions.

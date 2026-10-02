@@ -558,6 +558,11 @@ fn an_operator_finishes_a_worker_that_never_submitted_and_the_result_lands_autom
     // it too, since it rebuilds the base and the candidate from staged objects.
     fs::create_dir_all(lab.repo.join("docs/plan")).unwrap();
     fs::write(lab.repo.join("docs/plan/00-readme.md"), "the plan\n").unwrap();
+    for index in 0..200 {
+        let dir = lab.repo.join(format!("docs/nested/{}", index / 10));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("file-{index}.txt")), format!("base file {index}\n")).unwrap();
+    }
     lab.git(&["add", "docs"]);
     lab.git(&["commit", "-q", "-m", "plan"]);
     let (contract, base) = lab.install_work_contract("verify_then_integrate");

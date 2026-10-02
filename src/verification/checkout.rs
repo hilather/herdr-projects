@@ -1,4 +1,5 @@
-//! Fresh checkout from retained objects. Hooks are not installed and git cannot use the network.
+//! Fresh checkout from the signed owner base and retained untrusted objects.
+//! Hooks are disabled; the only fetch is from the local owner repository.
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -46,6 +47,7 @@ pub fn materialize(
     objects: &[RetainedObject],
     oid: &str,
     object_format: &str,
+    trusted_base: Option<(&Path, &str)>,
 ) -> Result<Checkout> {
     if !matches!(object_format, "sha1" | "sha256") {
         bail!("unsupported Git object format");
@@ -79,6 +81,17 @@ pub fn materialize(
         ],
         None,
     )?;
+    if let Some((repository, base)) = trusted_base {
+        // Only the signed contract's base is imported. No alternate remains,
+        // and no candidate is fetched from an attempt or quarantine.
+        git(&path, &[
+            "-c".into(), "protocol.file.allow=always".into(),
+            "-c".into(), "fetch.fsckObjects=true".into(),
+            "-c".into(), "core.hooksPath=/dev/null".into(),
+            "fetch".into(), "--no-tags".into(), "--no-write-fetch-head".into(),
+            "--".into(), repository.display().to_string(), base.into(),
+        ], Some(&path)).context("owner repository base is unavailable or invalid")?;
+    }
     for object in objects {
         if object
             .relative_path
@@ -93,6 +106,11 @@ pub fn materialize(
         }
         fs::write(&dest, &object.bytes).with_context(|| format!("write {}", object.oid))?;
     }
+    // fsck checks both object identity and complete connectivity before any
+    // candidate files are exposed to acceptance checks.
+    git(&path, &["fsck".into(), "--full".into(), "--strict".into(),
+        "--no-reflogs".into(), "--no-dangling".into(), oid.into()], Some(&path))
+        .context("candidate object hash mismatch or missing referenced object")?;
     git(
         &path,
         &[

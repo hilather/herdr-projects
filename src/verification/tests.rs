@@ -363,7 +363,7 @@ fn materialize_refuses_to_delete_a_nested_store() {
     fs::create_dir_all(work.join("checkout")).unwrap();
     let store = work.join("checkout").join("state.db");
     fs::write(&store, b"database").unwrap();
-    let Err(error) = checkout::materialize(&work, &store, &[], "abcdef", "sha1") else {
+    let Err(error) = checkout::materialize(&work, &store, &[], "abcdef", "sha1", None) else {
         panic!("materialize deleted a nested store");
     };
     assert!(
@@ -378,7 +378,7 @@ fn materialize_refuses_to_delete_a_nested_store() {
     fs::write(&nested, b"kept").unwrap();
     let inside = store_dir.join("work");
     fs::create_dir_all(&inside).unwrap();
-    assert!(checkout::materialize(&inside, &nested, &[], "abcdef", "sha1").is_err());
+    assert!(checkout::materialize(&inside, &nested, &[], "abcdef", "sha1", None).is_err());
     assert_eq!(fs::read(&nested).unwrap(), b"kept");
 }
 

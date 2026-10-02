@@ -142,11 +142,10 @@ fn finish_instructions(root: &Path, slug: &str, contract: &Value, reference: &Ve
         script.push_str(&format!("blob{index}=$(git rev-parse \"HEAD:{output}\")\n"));
         manifest.push(format!(r#"{{"path":"{output}","oid":"$blob{index}"}}"#));
     }
-    // The verifier materializes the base and the candidate in a fresh repository
-    // from the staged objects alone, so every tree and blob of both is listed.
-    script.push_str(&"list() { git rev-list --objects --no-object-names --no-walk 'BASE' \"$candidate\" | sort -u; }\n\
-n=$(list | wc -l)\n[ \"$n\" -le LIMIT ] || { echo \"the base and candidate trees hold $n objects; a submission carries at most LIMIT\" >&2; exit 1; }\n\
-objects=$(list | sed 's#^\\(..\\)\\(.*\\)$#{\"oid\":\"\\1\\2\",\"relative_path\":\"\\1/\\2\"}#' | paste -sd, -)\n"
+    // Keep the candidate delta and both commit anchors in step with submit-captured.
+    script.push_str(&"list() { { printf '%s\\n' 'BASE' \"$candidate\"; git rev-list --objects --no-object-names \"$candidate\" '^BASE'; } | sort -u; }\n\
+n=$(list | wc -l)\n[ \"$n\" -le LIMIT ] || { echo \"the candidate delta and commit anchors hold $n objects; a submission carries at most LIMIT\" >&2; exit 1; }\n\
+objects=$(list | while IFS= read -r oid; do prefix=$(printf %s \"$oid\" | cut -c1-2); suffix=$(printf %s \"$oid\" | cut -c3-); printf '{\"oid\":\"%s\",\"relative_path\":\"%s/%s\"}\\n' \"$oid\" \"$prefix\" \"$suffix\"; done | paste -sd, -)\n"
         .replace("BASE", base).replace("LIMIT", &herdr_projects::store::SUBMISSION_OBJECT_LIMIT.to_string()));
     script.push_str("key=result-$(printf %s \"$attempt\" | cut -c1-100)\ndocument=$(mktemp)\ncat > \"$document\" <<EOF\n");
     script.push_str(&format!(

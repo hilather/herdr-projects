@@ -489,6 +489,7 @@ fn verify_owned(store: &mut SqliteStore, request: &VerifyRequest, ownership: Opt
         &target.objects,
         &target.candidate_oid,
         &target.object_format,
+        Some((Path::new(&target.repository), &target.base_oid)),
     )?;
     if let Some(scopes) = &target.write_scopes {
         let reason = match checkout::changed_paths(&checkout.path, &target.base_oid, &target.candidate_oid) {

@@ -56,6 +56,7 @@ pub(crate) struct VerifyTarget {
     pub objects: Vec<RetainedObject>,
     pub required_outputs: Vec<String>,
     pub base_oid: String,
+    pub repository: String,
     pub write_scopes: Option<Vec<String>>,
     pin: File,
 }
@@ -239,6 +240,7 @@ impl SqliteStore {
         }
         let contract = crate::domain::PreparedContract::parse_verified(&raw).map_err(|error| invalid(&error))?;
         let write_scopes = contract.write_scopes();
+        let repository = contract.repository;
         let base_oid = contract.base_oid;
         let required_outputs = contract.required_outputs;
         super::contract_binding::require_result_barrier(&tx, &task_id, u64::try_from(contract_revision).map_err(|_| invalid("invalid contract revision"))?,
@@ -304,6 +306,7 @@ impl SqliteStore {
             objects: retained,
             required_outputs,
             base_oid,
+            repository,
             write_scopes,
             pin,
         })
@@ -747,6 +750,7 @@ impl SqliteStore {
             objects: Vec::new(),
             required_outputs: Vec::new(),
             base_oid: "a".repeat(40),
+            repository: "/tmp/repo".into(),
             write_scopes: None,
             pin,
         })

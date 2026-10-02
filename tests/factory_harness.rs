@@ -138,19 +138,17 @@ mod slice {
     }
 
     fn reachable_objects(repo: &Path, specs: &[&str]) -> Vec<(String, String)> {
-        let mut args = vec!["rev-list", "--objects"];
-        args.extend_from_slice(specs);
+        let exclusion = format!("^{}", specs[0]);
+        let args = ["rev-list", "--objects", "--no-object-names", specs[1], &exclusion];
         let mut objects = Vec::new();
-        for line in git(repo, &args).lines() {
+        let listed = format!("{}\n{}\n{}", specs[0], specs[1], git(repo, &args));
+        for line in listed.lines() {
             let oid = line.split_whitespace().next().unwrap().to_string();
             if objects.iter().any(|(seen, _)| seen == &oid) {
                 continue;
             }
             let relative = format!("{}/{}", &oid[..2], &oid[2..]);
-            assert!(
-                repo.join(".git/objects").join(&relative).is_file(),
-                "loose object {oid} missing"
-            );
+            git(repo, &["cat-file", "-e", &oid]);
             objects.push((oid, relative));
         }
         assert!(
@@ -586,13 +584,20 @@ mod slice {
         fs::write(repo.join("src/fn.txt"), "fn=add\n").unwrap();
         fs::write(repo.join("src/peer.txt"), "peer=1\n").unwrap();
         fs::write(repo.join("src/state.txt"), STATE_BASE).unwrap();
-        git(&repo, &["add", "--", "src"]);
+        for index in 0..200 {
+            let dir = repo.join(format!("docs/base/{}", index / 10));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(format!("file-{index}")), format!("unchanged {index}\n")).unwrap();
+        }
+
+        git(&repo, &["add", "--", "src", "docs"]);
         git(
             &repo,
             &["-c", "commit.gpgsign=false", "commit", "-q", "-m", "base"],
         );
         git(&repo, &["branch", "integration"]);
         let base = oid_of(&repo, "HEAD");
+        assert!(git(&repo, &["rev-list", "--objects", &base]).lines().count() > 64);
 
         git(&repo, &["checkout", "-q", "-b", "worker-a"]);
         fs::write(repo.join("src/fn.txt"), "fn=mul\n").unwrap();
@@ -4356,5 +4361,60 @@ fn main() {
         }
         assert!(herdr_projects::verification::verify(&mut store,&request).unwrap().replayed);
         assert!(!work.join("checkout/.fixture-counter").exists(),"private copy escaped namespace");
+    }
+}
+
+/// Untrusted retained bytes and incomplete candidate closures are refused before
+/// acceptance checks, even when the owner repository contains the candidate.
+#[cfg(target_os = "linux")]
+#[test]
+fn result_verification_refuses_wrong_hash_and_unstaged_candidate_blob() {
+    for corrupt in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = classification_project(tmp.path(), "objects", Some("README"));
+        let db_path = project.join(".state/state.db");
+        admit_ready(&project);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (attempt, digest, repository, base, policy): (String, String, String, String, String) = conn.query_row(
+            "SELECT a.id,c.raw_digest,c.repository,c.base_oid,p.body FROM attempts a JOIN task_contracts c ON c.task_id=a.task_id JOIN acceptance_policies p ON p.task_id=c.task_id", [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).unwrap();
+        let repo = Path::new(&repository);
+        fs::write(repo.join("README"), "new candidate bytes\n").unwrap();
+        git(repo, &["add", "README"]);
+        git(repo, &["commit", "-q", "-m", "candidate"]);
+        let candidate = git(repo, &["rev-parse", "HEAD"]).trim().to_owned();
+        let blob = git(repo, &["rev-parse", "HEAD:README"]).trim().to_owned();
+        let mut objects: Vec<String> = git(repo, &["rev-list", "--objects", "--no-object-names", &candidate, &format!("^{base}")])
+            .lines().map(str::to_owned).collect();
+        objects.push(base.clone());
+        if corrupt {
+            let old_blob = git(repo, &["rev-parse", &format!("{base}:README")]).trim().to_owned();
+            let loose = |oid: &str| repo.join(".git/objects").join(format!("{}/{}", &oid[..2], &oid[2..]));
+            fs::remove_file(loose(&blob)).unwrap();
+            fs::copy(loose(&old_blob), loose(&blob)).unwrap();
+        } else {
+            objects.retain(|oid| oid != &blob);
+        }
+        let document = serde_json::json!({
+            "idempotency_key":"objects", "task_id":"objects", "contract_revision":1,
+            "contract_digest":digest, "attempt_id":attempt, "repository":repository,
+            "base_oid":base, "candidate_oid":candidate, "object_format":"sha1",
+            "artifact_manifest":[{"path":"README", "oid":blob}], "claimed_checks":[],
+            "objects":objects.iter().map(|oid| serde_json::json!({"oid":oid,"relative_path":format!("{}/{}", &oid[..2], &oid[2..])})).collect::<Vec<_>>()
+        });
+        let mut db = SqliteStore::open(&db_path).unwrap();
+        let submission = db.submit_result(&serde_json::to_vec(&document).unwrap()).unwrap();
+        let work = tmp.path().join("verify");
+        fs::create_dir(&work).unwrap();
+        let policy_path = work.join("policy.json");
+        fs::write(&policy_path, policy).unwrap();
+        let request = herdr_projects::verification::VerifyRequest::new(submission.submission_id,
+            "builds", &policy_path, "objects", Duration::from_secs(10), &work);
+        let error = match herdr_projects::verification::verify(&mut db, &request) {
+            Err(error) => error,
+            Ok(_) => panic!("untrusted candidate was verified"),
+        };
+        assert!(format!("{error:#}").contains("candidate object hash mismatch or missing referenced object"), "{error:#}");
+        assert_eq!(sql_count(&db_path, "SELECT count(*) FROM verified_results"), 0);
     }
 }
