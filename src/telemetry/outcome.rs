@@ -141,7 +141,7 @@ fn record(db: &Connection, version: u32, attempt: &str, task: &str, state: &str,
     let route: Option<String> = db.prepare_cached("SELECT route FROM task_contracts WHERE task_id=?1 AND contract_revision=?2")?.query_row(rusqlite::params![task, revision], |r| r.get(0)).optional()?;
     let integrates = route.as_deref() == Some("verify_then_integrate");
     let (result, verification, integration) = match &submission {
-        None => (json!({"state": "not_submitted", "submissions": submissions}), json!({"state": "not_submitted"}), json!({"state": if integrates { "not_submitted" } else { "not_applicable" }})),
+        None => (json!({"state": "not_submitted"}), json!({"state": "not_submitted"}), json!({"state": if integrates { "not_submitted" } else { "not_applicable" }})),
         Some((id, candidate, created, _)) => {
             let verification = verification(db, id, home)?;
             let integration = if !integrates { json!({"state": "not_applicable"}) } else {
@@ -229,5 +229,5 @@ pub fn text(report: &Value) -> String {
     } else { show(v) };
     report["attempts"].as_array().into_iter().flatten().map(|a| format!("{} task={} state={} wall_ms={} result={} submissions={} submission={} verification={} integration={} accepted={} attention={} usage={}\n",
         a["attempt_id"].as_str().unwrap_or(""), a["task_id"].as_str().unwrap_or(""), a["terminal_state"].as_str().unwrap_or(""), show(&a["active_ms"]),
-        show(&a["result"]), a["result"]["submissions"], a["result"]["submission_id"].as_str().unwrap_or("none"), show(&a["verification"]), show(&a["integration"]), a["accepted"], attention(&a["attention"]), show(&a["usage"]))).collect()
+        show(&a["result"]), a["result"]["submissions"].as_u64().unwrap_or(0), a["result"]["submission_id"].as_str().unwrap_or("none"), show(&a["verification"]), show(&a["integration"]), a["accepted"], attention(&a["attention"]), show(&a["usage"]))).collect()
 }

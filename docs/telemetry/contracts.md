@@ -280,7 +280,7 @@ reads `unavailable: predates_lifecycle_log`.
 | `terminal_state` | terminal mark, else `open` |
 | `active_ms` | `terminal − running` wall time, idle time at the prompt included (not an activity signal; attention is S4); open → `censored`; no running mark → `unavailable`. The text form labels it `wall_ms` |
 | `queue_to_launch_ms` | `launching − reserved` |
-| `result` | latest submission meeting §6 `A` for the current contract (including confirmed integration when required), otherwise latest submission; ties use insertion order. `submission_id`, `candidate_oid`, `created_unix_ms` identify the chosen submission; `submissions` counts all submissions (0 when `not_submitted`) |
+| `result` | latest submission meeting §6 `A` for the current contract (including confirmed integration when required), otherwise latest submission; ties use insertion order. `submission_id`, `candidate_oid`, `created_unix_ms` identify the chosen submission; `submissions` counts all submissions and is absent when `not_submitted` (reports carry no numeric zeros) |
 | `verification` | per acceptance policy of that submission, its latest `verification_runs` row: `rejected` (+ `reason` excerpt) if any policy's is, `accepted` only if every policy's is, else `error` (+ diagnostic excerpt) for a permanently failed verification job without a run, otherwise `pending`; `policies` lists each |
 | `integration` | route `verify_only` → `not_applicable`; else confirmed integration preferred, otherwise latest `integration_operations` state via `verified_results`; `integrated` needs an `integrated_commits` row |
 | `accepted` | `true` iff the task's acceptance rule (§6 `A`) is met by evidence produced from this attempt |

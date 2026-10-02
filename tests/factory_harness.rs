@@ -1419,7 +1419,7 @@ fn outcome_rejected_verification_reason_is_excerpted() {
     let submitted_ms: i64 = conn.query_row("SELECT created_unix_ms FROM result_submissions", [], |r| r.get(0)).unwrap();
     let report = telemetry_attempts(&project);
     let record = &report["attempts"][0];
-    assert_eq!(record["result"], serde_json::json!({"candidate_oid": oid, "created_unix_ms": submitted_ms, "state": "submitted", "submission_id": submitted}));
+    assert_eq!(record["result"], serde_json::json!({"candidate_oid": oid, "created_unix_ms": submitted_ms, "state": "submitted", "submission_id": submitted, "submissions": 1}));
     assert_eq!(record["verification"], serde_json::json!({"reason": "policy_digest_mismatch", "state": "rejected",
         "policies": [{"policy_id": "builds", "reason": "policy_digest_mismatch", "state": "rejected"}]}));
     assert_eq!((&record["integration"], &record["accepted"]), (&serde_json::json!({"state": "not_applicable"}), &serde_json::json!(false)));
