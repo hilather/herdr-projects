@@ -227,6 +227,13 @@ impl ControlledStore {
         self.control.check()?;
         self.store.claim_with_creation_budget(id,expected,"canonical-brief-adapter",now,30_000,None,Some(&self.work_budget)).map_err(|e|self.error(e))
     }
+    /// The prompt crossed the boundary but the agent never showed it accepted it:
+    /// retain the claim's operation as ambiguous (never as confirmed), so only
+    /// explicit observation or operator retirement can resolve it.
+    pub(crate) fn record_worker_brief_unaccepted(&mut self,claim:&crate::operations::Claim,evidence:String,now:i64)->Result<crate::operations::Delivery> {
+        self.control.check()?;
+        self.store.finish_operation(claim,crate::operations::Outcome::Ambiguous{observation_required:evidence},now).map_err(|e|self.error(e))
+    }
     pub(crate) fn validate_worker_brief_claim(&mut self,claim:&crate::operations::Claim,now:i64)->Result<()> {
         self.control.check()?;
         self.store.validate_claim_with_budget(claim,now,Some(&self.work_budget)).map_err(|e|self.error(e))

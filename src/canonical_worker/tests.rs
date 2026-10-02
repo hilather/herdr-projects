@@ -135,7 +135,7 @@ if r['method']=='ping':
  if stock:result={{'type':'pong','version':'0.9.1'}}
  if (root/'server-capability.json').exists():result=json.loads((root/'server-capability.json').read_text())
 elif r['method']=='agent.list':
- if mode=='busy':a['agent_status']='working'
+ if mode=='busy' or (root/'sent').exists():a['agent_status']='working'
  if mode=='foreign':a['terminal_id']='foreign'
  # The target's own entry as a starting Codex TUI shows it: an animated title,
  # status and change counters move on every read ('drift' names an identity

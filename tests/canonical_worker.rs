@@ -16,7 +16,8 @@ const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
 /// and logs each request to `requests` beside the socket. `ping.json` there
 /// replaces the ping reply; `lose-create` runs the command but drops the reply;
 /// `drop-release` drops gate-release input unsent and unanswered; `vanish`
-/// closes the worker's workspace, pane and agent without touching its process.
+/// closes the worker's workspace, pane and agent without touching its process;
+/// `swallow-prompts` is a count of prompts the agent ignores (it stays idle).
 const SERVER: &str = r#"
 import json,os,sys,socket,subprocess
 path=sys.argv[1];root=os.path.dirname(path);s={}
@@ -30,6 +31,7 @@ while True:
  if os.path.exists(os.path.join(root,'changed-terminal')):pane['terminal_id']='replacement-terminal'
  kind=open(os.path.join(root,'agent-kind')).read() if os.path.exists(os.path.join(root,'agent-kind')) else 'claude'
  status=open(os.path.join(root,'agent-status')).read() if os.path.exists(os.path.join(root,'agent-status')) else 'idle'
+ if s.get('accepted'):status='working'
  agent=dict(pane,agent=kind,interactive_ready=True,agent_status=status,**({'name':s['name']} if 'name' in s else {}))
  res=None
  if m=='ping':
@@ -53,7 +55,12 @@ while True:
  elif m=='agent.explain':res={'type':'agent_explain','explain':{'agent':kind,'state':'idle','manifest_source':'bundled','manifest_version':'2026.09.14.1',
   'matched_rule':{'id':'prompt','state':'idle'},'visible_idle':True,'visible_blocker':False,'visible_working':False,'screen_detection_skipped':False,
   'skip_state_update':False,'local_override_shadowing_remote':False,'fallback_reason':None,'warning':None}}
- elif m=='agent.prompt':res={'type':'agent_prompted','agent':agent}
+ elif m=='agent.prompt':
+  # `swallow-prompts` holds how many prompts a startup banner eats before the agent takes one.
+  s['prompts']=s.get('prompts',0)+1
+  swallow=int(open(os.path.join(root,'swallow-prompts')).read()) if os.path.exists(os.path.join(root,'swallow-prompts')) else 0
+  if s['prompts']>swallow:s['accepted']=True
+  res={'type':'agent_prompted','agent':agent}
  if res is not None:f.write(json.dumps({'id':r['id'],'result':res})+'\n');f.flush()
  c.close()
 "#;
@@ -413,6 +420,44 @@ fn ticker_launches_and_briefs_once_then_stops_a_cancelled_worker_while_paused_an
 
 
 /// Replaces `lost_resource_creation_reply_retains_claim_and_never_creates_again`.
+/// An acknowledged prompt is not an accepted one: a startup banner that eats the
+/// typed text leaves the agent idle at an empty prompt. The brief is re-delivered
+/// while the agent stays idle and confirmed only once it shows it took it.
+#[test]
+fn a_brief_swallowed_by_the_agent_is_redelivered_and_confirmed_only_once_accepted() {
+    let mut lab = Lab::new("unknown_usage='allow_with_warning'");
+    let (_, attempt) = lab.reserve("Retained instructions");
+    fs::write(lab.path("lab/swallow-prompts"), "1").unwrap();
+    lab.serve();
+    let briefed = || { let s = lab.state(); s.operations.iter().any(|o| o.kind == "runtime.worker_brief" && s.deliveries.iter().any(|d| d.operation == o.id && d.state == DeliveryState::Confirmed)) };
+    let mut ticker = lab.spawn();
+    lab.wait(&mut ticker, 120, &briefed);
+    lab.stop(ticker);
+    assert_eq!(lab.count("agent.prompt"), 2, "the first prompt was swallowed, the second accepted");
+    assert_eq!(lab.attempt(&attempt).state, AttemptState::Running);
+}
+
+/// A prompt the agent never takes is not confirmed: after the bounded
+/// re-deliveries the operation is left ambiguous and the attempt is not running.
+#[test]
+fn a_brief_the_agent_never_accepts_is_left_ambiguous_not_confirmed() {
+    let mut lab = Lab::new("unknown_usage='allow_with_warning'");
+    let (_, attempt) = lab.reserve("Retained instructions");
+    fs::write(lab.path("lab/swallow-prompts"), "99").unwrap();
+    lab.serve();
+    let ambiguous = || { let s = lab.state(); s.operations.iter().any(|o| o.kind == "runtime.worker_brief" && s.deliveries.iter().any(|d| d.operation == o.id && d.state == DeliveryState::Ambiguous)) };
+    let mut ticker = lab.spawn();
+    lab.wait(&mut ticker, 120, &ambiguous);
+    lab.stop(ticker);
+    assert_eq!(lab.count("agent.prompt"), 3, "bounded re-delivery");
+    let state = lab.state();
+    assert!(!state.deliveries.iter().any(|d| d.state == DeliveryState::Confirmed && state.operations.iter().any(|o| o.id == d.operation && o.kind == "runtime.worker_brief")), "never a false confirmation");
+    assert_ne!(lab.attempt(&attempt).state, AttemptState::Running);
+    // Nothing sends it a fourth time.
+    lab.run_for("agent.list", 2);
+    assert_eq!(lab.count("agent.prompt"), 3);
+}
+
 #[test]
 fn ticker_recovers_a_lost_creation_reply_without_creating_again() {
     let mut lab = Lab::new("unknown_usage='allow_with_warning'");

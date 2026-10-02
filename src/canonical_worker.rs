@@ -135,6 +135,13 @@ pub fn executable(
     Ok(())
 }
 
+/// How long one delivery of the brief is watched for the agent accepting it,
+/// how often, and how many deliveries are tried while it stays idle. Together
+/// they fit the 30 s claim lease.
+const BRIEF_ACCEPT_WINDOW: Duration = Duration::from_secs(6);
+const BRIEF_ACCEPT_POLL: Duration = Duration::from_millis(500);
+const BRIEF_DELIVERIES: u32 = 3;
+
 struct Native<'a> {
     executable: &'a ExecutableIdentity,
     start: &'a LaunchStartedReceipt,
@@ -223,6 +230,38 @@ impl Native<'_> {
             Some(&self.start.agent.name),
             ready,
         )
+    }
+    /// Whether the agent took the prompt just sent: within a bounded window its
+    /// status leaves idle (working, or blocked on a dialog of its own), or
+    /// Herdr's visible-screen detector sees it working. `false` means it stayed
+    /// idle the whole window.
+    fn await_acceptance(&self, id: &str, delivery: u32) -> Result<bool> {
+        let until = Instant::now() + BRIEF_ACCEPT_WINDOW;
+        let mut poll = 0;
+        loop {
+            poll += 1;
+            let id = format!("{id}:accepted-{delivery}-{poll}");
+            let list = self.call(&id, "agent.list", json!({}))?;
+            ensure!(list["type"].as_str() == Some("agent_list"), "invalid native acceptance inventory");
+            let agents = list["agents"].as_array().context("native agent inventory missing")?;
+            ensure!(agents.len() <= 256, "native acceptance inventory exceeds bounds");
+            let matching: Vec<_> = agents.iter().filter(|a| a["pane_id"].as_str() == Some(&self.start.route.pane_id)).collect();
+            ensure!(matching.len() == 1, "worker agent absent or ambiguous");
+            self.agent(matching[0], false)?;
+            if matches!(matching[0]["agent_status"].as_str(), Some("working" | "blocked")) {
+                return Ok(true);
+            }
+            if let Ok(explain) = self.call(&id, "agent.explain", json!({"target":self.start.route.pane_id})) {
+                let explain = &explain["explain"];
+                if explain["state"].as_str() == Some("working") || explain["visible_working"].as_bool() == Some(true) {
+                    return Ok(true);
+                }
+            }
+            if Instant::now() + BRIEF_ACCEPT_POLL >= until || Instant::now() + BRIEF_ACCEPT_POLL >= self.deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(BRIEF_ACCEPT_POLL);
+        }
     }
     fn ready(&self, id: &str) -> Result<()> {
         let result = self.call(id, "agent.list", json!({}))?;
@@ -427,6 +466,33 @@ pub fn deliver_brief(
         "native brief acknowledgment type mismatch"
     );
     native.agent(&result["agent"], false)?;
+    // An acknowledged prompt is not an accepted one: a startup banner or a
+    // dialog can swallow the typed text. Confirm only once the agent shows it
+    // took the prompt, re-delivering a bounded number of times while it is
+    // still idle at its empty prompt.
+    let mut delivered = 1;
+    while !native.await_acceptance(operation.as_str(), delivered)? {
+        if delivered >= BRIEF_DELIVERIES {
+            let evidence = format!("the brief was sent {delivered} times but the agent never left its idle prompt; it may not have received it: observe the worker, then retire this brief or stop the attempt");
+            db.record_worker_brief_unaccepted(&claim, evidence.clone(), now())?;
+            anyhow::bail!("{evidence}");
+        }
+        delivered += 1;
+        let again = native.call_checked(
+            &format!("{}:redeliver-{delivered}", operation.as_str()),
+            "agent.prompt",
+            json!({"target":start.agent.name,"text":brief.text}),
+            || {
+                executable(&profile.agent, deadline, &cancellation)?;
+                Ok(db.validate_worker_brief_claim(&claim, now())?)
+            },
+        )?;
+        ensure!(
+            again["type"].as_str() == Some("agent_prompted"),
+            "native brief acknowledgment type mismatch"
+        );
+        native.agent(&again["agent"], false)?;
+    }
     let receipt = PreparedWorkerBriefReceipt {
         receipt: WorkerBriefReceipt {
             version: 1,
