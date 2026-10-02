@@ -33,13 +33,47 @@ pub fn valid_pin(value: &str) -> bool {
 }
 
 /// The login file shared with the owner's CLI, relative to the owner's home and
-/// to the execution home (the same relative path in both).
+/// to the execution home (the same relative path in both). Only Codex has one:
+/// it rewrites `auth.json` in place, so the bound inode stays current. Claude
+/// Code renames a new credentials file over the old one, which a bind mount
+/// cannot follow, so a Claude worker authenticates with a setup-token file
+/// instead (see [`check_token_file`]).
 pub fn login_file(kind: &str) -> Option<&'static str> {
     match kind {
         "codex" => Some(".codex/auth.json"),
-        "claude" => Some(".claude/.credentials.json"),
         _ => None,
     }
+}
+
+/// Agent directories whose files a token file must not live in.
+const AGENT_DIRS: &[&str] = &[".claude", ".codex", ".gemini", ".grok", ".cursor", ".copilot", "opencode"];
+
+/// Check the long-lived Claude setup-token file the pinned owner configuration
+/// names: absolute, a regular file (not a link) owned by the caller with no
+/// group or other access, outside `project`, `root` (the projects root, which
+/// the worker sandbox masks) and every agent directory, and holding one
+/// non-empty token line. The token is checked here and never reported.
+pub fn check_token_file(path: &Path, project: &Path, root: &Path) -> Result<()> {
+    ensure!(path.is_absolute(), "claude_token_file must be an absolute path");
+    for form in [Some(path.to_path_buf()), path.canonicalize().ok()].into_iter().flatten() {
+        ensure!(![project, root].iter().any(|dir| !dir.as_os_str().is_empty() && form.starts_with(dir)), "claude_token_file must lie outside the project and the projects root");
+        ensure!(
+            !form.components().any(|c| AGENT_DIRS.iter().any(|d| c.as_os_str() == *d)),
+            "claude_token_file must lie outside the agent directories"
+        );
+    }
+    let metadata = fs::symlink_metadata(path).context("claude_token_file does not exist")?;
+    ensure!(
+        metadata.is_file() && metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0,
+        "claude_token_file must be a regular file owned by you with mode 0600"
+    );
+    let mut text = Vec::new();
+    fs::File::open(path)?.take(4097).read_to_end(&mut text)?;
+    let token = text.strip_suffix(b"\n").unwrap_or(&text);
+    let valid = !token.is_empty() && token.len() <= 4096 && token.iter().all(|b| b.is_ascii_graphic());
+    text.fill(0);
+    ensure!(valid, "claude_token_file must hold one token on a single line (contents withheld)");
+    Ok(())
 }
 
 /// What the agent's own configuration pins, as read back from the home.

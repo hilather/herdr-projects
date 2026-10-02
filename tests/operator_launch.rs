@@ -84,14 +84,26 @@ const STATIC_HERDR: &str = r#"#!/bin/sh
 exit 3
 "#;
 
-/// A stand-in agent: answers `--version`; otherwise it must find the shared
-/// login in its home and its working directory trusted in its own configuration.
+/// The stand-in agent's login check: a Codex agent must find the shared login
+/// file (`login`) in its home; a Claude agent (`login` empty) must find the
+/// setup token in its environment and no credentials file.
+fn login_check(login: &str) -> String {
+    if login.is_empty() {
+        r#"if std::env::var("CLAUDE_CODE_OAUTH_TOKEN").as_deref()!=Ok("fixture-setup-token")||std::path::Path::new(&format!("{home}/.claude/.credentials.json")).exists(){eprintln!("not logged in");std::process::exit(7)}"#.to_owned()
+    } else {
+        format!(r#"if std::fs::read_to_string(format!("{{home}}/{login}")).unwrap_or_default().trim()!="shared-login"{{eprintln!("not logged in");std::process::exit(7)}}"#)
+    }
+}
+
+/// A stand-in agent: answers `--version`; otherwise it must be logged in (see
+/// `login_check`) and its working directory trusted in its own configuration.
 fn agent_source(version: &str, login: &str, trust: &str) -> String {
+    let check = login_check(login);
     format!(
         r#"fn main(){{
  if std::env::args().nth(1).as_deref()==Some("--version"){{println!({version:?});return}}
  let home=std::env::var("HOME").unwrap_or_default();
- if std::fs::read_to_string(format!("{{home}}/{login}")).unwrap_or_default().trim()!="shared-login"{{eprintln!("not logged in");std::process::exit(7)}}
+ {check}
  let cwd=std::env::current_dir().unwrap();
  if !std::fs::read_to_string(format!("{{home}}/{trust}")).unwrap_or_default().contains(cwd.to_str().unwrap()){{eprintln!("untrusted directory");std::process::exit(8)}}
  loop{{std::thread::park()}}
@@ -103,6 +115,7 @@ fn agent_source(version: &str, login: &str, trust: &str) -> String {
 /// on `--version` (when it is given a HOME) and during the session. `version_extra`
 /// is extra Rust run on `--version` with `home` bound, for hostile variants.
 fn writing_agent_source(version: &str, login: &str, trust: &str, version_dir: &str, version_file: &str, session_file: &str, version_extra: &str) -> String {
+    let check = login_check(login);
     format!(
         r#"fn main(){{
  let home=std::env::var("HOME").unwrap_or_default();
@@ -111,7 +124,7 @@ fn writing_agent_source(version: &str, login: &str, trust: &str, version_dir: &s
   {version_extra}
   println!({version:?});return
  }}
- if std::fs::read_to_string(format!("{{home}}/{login}")).unwrap_or_default().trim()!="shared-login"{{eprintln!("not logged in");std::process::exit(7)}}
+ {check}
  let cwd=std::env::current_dir().unwrap();
  if !std::fs::read_to_string(format!("{{home}}/{trust}")).unwrap_or_default().contains(cwd.to_str().unwrap()){{eprintln!("untrusted directory");std::process::exit(8)}}
  let session=format!("{{home}}/{session_file}");
@@ -124,12 +137,22 @@ fn writing_agent_source(version: &str, login: &str, trust: &str, version_dir: &s
 
 struct Lab {
     _top: tempfile::TempDir,
+    /// The private runtime directory every CLI run uses for its Herdr sockets,
+    /// so a test sees (and never shares) the socket directories a run leaves.
+    runtime: tempfile::TempDir,
     home: PathBuf,
     root: PathBuf,
     project: PathBuf,
     repo: PathBuf,
     key: PathBuf,
     extra_env: Vec<(String, PathBuf)>,
+}
+
+impl Drop for Lab {
+    /// Safety net: a failed test must not leave a stand-in Herdr server behind.
+    fn drop(&mut self) {
+        let _ = Command::new("/usr/bin/pkill").args(["-KILL", "-f"]).arg(format!("{} server", self.home.join("bin/herdr").display())).status();
+    }
 }
 
 impl Lab {
@@ -148,6 +171,12 @@ impl Lab {
         for dir in ["", "bin", "repo", "agent-home-codex", "agent-home-claude", ".codex", ".claude"] {
             fs::create_dir_all(home.join(dir)).unwrap();
         }
+        // The Claude worker's login: a long-lived setup-token file, outside the
+        // project and the agent directories (the owner's credentials file is
+        // never shared with a worker).
+        let token = home.join("claude-setup-token");
+        fs::write(&token, "fixture-setup-token\n").unwrap();
+        fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
         for login in [".codex/auth.json", ".claude/.credentials.json"] {
             fs::write(home.join(login), "shared-login").unwrap();
             fs::set_permissions(home.join(login), fs::Permissions::from_mode(0o600)).unwrap();
@@ -160,15 +189,18 @@ impl Lab {
         let budget = "max_wall_seconds=600\nunknown_usage='allow_with_warning'\n";
         fs::write(&config, format!(
             "[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n\
+[worker_isolation.login]\nclaude_token_file={token:?}\n\
 [profiles.codex-sol]\nkind='codex'\npermission_policy='interactive'\nmodel='gpt-6.1-sol'\nreasoning_effort='low'\n[profiles.codex-sol.budget]\n{budget}\
 [profiles.claude-sonnet]\nkind='claude'\npermission_policy='interactive'\nmodel='claude-sonnet-5-5'\nreasoning_effort='low'\n[profiles.claude-sonnet.budget]\n{budget}")).unwrap();
-        let lab = Lab { root: home.join("root"), project: home.join("root/demo"), repo: home.join("repo"), home, key, _top: top, extra_env: Vec::new() };
+        let runtime = tempfile::Builder::new().prefix("hp").tempdir_in(std::env::temp_dir()).unwrap();
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let lab = Lab { runtime, root: home.join("root"), project: home.join("root/demo"), repo: home.join("repo"), home, key, _top: top, extra_env: Vec::new() };
         for command in ["new", "pause"] {
             lab.ok(&[command, "demo"]);
         }
         herdr_projects::migration::apply(&lab.project, &herdr_projects::migration::inspect_with_config(&lab.project, &config).unwrap(), true).unwrap();
         fs::write(lab.home.join("bin/herdr"), herdr).unwrap();
-        for (name, version, login, trust) in [("codex", "codex-cli 0.154.0", ".codex/auth.json", ".codex/config.toml"), ("claude", "2.1.0 (Claude Code)", ".claude/.credentials.json", ".claude.json")] {
+        for (name, version, login, trust) in [("codex", "codex-cli 0.154.0", ".codex/auth.json", ".codex/config.toml"), ("claude", "2.1.0 (Claude Code)", "", ".claude.json")] {
             let source = lab.home.join(format!("bin/{name}.rs"));
             fs::write(&source, agent_source(version, login, trust)).unwrap();
             let built = Command::new("rustc").args(["--edition", "2021", "-o"]).arg(lab.home.join("bin").join(name)).arg(&source).output().unwrap();
@@ -211,7 +243,7 @@ impl Lab {
     fn cli(&self, args: &[&str]) -> Output {
         // Verification's disposable server socket lives under the temporary directory.
         Command::new(BIN).env_clear().env("HOME", &self.home).env("HERDR_PROJECTS_OWNER_HOME", &self.home).env("PATH", "/usr/bin:/bin").env("HERDR_BIN_PATH", self.home.join("bin/herdr"))
-            .env("TMPDIR", std::env::var_os("TMPDIR").unwrap_or("/tmp".into()))
+            .env("TMPDIR", std::env::var_os("TMPDIR").unwrap_or("/tmp".into())).env("XDG_RUNTIME_DIR", self.runtime.path())
             .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_path())))
             .args(["--root", self.root.to_str().unwrap()]).args(args).output().unwrap()
     }
@@ -317,9 +349,18 @@ fn verify_interaction_produces_launchable_evidence_for_codex_and_claude_from_the
         assert!(config.contains(model) && config.contains("low"), "{config}");
         let trust = fs::read_to_string(if kind == "codex" { home.join(".codex/config.toml") } else { home.join(".claude.json") }).unwrap();
         assert!(trust.contains(work.to_str().unwrap()), "{trust}");
-        // The login stays the owner's single file: the home only has an empty mount point.
-        let login = home.join(if kind == "codex" { ".codex/auth.json" } else { ".claude/.credentials.json" });
-        assert_eq!(fs::read_to_string(login).unwrap(), "", "no copy of the login in the execution home");
+        // Codex's login stays the owner's single file: the home only has an empty
+        // mount point. Claude's is the setup token in the agent's environment:
+        // no credentials file and no copy of the token anywhere in the home.
+        if kind == "codex" {
+            assert_eq!(fs::read_to_string(home.join(".codex/auth.json")).unwrap(), "", "no copy of the login in the execution home");
+        } else {
+            assert!(!home.join(".claude/.credentials.json").exists(), "no Claude credentials file in the execution home");
+            let leaked = Command::new("/usr/bin/grep").args(["-r", "-l", "fixture-setup-token"]).arg(&home).output().unwrap();
+            assert!(leaked.stdout.is_empty(), "the token is in no file of the execution home: {}", String::from_utf8_lossy(&leaked.stdout));
+        }
+        let report_text = report.to_string();
+        assert!(!report_text.contains("fixture-setup-token"), "the token never appears in a report");
     }
 }
 
@@ -395,6 +436,38 @@ fn launch_run_reserves_a_planning_task_for_each_kind_and_reruns_safely() {
     assert_eq!(after.runtime_bindings.len(), before.runtime_bindings.len(), "no binding was created");
 }
 
+/// A Claude profile whose pinned owner configuration names no setup-token file
+/// is refused before any server starts or anything is
+/// reserved, with a message that says what to configure, rather than launching
+/// a worker that can only answer "login expired".
+#[test]
+fn a_claude_profile_without_a_setup_token_file_is_refused_by_verification_and_launch_run() {
+    let lab = Lab::with_herdr(STATIC_HERDR);
+    let config = lab.home.join(".config/herdr-projects/config.toml");
+    let token = lab.home.join("claude-setup-token");
+    let with_token = fs::read_to_string(&config).unwrap();
+    let without = with_token.replace(&format!("[worker_isolation.login]\nclaude_token_file={token:?}\n"), "");
+    assert_ne!(with_token, without);
+    fs::write(&config, &without).unwrap();
+    lab.plant_launchable("claude-sonnet", "claude", "claude-sonnet-5-5");
+    let prompt = lab.home.join("prompt.txt");
+    fs::write(&prompt, "Plan the next milestone.").unwrap();
+    let socket = lab.socket_inode_once("plan-claude.sock");
+    let mut args: Vec<String> = lab.run_args("plan-claude", "claude-sonnet", "docs/plan-claude.md", prompt.to_str().unwrap()).into_iter().map(str::to_owned).collect();
+    args.extend(["--herdr-socket".into(), socket.display().to_string()]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let before = herdr_projects::runtime::snapshot(&lab.project).unwrap();
+    let error = lab.fail(&args);
+    assert!(error.contains("stopped at step 1") && error.contains("claude_token_file") && error.contains("claude setup-token"), "{error}");
+    assert_eq!(herdr_projects::runtime::snapshot(&lab.project).unwrap(), before, "a refused run must not write");
+    // Verification refuses the same profile before it starts any server.
+    let (herdr, agent, home) = (lab.home.join("bin/herdr"), lab.home.join("bin/claude"), lab.home.join("agent-home-claude"));
+    let verify = ["profile", "verify-interaction", "demo", "claude-sonnet", "--herdr-executable", herdr.to_str().unwrap(),
+        "--agent-executable", agent.to_str().unwrap(), "--execution-home", home.to_str().unwrap(), "--retain"];
+    let error = lab.fail(&verify);
+    assert!(error.contains("claude_token_file"), "{error}");
+}
+
 /// A control socket that could not be bound is refused before any server
 /// starts, naming the path and its length, never as a vague "server exited".
 #[test]
@@ -453,7 +526,7 @@ fn launch_run_with_a_dedicated_server_after_verify_interaction_reserves_both_kin
 fn verify_interaction_tolerates_agents_writing_into_their_execution_home() {
     let lab = Lab::new();
     lab.build_agent("codex", &writing_agent_source("codex-cli 0.159.2", ".codex/auth.json", ".codex/config.toml", ".codex/tmp", "arg0", ".codex/sessions/x.jsonl", ""));
-    lab.build_agent("claude", &writing_agent_source("2.1.0 (Claude Code)", ".claude/.credentials.json", ".claude.json", ".claude/projects", "probe.jsonl", ".claude/projects/session.jsonl", ""));
+    lab.build_agent("claude", &writing_agent_source("2.1.0 (Claude Code)", "", ".claude.json", ".claude/projects", "probe.jsonl", ".claude/projects/session.jsonl", ""));
     for (profile, kind) in [("codex-sol", "codex"), ("claude-sonnet", "claude")] {
         let report = lab.verify(profile, kind);
         assert_eq!(report["preparation"]["launchable"], true, "{kind}: {report}");

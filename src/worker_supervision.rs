@@ -199,6 +199,11 @@ pub struct Isolation {
     /// (owner login file, its place in the execution home): bound read-write
     /// before the owner's agent directory is hidden.
     login: Vec<(String, String)>,
+    /// The Claude setup-token file: opened by the sandbox before the owner's
+    /// directories are hidden and handed to the agent as an inherited file
+    /// descriptor, which a wrapper turns into `CLAUDE_CODE_OAUTH_TOKEN` in the
+    /// agent's environment alone (never argv, never a file in the home).
+    token: Option<String>,
     /// The worker's own project directory (canonical).
     project: String,
     /// The attempt's submission spool, when the agent is a canonical attempt
@@ -346,6 +351,9 @@ const OWNER_SECRETS: &[&str] = &[
 /// 5. binds the owner's single login file (`loginsrc:`/`logindst:`), when it
 ///    exists, read-write onto its place in the execution home, before the
 ///    owner's agent directory is hidden: the same inode, never a copy;
+///    (A Claude setup-token file, `tokensrc:`, is opened first of all on
+///    descriptor 9 and stays open for the agent's wrapper, see
+///    [`Isolation::with_login_token_file`].)
 /// 6. mounts an empty read-only tmpfs over every hidden directory and
 ///    `/dev/null` over every hidden file, then over the owner's SSH agent and
 ///    tmux socket directories in `/tmp` (enumerated at setup, so the argv
@@ -360,6 +368,8 @@ const OWNER_SECRETS: &[&str] = &[
 const SANDBOX: &str = concat!(
     r#"set -u; fail() { printf 'herdr-projects: worker isolation refused: %s\n' "$1" >&2; exit 125; }; "#,
     r#"root=$1; shift; cwd=$(pwd -P) || fail cwd; "#,
+    r#"for a in "$@"; do case $a in --) break;; tokensrc:*) t=${a#tokensrc:}; "#,
+    r#"{ [ -f "$t" ] && [ ! -L "$t" ] && eval "exec 9<\"\$t\""; } || fail "$t";; esac; done; "#,
     r#"if [ -n "$root" ]; then n=3; "#,
     r#"for a in "$@"; do case $a in --) break;; expose:*) [ "$n" -le 9 ] || fail expose; p=${a#expose:}; "#,
     r#"eval "exec $n<\"\$p\"" || fail "$p"; n=$((n+1));; esac; done; "#,
@@ -398,6 +408,11 @@ const SANDBOX: &str = concat!(
     r#"cd -- "$cwd" || fail "$cwd"; while [ "$1" != -- ]; do shift; done; shift; "#,
     r#"exec /usr/bin/unshare --user --map-root-user -- "$@""#,
 );
+
+/// Runs inside the sandbox in front of the agent when a setup token is shared:
+/// reads the token from descriptor 9 (opened by [`SANDBOX`]), closes it, and
+/// executes the agent with `CLAUDE_CODE_OAUTH_TOKEN` set.
+const TOKEN_WRAPPER: &str = r#"IFS= read -r t <&9 || exit 125; exec 9<&-; [ -n "$t" ] || exit 125; CLAUDE_CODE_OAUTH_TOKEN=$t exec "$@""#;
 
 /// Lexically normal absolute UTF-8 path, bounded and free of control
 /// characters, `.` and `..`; the sandbox receives it as a literal argument.
@@ -781,7 +796,7 @@ impl Isolation {
             ensure!(keep.len() <= 7, "too many agent paths directly under {dir}");
             private.push(((*dir).to_owned(), keep));
         }
-        let mut isolation = Self { root, expose, private, git: quarantines, plan, hide, login: Vec::new(), project, spool: None, product: None };
+        let mut isolation = Self { root, expose, private, git: quarantines, plan, hide, login: Vec::new(), token: None, project, spool: None, product: None };
         // Every executable the worker runs: the agent, and the product binary
         // it invokes for `result submit` and the review worker channel (the
         // controller deriving this sandbox is that binary).
@@ -795,8 +810,7 @@ impl Isolation {
     }
 
     /// Authenticate the worker as the owner's already-logged-in CLI: bind the
-    /// single login file of `kind` (`~/.codex/auth.json`,
-    /// `~/.claude/.credentials.json`, or `source_override`, an absolute path
+    /// single login file of `kind` (`~/.codex/auth.json`, or `source_override`, an absolute path
     /// from the pinned owner configuration) read-write onto its place in the
     /// execution `home`. It is the same file, never a copy, so token refreshes
     /// stay consistent with the owner's own sessions; the rest of the owner's
@@ -811,6 +825,27 @@ impl Isolation {
         self.login.sort();
         self.login.dedup();
         ensure!(self.login.len() <= 1, "one login file is shared per worker");
+        Ok(self)
+    }
+
+    /// Authenticate a Claude worker with the long-lived setup token in `file`
+    /// (see [`crate::agent_home::check_token_file`]): the sandbox opens it as an
+    /// inherited descriptor and the agent alone receives its content as
+    /// `CLAUDE_CODE_OAUTH_TOKEN`. Nothing is bound or copied into the home, so
+    /// there is no credentials file for the agent's own refresh to fight over.
+    pub fn with_login_token_file(mut self, file: &Path) -> Result<Self> {
+        crate::agent_home::check_token_file(file, Path::new(&self.project), Path::new(&self.root))?;
+        // Descriptor 9 is held from the start of the sandbox script, so its
+        // path-opening loops (descriptors 3 to 9) may use at most 6 slots.
+        ensure!(self.expose.len() <= 6 && self.private.iter().all(|(_, keep)| keep.len() <= 6), "too many sandbox paths to also share a login token");
+        let file = normal(file)?;
+        // Opened before the hiding below, so the agent gets the token only
+        // through the descriptor and cannot read the file itself.
+        if !self.hide.contains(&file) {
+            self.hide.push(file.clone());
+            self.hide.sort();
+        }
+        self.token = Some(file);
         Ok(self)
     }
 
@@ -937,6 +972,9 @@ impl Isolation {
         for (source, dest) in &self.login {
             args.extend([format!("loginsrc:{source}"), format!("logindst:{dest}")]);
         }
+        if let Some(token) = &self.token {
+            args.push(format!("tokensrc:{token}"));
+        }
         args.extend(self.hide.iter().map(|p| format!("hide:{p}")));
         args
     }
@@ -994,6 +1032,11 @@ pub fn isolated_gated_command(
     ]);
     if let Some(spool) = &isolation.spool {
         args.push(format!("{SUBMISSION_SPOOL_ENV}={spool}"));
+    }
+    if isolation.token.is_some() {
+        // The token arrives on descriptor 9 and enters the agent's environment
+        // only here, never an argument of any process.
+        args.extend(["/bin/sh".into(), "-c".into(), TOKEN_WRAPPER.into(), "herdr-projects-token".into()]);
     }
     args.push(
         executable

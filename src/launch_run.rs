@@ -215,9 +215,15 @@ fn steps(run: &mut Run, args: &Args) -> Result<Value> {
         "give --plan-output (planning task) or --contract-file (your own contract), not both");
 
     // 1. The retained, launchable profile evidence.
-    let (profile, kind) = herdr_projects::store::SqliteStore::open(&project.join(".state/state.db"))?
+    let mut store = herdr_projects::store::SqliteStore::open(&project.join(".state/state.db"))?;
+    let (profile, kind) = store
         .latest_launchable_native_profile(&args.profile)?
         .with_context(|| format!("no launchable evidence retained for profile {}: run `profile verify-interaction {} {} --retain ...` first", args.profile, run.slug, args.profile))?;
+    // A worker that cannot log in would only 401 after launch: refuse now.
+    let retained = store.native_profile_report(&profile)?.context("retained native profile not found")?;
+    let frozen: herdr_projects::domain::FrozenProfile = serde_json::from_value(retained["preparation"]["profile"].clone()).context("retained native profile is unreadable")?;
+    herdr_projects::profile_config::check_worker_login(&frozen, &project)?;
+    drop(store);
     run.done("profile_evidence", json!({"profile":profile,"kind":kind}));
 
     // 2. The owner configuration must be acknowledged by an active project

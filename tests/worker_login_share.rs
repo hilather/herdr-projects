@@ -1,8 +1,13 @@
 #![cfg(all(feature = "state-store", target_os = "linux"))]
 #![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
-//! The worker sandbox authenticates as the owner's logged-in agent CLI by
-//! binding the owner's single login file (never a copy) into the isolated
+//! The worker sandbox authenticates a Codex worker as the owner's logged-in CLI
+//! by binding the owner's single `auth.json` (never a copy) into the isolated
 //! execution home, while the rest of the owner's agent directories stays hidden.
+//! Codex rewrites that file in place, so the owner's own refreshes stay visible
+//! to the worker. Claude Code replaces its credentials file by rename, which a
+//! bind mount cannot follow, so a Claude worker gets a long-lived setup token
+//! file instead: handed to the agent alone as an environment variable, never
+//! bound, copied into the home or put in any argument.
 //! Runs the real sandbox with a probe script standing in for the agent.
 use herdr_projects::{
     execution_guard::GatedSpawn,
@@ -71,6 +76,9 @@ show owner_claude_login "{owner_text}/.claude/.credentials.json"
 show owner_claude_state "{owner_text}/.claude.json"
 show owner_gemini "{owner_text}/.gemini/oauth_creds.json"
 show owner_grok "{owner_text}/.grok/auth.json"
+show setup_token_file "{owner_text}/../claude-setup-token"
+printf 'token_env=%s\n' "${{CLAUDE_CODE_OAUTH_TOKEN-unset}}" >> "$out"
+if [ -e /proc/self/fd/9 ]; then echo fd9=open >> "$out"; else echo fd9=closed >> "$out"; fi
 printf 'home_codex_dir=%s\n' "$(ls -A "$HOME/.codex" 2>/dev/null | tr '\n' ' ')" >> "$out"
 printf 'home_claude_dir=%s\n' "$(ls -A "$HOME/.claude" 2>/dev/null | tr '\n' ' ')" >> "$out"
 printf 'owner_codex_dir=%s\n' "$(ls -A "{owner_text}/.codex" 2>/dev/null | tr '\n' ' ')" >> "$out"
@@ -145,15 +153,64 @@ fn the_worker_shares_the_owners_single_login_file_and_nothing_else_of_the_agent_
     assert_eq!(fs::read_to_string(world.home.join(".codex/auth.json")).unwrap(), "", "the home holds only the mount point of the bound file");
     assert!(fs::read_to_string(world.owner.join(".codex/history.jsonl")).unwrap() == "codex-private-history");
 
-    // Claude Code: its credentials file, and again nothing else.
+    an_owner_refresh_of_the_codex_login_written_in_place_is_visible_to_a_running_worker(&world);
+    fs::write(world.owner.join(".codex/auth.json"), "codex-login").unwrap();
+
+    // Claude Code: no credentials file is bound any more, so the owner's
+    // refresh (a rename onto the owner's path) can never leave the worker with a
+    // stale inode, nor the worker's own refresh fight a mount point.
     let report = probe(&world, &isolation(&world).with_shared_login("claude", &world.home, None).unwrap());
-    assert_eq!(report["home_claude_login"], "claude-login", "{report:?}");
-    assert_eq!(report["home_claude_dir"].split_whitespace().filter(|n| *n != ".credentials.json").count(), 0, "{report:?}");
+    assert_eq!(report["home_claude_login"], "", "no bound Claude credentials: {report:?}");
+    assert_eq!(report["token_env"], "unset", "{report:?}");
+    assert_eq!(report["owner_claude_login"], "", "{report:?}");
+
+    // The Claude login is a setup-token file: its content reaches the agent's
+    // environment alone, through a descriptor the wrapper closes.
+    let token = world.owner.parent().unwrap().join("claude-setup-token");
+    fs::write(&token, "sk-ant-oat01-fixture-setup-token\n").unwrap();
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+    let with_token = isolation(&world).with_login_token_file(&token).unwrap();
+    let argv = isolated_gated_command(&world.agent, &[], 30, "release-probe", &world.home, &with_token).unwrap();
+    assert!(argv.iter().all(|a| !a.contains("fixture-setup-token")), "the token never appears in an argument");
+    assert!(argv.iter().any(|a| a == &format!("tokensrc:{}", token.display())), "{argv:?}");
+    let report = probe(&world, &with_token);
+    assert_eq!(report["token_env"], "sk-ant-oat01-fixture-setup-token", "{report:?}");
+    assert_eq!(report["fd9"], "closed", "{report:?}");
+    assert_eq!(report["setup_token_file"], "", "the agent cannot read the token file itself: {report:?}");
+    assert_eq!(report["home_claude_login"], "", "{report:?}");
+    assert_eq!(report["home_claude_dir"], "", "nothing is bound or written under the home's .claude: {report:?}");
     for hidden in ["owner_claude_session", "owner_claude_settings", "owner_claude_login", "owner_claude_state", "owner_codex_history", "owner_codex_config", "owner_claude_dir"] {
         assert_eq!(report[hidden], "", "{hidden} must stay hidden from the worker: {report:?}");
     }
-    assert_eq!(fs::read_to_string(world.owner.join(".claude/.credentials.json")).unwrap(), "token-refreshed-in-place");
-    assert_eq!(fs::read_to_string(world.owner.join(".claude/settings.json")).unwrap(), "owner-claude-settings");
+    assert_eq!(fs::read_to_string(world.owner.join(".claude/.credentials.json")).unwrap(), "claude-login", "the owner's credentials are untouched");
+    let leaked = Command::new("/usr/bin/grep").args(["-r", "-l", "--exclude=probe.txt", "fixture-setup-token"]).arg(&world.home).output().unwrap();
+    assert!(leaked.stdout.is_empty(), "the token is in no file of the execution home: {}", String::from_utf8_lossy(&leaked.stdout));
+    // (The probe can read that file when nothing hides it.)
+    assert_eq!(probe(&world, &isolation(&world))["setup_token_file"], "sk-ant-oat01-fixture-setup-token");
+    // A Codex worker never sees the variable.
+    let report = probe(&world, &isolation(&world).with_shared_login("codex", &world.home, None).unwrap());
+    assert_eq!(report["token_env"], "unset", "{report:?}");
+
+    // A token file that others can read, that lies in an agent directory, in
+    // the project, or that is empty or holds more than a token is refused.
+    let loose = world.owner.parent().unwrap().join("loose-token");
+    fs::write(&loose, "t\n").unwrap();
+    fs::set_permissions(&loose, fs::Permissions::from_mode(0o644)).unwrap();
+    let inside_agent_dir = world.owner.join(".claude/token");
+    fs::write(&inside_agent_dir, "t\n").unwrap();
+    fs::set_permissions(&inside_agent_dir, fs::Permissions::from_mode(0o600)).unwrap();
+    let inside_project = world.project.join("token");
+    fs::write(&inside_project, "t\n").unwrap();
+    fs::set_permissions(&inside_project, fs::Permissions::from_mode(0o600)).unwrap();
+    let empty = world.owner.parent().unwrap().join("empty-token");
+    fs::write(&empty, "\n").unwrap();
+    fs::set_permissions(&empty, fs::Permissions::from_mode(0o600)).unwrap();
+    let multiline = world.owner.parent().unwrap().join("multiline-token");
+    fs::write(&multiline, "one\ntwo\n").unwrap();
+    fs::set_permissions(&multiline, fs::Permissions::from_mode(0o600)).unwrap();
+    for bad in [&loose, &inside_agent_dir, &inside_project, &empty, &multiline, &world.owner.parent().unwrap().join("missing-token")] {
+        assert!(isolation(&world).with_login_token_file(bad).is_err(), "{} must be refused", bad.display());
+    }
 
     // An explicit override binds another token file instead of the owner's default.
     let token = world.owner.parent().unwrap().join("setup-token");
@@ -172,4 +229,42 @@ fn the_worker_shares_the_owners_single_login_file_and_nothing_else_of_the_agent_
     fs::remove_file(world.owner.join(".codex/auth.json")).unwrap();
     let report = probe(&world, &isolation(&world).with_shared_login("codex", &world.home, None).unwrap());
     assert_eq!(report["home_codex_login"], "", "{report:?}");
+}
+
+/// Codex rewrites `auth.json` in place (truncate and write, the same inode), so
+/// the bind stays current: a refresh the owner's own session makes while the
+/// worker runs is visible to the worker.
+fn an_owner_refresh_of_the_codex_login_written_in_place_is_visible_to_a_running_worker(world: &World) {
+    let watcher = world.home.parent().unwrap().join("watch-agent");
+    fs::write(
+        &watcher,
+        r#"#!/bin/sh
+: > "$HOME/watching"
+n=0
+while [ "$n" -lt 200 ]; do
+  if [ "$(cat "$HOME/.codex/auth.json" 2>/dev/null)" = owner-refreshed ]; then echo seen > "$HOME/refresh.txt"; exit 0; fi
+  n=$((n+1)); sleep 0.1
+done
+echo missed > "$HOME/refresh.txt"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&watcher, fs::Permissions::from_mode(0o700)).unwrap();
+    let isolation = Isolation::for_agent(&world.project, &world.home, &world.project, &watcher, &[], &[], None, None, &[]).unwrap().with_shared_login("codex", &world.home, None).unwrap();
+    let argv = isolated_gated_command(&watcher, &[], 60, "release-probe", &world.home, &isolation).unwrap();
+    let mut child = Command::new(&argv[0]).args(&argv[1..]).current_dir(&world.project).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn_gated().unwrap();
+    child.stdin.take().unwrap().write_all(b"release-probe\n").unwrap();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !world.home.join("watching").exists() {
+        assert!(std::time::Instant::now() < until, "the worker never started");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // The owner's refresh: in place, same inode.
+    let login = world.owner.join(".codex/auth.json");
+    let inode = fs::metadata(&login).unwrap().ino();
+    fs::OpenOptions::new().write(true).truncate(true).open(&login).unwrap().write_all(b"owner-refreshed").unwrap();
+    assert_eq!(fs::metadata(&login).unwrap().ino(), inode);
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(fs::read_to_string(world.home.join("refresh.txt")).unwrap().trim(), "seen", "the worker must see the owner's in-place refresh");
 }

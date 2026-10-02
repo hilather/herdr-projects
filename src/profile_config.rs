@@ -256,15 +256,19 @@ pub(crate) fn frozen_isolation_hides(profile: &crate::domain::FrozenProfile) -> 
 }
 
 /// The `[worker_isolation]` table of the digest-pinned owner configuration.
-/// `login` shares the owner's login file with the worker (default on); an
-/// explicit per-kind path under `[worker_isolation.login]` names another token
-/// file to bind instead of the owner's default one.
+/// `share_login` shares the worker's login (default on): for Codex the owner's
+/// `auth.json` (an explicit `codex = "/abs/path"` under `[worker_isolation.login]`
+/// binds another file instead); for Claude Code the setup-token file named by
+/// `claude_token_file = "/abs/path"` there, never a bound credentials file.
 #[cfg(feature = "state-store")]
 #[derive(Default)]
 pub(crate) struct IsolationConfig {
     pub hide: Vec<String>,
     pub share_login: Option<bool>,
     pub login: std::collections::BTreeMap<String, std::path::PathBuf>,
+    /// The long-lived Claude setup-token file (`[worker_isolation.login]
+    /// claude_token_file`): a Claude worker's login.
+    pub claude_token_file: Option<std::path::PathBuf>,
 }
 
 #[cfg(feature = "state-store")]
@@ -299,12 +303,19 @@ pub(crate) fn frozen_isolation(profile: &crate::domain::FrozenProfile) -> anyhow
     ensure!(table.keys().all(|k| matches!(k.as_str(), "hide" | "share_login" | "login")), "unknown worker_isolation setting");
     let share_login = table.get("share_login").map(|v| v.as_bool().context("worker_isolation.share_login must be a boolean")).transpose()?;
     let mut login = std::collections::BTreeMap::new();
+    let mut claude_token_file = None;
     if let Some(entries) = table.get("login") {
-        for (kind, path) in entries.as_table().context("worker_isolation.login must be a table of kind = path")? {
+        for (key, path) in entries.as_table().context("worker_isolation.login must be a table")? {
             let path = path.as_str().context("worker_isolation.login paths must be strings")?;
-            ensure!(crate::agent_home::login_file(kind).is_some() && path.starts_with('/') && path.len() <= 1024 && !path.contains('\0'),
-                "worker_isolation.login takes an absolute path for codex or claude");
-            login.insert(kind.clone(), std::path::PathBuf::from(path));
+            ensure!(path.starts_with('/') && path.len() <= 1024 && !path.contains('\0'), "worker_isolation.login paths must be absolute");
+            match key.as_str() {
+                "claude_token_file" => claude_token_file = Some(std::path::PathBuf::from(path)),
+                "codex" => {
+                    login.insert(key.clone(), std::path::PathBuf::from(path));
+                }
+                "claude" => anyhow::bail!("a Claude worker no longer binds a credentials file; set worker_isolation.login.claude_token_file to a `claude setup-token` file"),
+                _ => anyhow::bail!("worker_isolation.login takes codex or claude_token_file"),
+            }
         }
     }
     let hide = table
@@ -318,7 +329,7 @@ pub(crate) fn frozen_isolation(profile: &crate::domain::FrozenProfile) -> anyhow
         hide.len() <= 16 && hide.iter().all(|p| p.starts_with('/') || p.starts_with("~/")),
         "worker_isolation.hide takes at most 16 absolute or ~/ paths"
     );
-    Ok(IsolationConfig { hide, share_login, login })
+    Ok(IsolationConfig { hide, share_login, login, claude_token_file })
 }
 
 /// Share the owner's login with the worker the profile launches, unless the
@@ -334,5 +345,33 @@ pub(crate) fn share_login(
     if !config.shares_login() {
         return Ok(isolation);
     }
+    if profile.kind == "claude" {
+        // A profile without a token file has no worker login; verification and
+        // `launch run` refuse such a profile (see [`check_worker_login`]).
+        return match &config.claude_token_file {
+            Some(file) => isolation.with_login_token_file(file),
+            None => Ok(isolation),
+        };
+    }
     isolation.with_shared_login(&profile.kind, home, config.login_override(&profile.kind).as_deref())
+}
+
+/// The Claude setup-token file of a profile whose worker login is shared, or the
+/// refusal that stops a launch which could only fail with "login expired".
+#[cfg(feature = "state-store")]
+fn claude_token_file(config: &IsolationConfig) -> anyhow::Result<std::path::PathBuf> {
+    config.claude_token_file.clone().ok_or_else(|| anyhow::anyhow!(
+        "no Claude worker login is configured: create a long-lived token with `claude setup-token`, save it in a 0600 file outside the project and the agent directories, set `claude_token_file = \"/abs/path\"` under [worker_isolation.login] in the owner configuration, then prepare and verify the profile again"))
+}
+
+/// Refuse a frozen Claude profile whose pinned owner configuration names no
+/// usable setup-token file, before anything is reserved for it. Other kinds and
+/// profiles that do not share a login pass.
+#[cfg(feature = "state-store")]
+pub fn check_worker_login(profile: &crate::domain::FrozenProfile, project: &std::path::Path) -> anyhow::Result<()> {
+    let config = frozen_isolation(profile)?;
+    if profile.kind != "claude" || !config.shares_login() {
+        return Ok(());
+    }
+    crate::agent_home::check_token_file(&claude_token_file(&config)?, project, std::path::Path::new(""))
 }
