@@ -504,15 +504,34 @@ fn executable_dependencies(executable: &Path) -> Vec<std::path::PathBuf> {
     out
 }
 
-/// The owner's home directories: the account's passwd entry and, when it
-/// differs, the controller's `HOME`. Both are hidden-secret anchors and the
-/// places an owner login is looked up. `HERDR_PROJECTS_OWNER_HOME` (absolute)
-/// replaces both: the end-to-end suites declare a fixture owner home with it,
-/// so no test ever reads, binds or hides the real owner's home.
+/// `HERDR_PROJECTS_OWNER_HOME` (absolute): a declared fixture owner home. It
+/// only ever ADDS a hidden-secret anchor and redirects where the owner login
+/// is looked up; it can never remove the real owner home from the hidden set,
+/// so a stray value cannot expose the owner's keys or agent data to a worker.
+fn declared_owner_home() -> Result<Option<String>> {
+    std::env::var_os("HERDR_PROJECTS_OWNER_HOME").map(|home| normal(Path::new(&home))).transpose()
+}
+
+/// Hidden-secret anchors: the real owner homes plus any declared fixture home.
 fn owner_homes() -> Result<Vec<String>> {
-    if let Some(home) = std::env::var_os("HERDR_PROJECTS_OWNER_HOME") {
-        return Ok(vec![normal(Path::new(&home))?]);
+    let mut homes = real_owner_homes()?;
+    if let Some(declared) = declared_owner_home()?
+        && !homes.contains(&declared)
+    {
+        homes.push(declared);
     }
+    Ok(homes)
+}
+
+/// Where the owner's login file is looked up: the declared fixture home when
+/// set (so tests never bind the real login), otherwise the real owner homes.
+fn login_homes() -> Result<Vec<String>> {
+    Ok(match declared_owner_home()? { Some(home) => vec![home], None => real_owner_homes()? })
+}
+
+/// The owner's real home directories: the account's passwd entry and, when it
+/// differs, the controller's `HOME`.
+fn real_owner_homes() -> Result<Vec<String>> {
     let mut homes = Vec::new();
     let mut buffer = vec![0u8; 16384];
     let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
@@ -787,7 +806,7 @@ impl Isolation {
     /// that renames a new file over it gets `EBUSY` on the mount point.
     pub fn with_shared_login(mut self, kind: &str, home: &Path, source_override: Option<&Path>) -> Result<Self> {
         let Some(relative) = crate::agent_home::login_file(kind) else { return Ok(self) };
-        let Some(source) = crate::agent_home::login_source(kind, &owner_homes()?, source_override) else { return Ok(self) };
+        let Some(source) = crate::agent_home::login_source(kind, &login_homes()?, source_override) else { return Ok(self) };
         self.login.push((normal(&source)?, normal(&home.join(relative))?));
         self.login.sort();
         self.login.dedup();

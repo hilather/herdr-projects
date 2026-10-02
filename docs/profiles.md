@@ -267,9 +267,10 @@ A copy placed in the execution home by hand still works with `share_login = fals
 
 The owner home (where the login is looked up and whose agent directories are
 hidden) is the account's passwd home plus `HOME`. `HERDR_PROJECTS_OWNER_HOME`
-(absolute) replaces both; the test suites set it to a fixture home so no test
-reads, binds or hides the real owner's files. A login source that does not
-exist adds nothing.
+(absolute) declares a fixture owner home: the login is then looked up only
+there (so no test binds the real owner's login), and its agent directories are
+hidden **in addition to** the real owner home's. It can never remove the real
+home from the hidden set. A login source that does not exist adds nothing.
 An override path must not lie under `/tmp`, `/var/tmp` or `/dev/shm` (private in the
 sandbox). Other launch kinds get the same treatment as they become launchable.
 
