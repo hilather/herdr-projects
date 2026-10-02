@@ -63,6 +63,7 @@ def serve(path):
    'matched_rule':{'id':'prompt','state':'idle'},'visible_idle':True,'visible_blocker':False,'visible_working':False,'screen_detection_skipped':False,
    'skip_state_update':False,'local_override_shadowing_remote':False,'fallback_reason':None,'warning':None}}
   elif m=='agent.prompt':s['accepted']=True;res={'type':'agent_prompted','agent':agent}
+  elif m=='agent.rename':s['name']=agent['name']=p['name'];res={'type':'agent_info','agent':agent}
   if res is not None:f.write(json.dumps({'id':r['id'],'result':res})+'\n');f.flush()
   c.close()
 if args==['server']:serve(os.environ['HERDR_SOCKET_PATH']);sys.exit(0)
@@ -251,21 +252,6 @@ impl Lab {
         let out = self.cli(args);
         assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
         serde_json::from_slice(&out.stdout).unwrap_or(Value::Null)
-    }
-    /// Rebuild optimistic concurrency arguments when the fixture ticker races a write.
-    fn ok_live(&self, stage: &str, args: &dyn Fn() -> Vec<String>) -> Value {
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            let args = args();
-            let out = self.cli(&args.iter().map(String::as_str).collect::<Vec<_>>());
-            if out.status.success() { return serde_json::from_slice(&out.stdout).unwrap_or(Value::Null); }
-            assert!(std::time::Instant::now() < until,
-                "timed out waiting for {stage}: {args:?}: {}\nattempt states: {:?}\nticker log:\n{}",
-                String::from_utf8_lossy(&out.stderr),
-                herdr_projects::runtime::snapshot(&self.project).map(|s| s.attempts),
-                fs::read_to_string(self.root.join(".ticker.log")).unwrap_or_default());
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
     }
     fn fail(&self, args: &[&str]) -> String {
         let out = self.cli(args);
@@ -610,13 +596,19 @@ fn launch_run_retries_after_termination_but_refuses_an_unobserved_live_worker() 
         .env("XDG_RUNTIME_DIR", lab.runtime.path())
         .args(["--root", lab.root.to_str().unwrap(), "ticker", "run"])
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap());
-    lab.ok_live("cancel first Running attempt", &|| {
-        let state = herdr_projects::runtime::snapshot(&lab.project).unwrap();
-        let revision = state.attempts.iter().find(|a| a.id.as_str() == attempt).unwrap().revision;
-        ["task", "demo", "cancel-attempt", attempt, "--expected-revision", &revision.to_string(),
-            "--expected-head", &state.head.to_string(), "--reason", "finished"].map(String::from).to_vec()
-    });
-    wait("first attempt termination observed after cancellation", &|| herdr_projects::runtime::snapshot(&lab.project).is_ok_and(|s|
+    // The worker dies on its own, as the live trial's did (its budget ended it):
+    // the attempt fails and the task is left blocked, not cancelled.
+    let agent = fs::canonicalize(lab.home.join("bin/codex")).unwrap();
+    let mut killed = 0;
+    for entry in fs::read_dir("/proc").unwrap().flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) else { continue };
+        if fs::read_link(entry.path().join("exe")).is_ok_and(|exe| exe == agent) {
+            assert!(Command::new("/bin/kill").args(["-KILL", &pid.to_string()]).status().unwrap().success());
+            killed += 1;
+        }
+    }
+    assert_eq!(killed, 1, "exactly the fixture's worker agent is killed");
+    wait("first attempt termination observed after the worker died", &|| herdr_projects::runtime::snapshot(&lab.project).is_ok_and(|s|
         s.attempts.iter().any(|a| a.id.as_str() == attempt && a.termination_observed)));
     ticker.0.kill().unwrap();ticker.0.wait().unwrap();
     lab.ok(&["launch", "demo", "stop", "--task", "plan-retry"]);
