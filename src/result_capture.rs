@@ -176,6 +176,13 @@ pub fn submit_captured(project: &Path, attempt: &str, message: Option<&str>) -> 
         artifacts.push((output.clone(), oid));
     }
     let loose = |oid: &str| format!("{}/{}", &oid[..2], &oid[2..]);
+    // Stage every object the candidate adds over its base (the capture commit,
+    // its trees and blobs, all written loose by the capture), not only the two
+    // commits: verification checks the candidate out from the staged objects.
+    let mut objects = vec![capture.base_oid.clone()];
+    for oid in git(&["rev-list", "--objects", "--no-object-names", &format!("{}..{}", capture.base_oid, capture.candidate_oid)])?.lines() {
+        if !objects.iter().any(|o| o == oid) { objects.push(oid.to_owned()); }
+    }
     let key = format!("captured-{}", &format!("{:x}", Sha256::digest(format!("{attempt}\0{}", capture.candidate_oid).as_bytes()))[..32]);
     let mut document = serde_json::to_vec(&serde_json::json!({
         "idempotency_key": key,
@@ -190,10 +197,7 @@ pub fn submit_captured(project: &Path, attempt: &str, message: Option<&str>) -> 
         "memory_snapshot_id": contract.memory_snapshot_id,
         "artifact_manifest": artifacts.iter().map(|(path, oid)| serde_json::json!({"path": path, "oid": oid})).collect::<Vec<_>>(),
         "claimed_checks": Vec::<String>::new(),
-        "objects": [
-            {"oid": capture.base_oid, "relative_path": loose(&capture.base_oid)},
-            {"oid": capture.candidate_oid, "relative_path": loose(&capture.candidate_oid)},
-        ],
+        "objects": objects.iter().map(|oid| serde_json::json!({"oid": oid, "relative_path": loose(oid)})).collect::<Vec<_>>(),
     }))?;
     document.push(b'\n');
     let submission = {
