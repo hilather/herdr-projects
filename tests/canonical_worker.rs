@@ -486,7 +486,9 @@ fn launch_sets_the_intended_permission_mode_over_a_stale_one_in_the_home() {
     fs::write(&settings, r#"{"permissions":{"defaultMode":"auto"},"env":{"DISABLE_AUTOUPDATER":"0"},"owner_extra":"kept"}"#).unwrap();
     lab.serve();
     let mut ticker = lab.spawn();
-    lab.wait(&mut ticker, 60, &|| lab.count("workspace.create_command") == 1);
+    // The home is prepared at the release gate, a later stage than workspace
+    // creation: wait for the brief, which is delivered only after release.
+    lab.wait(&mut ticker, 60, &|| lab.count("agent.prompt") >= 1);
     lab.stop(ticker);
     let written: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
     assert_eq!(written["permissions"]["defaultMode"], "acceptEdits", "{written}");
