@@ -252,6 +252,21 @@ impl Lab {
         assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
         serde_json::from_slice(&out.stdout).unwrap_or(Value::Null)
     }
+    /// Rebuild optimistic concurrency arguments when the fixture ticker races a write.
+    fn ok_live(&self, stage: &str, args: &dyn Fn() -> Vec<String>) -> Value {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let args = args();
+            let out = self.cli(&args.iter().map(String::as_str).collect::<Vec<_>>());
+            if out.status.success() { return serde_json::from_slice(&out.stdout).unwrap_or(Value::Null); }
+            assert!(std::time::Instant::now() < until,
+                "timed out waiting for {stage}: {args:?}: {}\nattempt states: {:?}\nticker log:\n{}",
+                String::from_utf8_lossy(&out.stderr),
+                herdr_projects::runtime::snapshot(&self.project).map(|s| s.attempts),
+                fs::read_to_string(self.root.join(".ticker.log")).unwrap_or_default());
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
     fn fail(&self, args: &[&str]) -> String {
         let out = self.cli(args);
         assert!(!out.status.success(), "{args:?} succeeded: {}", String::from_utf8_lossy(&out.stdout));
@@ -545,7 +560,7 @@ fn launch_run_reacknowledges_an_owner_configuration_edited_since_control_was_act
     assert_eq!(step(&again, "project_control")["outcome"], "already_done", "{again}");
 }
 
-/// socket: budget termination permits owner re-acknowledgment and a new attempt,
+/// socket: explicit cancellation permits owner re-acknowledgment and a new attempt,
 /// while an unobserved live worker still fences step 2.
 #[test]
 fn launch_run_retries_after_termination_but_refuses_an_unobserved_live_worker() {
@@ -554,9 +569,6 @@ fn launch_run_retries_after_termination_but_refuses_an_unobserved_live_worker() 
         fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
     }
     let lab = Lab::new();
-    let config = lab.home.join(".config/herdr-projects/config.toml");
-    let text = fs::read_to_string(&config).unwrap().replace("max_wall_seconds=600", "max_wall_seconds=15");
-    fs::write(&config, text).unwrap();
     lab.verify("codex-sol", "codex");
     let prompt = lab.home.join("prompt.txt");
     fs::write(&prompt, "Plan the next milestone.").unwrap();
@@ -569,14 +581,17 @@ fn launch_run_retries_after_termination_but_refuses_an_unobserved_live_worker() 
         .env("XDG_RUNTIME_DIR", lab.runtime.path())
         .args(["--root", lab.root.to_str().unwrap(), "ticker", "run"])
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap());
-    let wait = |done: &dyn Fn() -> bool| {
+    let wait = |stage: &str, done: &dyn Fn() -> bool| {
         let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !done() {
-            assert!(std::time::Instant::now() < until, "ticker workflow timed out");
+            assert!(std::time::Instant::now() < until,
+                "timed out waiting for {stage}\nattempt states: {:?}\nticker log:\n{}",
+                herdr_projects::runtime::snapshot(&lab.project).map(|s| s.attempts),
+                fs::read_to_string(lab.root.join(".ticker.log")).unwrap_or_default());
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     };
-    wait(&|| herdr_projects::runtime::snapshot(&lab.project).is_ok_and(|s|
+    wait("first attempt Running", &|| herdr_projects::runtime::snapshot(&lab.project).is_ok_and(|s|
         s.attempts.iter().any(|a| a.id.as_str() == attempt && a.state == AttemptState::Running)));
     // Stop only this fixture's ticker: the worker remains alive and its old
     // observation cannot acknowledge edited owner configuration.
@@ -595,7 +610,13 @@ fn launch_run_retries_after_termination_but_refuses_an_unobserved_live_worker() 
         .env("XDG_RUNTIME_DIR", lab.runtime.path())
         .args(["--root", lab.root.to_str().unwrap(), "ticker", "run"])
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap());
-    wait(&|| herdr_projects::runtime::snapshot(&lab.project).is_ok_and(|s|
+    lab.ok_live("cancel first Running attempt", &|| {
+        let state = herdr_projects::runtime::snapshot(&lab.project).unwrap();
+        let revision = state.attempts.iter().find(|a| a.id.as_str() == attempt).unwrap().revision;
+        ["task", "demo", "cancel-attempt", attempt, "--expected-revision", &revision.to_string(),
+            "--expected-head", &state.head.to_string(), "--reason", "finished"].map(String::from).to_vec()
+    });
+    wait("first attempt termination observed after cancellation", &|| herdr_projects::runtime::snapshot(&lab.project).is_ok_and(|s|
         s.attempts.iter().any(|a| a.id.as_str() == attempt && a.termination_observed)));
     ticker.0.kill().unwrap();ticker.0.wait().unwrap();
     lab.ok(&["launch", "demo", "stop", "--task", "plan-retry"]);
