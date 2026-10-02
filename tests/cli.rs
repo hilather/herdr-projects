@@ -3211,11 +3211,13 @@ fn outcome_success_path() {
     assert_eq!(blockers("b"),(vec!["admission_disabled:integrated_commit".to_owned()],1),"b is released; a's worker still holds capacity");
     assert!(a_attempt().retains_capacity());
 
-    // Completion is recorded once; a repeat is an idempotent no-op.
+    // Completion is recorded once: with verification and integration automatic,
+    // the ticker already requested it for the accepted attempt, so the
+    // operator's request replays it; a repeat is an idempotent no-op.
     let revision=task("a").revision;
     let requested=complete(revision);assert!(requested.status.success(),"{}",String::from_utf8_lossy(&requested.stderr));
     let requested:serde_json::Value=serde_json::from_slice(&requested.stdout).unwrap();
-    assert_eq!((requested["attempt"].as_str(),requested["replayed"].as_bool()),(Some(attempt.as_str()),Some(false)));
+    assert_eq!((requested["attempt"].as_str(),requested["replayed"].as_bool()),(Some(attempt.as_str()),Some(true)));
     assert!(a_attempt().retains_capacity(),"capacity is held until termination is proven");
     let before=head();let replay=complete(revision);assert!(replay.status.success(),"{}",String::from_utf8_lossy(&replay.stderr));
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&replay.stdout).unwrap()["replayed"],true);assert_eq!(head(),before);
