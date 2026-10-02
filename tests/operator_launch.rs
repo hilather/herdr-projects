@@ -301,6 +301,29 @@ impl Lab {
         assert_eq!(unsafe { libc::mknod(c.as_ptr(), libc::S_IFSOCK | 0o600, 0) }, 0);
         path
     }
+    /// Follow the closing script of the attempt's retained brief as the worker
+    /// would: edit the deliverable in a worktree of the repository and run the
+    /// script. `herdr-projects` resolves to the product CLI with the spool
+    /// variable removed, so outside any sandbox it records the submission
+    /// directly (inside the sandbox the same command goes through the spool).
+    fn follow_brief(&self, attempt: &str, output: &str, branch: &str) -> Output {
+        let brief = self.ok(&["memory", "demo", "attempt-brief", "--attempt", attempt]);
+        let text = brief["text"].as_str().unwrap();
+        let script = text.split("```sh\n").nth(1).and_then(|rest| rest.split("```").next()).unwrap_or_else(|| panic!("the brief has no submission script:\n{text}"));
+        let worktree = self.home.join(format!("worker-{branch}"));
+        self.git(&["worktree", "add", "-q", "-b", branch, worktree.to_str().unwrap()]);
+        fs::create_dir_all(worktree.join(output).parent().unwrap()).unwrap();
+        fs::write(worktree.join(output), "The plan.\n").unwrap();
+        let shim = self.home.join("shim");
+        fs::create_dir_all(&shim).unwrap();
+        fs::write(shim.join("herdr-projects"), format!("#!/bin/sh\nunset HERDR_PROJECTS_SUBMISSION_SPOOL\nexec {BIN} \"$@\"\n")).unwrap();
+        fs::set_permissions(shim.join("herdr-projects"), fs::Permissions::from_mode(0o700)).unwrap();
+        Command::new("/bin/sh").arg("-c").arg(script).current_dir(&worktree).env_clear()
+            .env("HOME", &self.home).env("HERDR_PROJECTS_OWNER_HOME", &self.home).env("PATH", format!("{}:/usr/bin:/bin", shim.display()))
+            .env("TMPDIR", std::env::var_os("TMPDIR").unwrap_or("/tmp".into())).env("XDG_RUNTIME_DIR", self.runtime.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("HERDR_PROJECTS_SUBMISSION_SPOOL", self.project.join(".state/spool").join(attempt)).output().unwrap()
+    }
     fn run_args<'a>(&'a self, task: &'a str, profile: &'a str, output: &'a str, prompt: &'a str) -> Vec<&'a str> {
         vec!["launch", "demo", "run", "--task", task, "--profile", profile, "--repository", self.repo.to_str().unwrap(), "--plan-output", output,
             "--prompt-file", prompt, "--integration-ref", "refs/heads/integration", "--sign-with", self.key.to_str().unwrap(),
@@ -409,6 +432,19 @@ fn launch_run_reserves_a_planning_task_for_each_kind_and_reruns_safely() {
         // The retained brief carries the project instructions, the task text and the deliverable.
         let brief = lab.ok(&["memory", "demo", "attempt-brief", "--attempt", &attempt]).to_string();
         assert!(brief.contains("Shadow trial project") && brief.contains("Plan the next milestone") && brief.contains(&output), "{brief}");
+        // The brief ends with the exact submission the worker must make; following
+        // it records one submission bound to this attempt's contract.
+        let brief_text = lab.ok(&["memory", "demo", "attempt-brief", "--attempt", &attempt])["text"].as_str().unwrap().to_owned();
+        assert!(brief_text.contains("submission_id") && brief_text.contains("result demo submit"), "{brief_text}");
+        let branch = format!("worker-{task}");
+        let followed = lab.follow_brief(&attempt, &output, &branch);
+        assert!(followed.status.success() && String::from_utf8_lossy(&followed.stdout).contains("submission_id"), "{}{}", String::from_utf8_lossy(&followed.stdout), String::from_utf8_lossy(&followed.stderr));
+        let shown = lab.ok(&["result", "demo", "show"]);
+        let mine: Vec<_> = shown.as_array().unwrap().iter().filter(|r| r["attempt_id"] == attempt.as_str()).collect();
+        assert_eq!(mine.len(), 1, "{shown}");
+        assert_eq!(mine[0]["task_id"], task);
+        assert_eq!(mine[0]["artifact_manifest"][0]["path"], output.as_str(), "{shown}");
+        assert_eq!(mine[0]["contract_revision"], 1);
         // Safe to repeat: finished steps are skipped and no second attempt appears.
         let again = lab.ok(&args);
         assert_eq!(again["attempt"], report["attempt"], "{again}");

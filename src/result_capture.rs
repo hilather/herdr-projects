@@ -128,3 +128,74 @@ fn check_changes(raw: &str, scopes: Option<&[String]>, blob: impl Fn(&str) -> Re
     }
     Ok(())
 }
+
+/// What `result submit-captured` recorded: the capture and the submission built from it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CapturedSubmission {
+    pub capture: CaptureReceipt,
+    pub contract_revision: u64,
+    pub contract_digest: String,
+    pub artifacts: Vec<(String, String)>,
+    pub submission: ResultReceipt,
+}
+
+/// Finish a worker that did not submit: capture its worktree (idempotent), then
+/// build the result document from that capture and record it as an untrusted
+/// submission exactly as `result submit` would. The document carries the
+/// attempt's frozen contract revision and digest, the contract's base and the
+/// captured candidate (objects staged from its repository), and an artifact
+/// manifest holding the blob of every output the contract declares at the
+/// candidate. Replays under the same key while the candidate is unchanged. The
+/// submission is as untrusted as any other: verification still decides.
+pub fn submit_captured(project: &Path, attempt: &str, message: Option<&str>) -> Result<CapturedSubmission> {
+    use sha2::{Digest, Sha256};
+    use crate::execution_guard::GatedSpawn;
+    let attempt_id = AttemptId::new(attempt.to_owned()).map_err(anyhow::Error::msg)?;
+    let capture = capture_project(project, attempt, message)?;
+    let project = project.canonicalize()?;
+    let (contract, frozen) = {
+        let mut db = crate::migration::open_active(&project)?;
+        let state = db.read_snapshot(None)?;
+        let record = state.attempt_inputs.iter().find(|r| r.attempt == attempt_id).context("attempt's retained launch inputs missing")?;
+        let contract = db.attempt_contract(record.inputs.task.as_str(), record.inputs.task_contract.as_ref())?.context("the attempt has no task contract")?;
+        (contract.clone(), record.inputs.task_contract.clone())
+    };
+    ensure!(frozen.is_none_or(|f| f.digest == contract.digest), "attempt contract binding mismatch");
+    ensure!(contract.repository == capture.repository && contract.base_oid == capture.base_oid, "the captured work does not match the contract's repository and base");
+    let git = |args: &[&str]| -> Result<String> {
+        let output = std::process::Command::new("/usr/bin/git").env_clear().env("PATH", "/usr/bin:/bin").env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .arg("-C").arg(&capture.repository).args(args).output_gated()?;
+        ensure!(output.status.success(), "git {} failed", args.first().copied().unwrap_or_default());
+        Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    };
+    let mut artifacts = Vec::new();
+    for output in &contract.required_outputs {
+        let oid = git(&["rev-parse", "--verify", &format!("{}:{output}", capture.candidate_oid)])
+            .with_context(|| format!("the captured candidate has no declared output {output}"))?;
+        artifacts.push((output.clone(), oid));
+    }
+    let loose = |oid: &str| format!("{}/{}", &oid[..2], &oid[2..]);
+    let key = format!("captured-{}", &format!("{:x}", Sha256::digest(format!("{attempt}\0{}", capture.candidate_oid).as_bytes()))[..32]);
+    let mut document = serde_json::to_vec(&serde_json::json!({
+        "idempotency_key": key,
+        "task_id": capture.task,
+        "contract_revision": contract.contract_revision,
+        "contract_digest": contract.digest,
+        "attempt_id": attempt,
+        "repository": capture.repository,
+        "base_oid": capture.base_oid,
+        "candidate_oid": capture.candidate_oid,
+        "object_format": contract.object_format.as_str(),
+        "memory_snapshot_id": contract.memory_snapshot_id,
+        "artifact_manifest": artifacts.iter().map(|(path, oid)| serde_json::json!({"path": path, "oid": oid})).collect::<Vec<_>>(),
+        "claimed_checks": Vec::<String>::new(),
+        "objects": [
+            {"oid": capture.base_oid, "relative_path": loose(&capture.base_oid)},
+            {"oid": capture.candidate_oid, "relative_path": loose(&capture.candidate_oid)},
+        ],
+    }))?;
+    document.push(b'\n');
+    let held = crate::migration::runtime_mutation(&project)?;
+    let submission = crate::store::submit_untrusted_result_bytes(&held, &project, &document)?;
+    Ok(CapturedSubmission { contract_revision: contract.contract_revision, contract_digest: contract.digest, artifacts, submission, capture })
+}

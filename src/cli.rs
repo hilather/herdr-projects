@@ -829,6 +829,9 @@ enum ResultCommand {
     /// Commit a sandboxed worker's uncommitted edits on its attempt branch with a fixed identity; prints the candidate OID. Not evidence.
     #[cfg(target_os="linux")]
     Capture { attempt:String, #[arg(long)] message:Option<String> },
+    /// Finish a worker that did not submit: capture its worktree, build the result document from the capture (the attempt's frozen contract, base, candidate and the declared outputs' blobs) and record it as an untrusted submission. Verification and integration then proceed as for any submission.
+    #[cfg(target_os="linux")]
+    SubmitCaptured { attempt:String, #[arg(long)] message:Option<String> },
     /// Stage git objects and record one untrusted submission. Claimed checks are not evidence.
     #[cfg(target_os="linux")]
     Submit { #[arg(long)] input_file:PathBuf },
@@ -1510,6 +1513,8 @@ pub fn run() -> Result<()> {
             match command {
                 #[cfg(target_os="linux")]
                 ResultCommand::Capture{attempt,message}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::result_capture::capture_project(&dir,&attempt,message.as_deref())?)?),
+                #[cfg(target_os="linux")]
+                ResultCommand::SubmitCaptured{attempt,message}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::result_capture::submit_captured(&dir,&attempt,message.as_deref())?)?),
                 #[cfg(target_os="linux")]
                 // Inside the worker sandbox the store is read-only: the ticker
                 // ingests the request from the attempt's submission spool.

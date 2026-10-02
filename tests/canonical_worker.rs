@@ -517,6 +517,56 @@ fn ticker_stops_the_dedicated_herdr_server_of_a_finished_task() {
     assert!(!run.join("demo-work/herdr/server.json").exists());
 }
 
+/// A worker that edits its deliverable and never submits. `herdr-projects result
+/// DEMO submit-captured ATTEMPT` captures the worktree, builds the submission
+/// from the capture (frozen contract revision and digest, base and candidate,
+/// the declared output's blob) and records it; with verification and
+/// integration automatic the ticker then verifies and integrates it, and
+/// repeating the command replays.
+const EDITING_AGENT: &str = r#"
+use std::{fs, time::Duration};
+fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--version") { println!("2.1.0 (Claude Code)"); return }
+    fs::write("work.txt", "worker change\n").unwrap();
+    loop { std::thread::sleep(Duration::from_secs(1)) }
+}
+"#;
+
+#[test]
+fn an_operator_finishes_a_worker_that_never_submitted_and_the_result_lands_automatically() {
+    let mut lab = Lab::new("unknown_usage='allow_with_warning'\n");
+    lab.write_agent(EDITING_AGENT, &[]);
+    let (contract, base) = lab.install_work_contract("verify_then_integrate");
+    let (_, attempt) = lab.reserve("Retained instructions");
+    let worktree = lab.planned_worktree(&attempt);
+    let repository = lab.repo.canonicalize().unwrap().display().to_string();
+    lab.ok(&["result", "demo", "configure-integration", "--repository", &repository, "--reference", "refs/heads/integration"]);
+    lab.ok(&["result", "demo", "auto", "--verify", "on", "--integrate", "on", "--expected-head", &lab.head().to_string()]);
+    lab.serve();
+    let mut ticker = lab.spawn();
+    lab.wait(&mut ticker, 120, &|| fs::read_to_string(worktree.join("work.txt")).is_ok_and(|t| t == "worker change\n"));
+    assert_eq!(lab.ok(&["result", "demo", "show"]), json!([]), "the worker never submitted");
+
+    let done = lab.ok_live(&|| ["result", "demo", "submit-captured", attempt.as_str()].map(String::from).to_vec());
+    let candidate = done["capture"]["candidate_oid"].as_str().unwrap().to_owned();
+    assert_eq!((done["capture"]["base_oid"].as_str(), done["contract_revision"].as_u64(), done["contract_digest"].as_str(), done["submission"]["replayed"].as_bool()),
+        (Some(base.as_str()), Some(1), Some(contract.as_str()), Some(false)), "{done}");
+    let blob = lab.git(&["rev-parse", &format!("{candidate}:work.txt")]);
+    assert_eq!(done["artifacts"], json!([["work.txt", blob]]), "{done}");
+    let shown = lab.ok(&["result", "demo", "show"]);
+    assert_eq!(shown.as_array().map(|a| (a.len(), a[0]["candidate_oid"].clone(), a[0]["attempt_id"].clone(), a[0]["artifact_manifest"].clone())),
+        Some((1, json!(candidate), json!(attempt.as_str()), json!([{"path": "work.txt", "oid": blob}]))), "{shown}");
+    // Repeating the command changes nothing.
+    let again = lab.ok_live(&|| ["result", "demo", "submit-captured", attempt.as_str()].map(String::from).to_vec());
+    assert_eq!((again["submission"]["replayed"].as_bool(), again["capture"]["captured"].as_bool(), again["submission"]["submission_id"].clone()), (Some(true), Some(false), done["submission"]["submission_id"].clone()), "{again}");
+    assert_eq!(lab.ok(&["result", "demo", "show"]).as_array().unwrap().len(), 1);
+    // Automatic verification and integration take it from here.
+    lab.wait(&mut ticker, 120, &|| lab.git_ok(&["rev-parse", "--verify", "-q", "integration^2"]));
+    lab.stop(ticker);
+    assert_eq!(lab.git(&["rev-parse", "integration^2"]), candidate);
+    assert_eq!(lab.git(&["cat-file", "-p", &format!("{candidate}:work.txt")]), "worker change");
+}
+
 #[test]
 fn ticker_recovers_a_lost_creation_reply_without_creating_again() {
     let mut lab = Lab::new("unknown_usage='allow_with_warning'");

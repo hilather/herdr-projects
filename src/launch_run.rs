@@ -121,6 +121,37 @@ fn planning_contract(args: &Args, repository: &Path, head: u64, kind: &str, proj
     Ok(bytes)
 }
 
+/// The closing section of the brief: commit the declared outputs and submit
+/// the result through the worker's submission spool, with every value the
+/// contract fixes already filled in. Without it nothing ever enters
+/// verification or integration.
+fn finish_instructions(root: &Path, slug: &str, contract: &Value, reference: &VersionedReference) -> Result<String> {
+    let text = |key: &str| contract[key].as_str().with_context(|| format!("contract field {key} missing"));
+    let outputs: Vec<&str> = contract["outputs"].as_array().context("contract outputs missing")?.iter().filter_map(|o| o["path"].as_str()).collect();
+    ensure!(!outputs.is_empty() && outputs.len() <= 8, "a launched task declares between one and eight outputs");
+    let safe = |value: &str| !value.is_empty() && !value.contains(['$', '`', '\\', '\'', '"', '\n']);
+    let (task, repository, base, format) = (text("task_id")?, text("repository")?, text("base_oid")?, text("object_format")?);
+    ensure!([task, repository, base, format, reference.digest.as_str()].iter().all(|v| safe(v)) && safe(&root.display().to_string()) && outputs.iter().all(|o| safe(o)),
+        "a path or value in the task contract contains a character the submission script cannot carry");
+    let loose = format!("{}/{}", &base[..2], &base[2..]);
+    let mut script = String::from("set -eu\nattempt=$(basename \"$HERDR_PROJECTS_SUBMISSION_SPOOL\")\n");
+    script.push_str(&format!("git add --{}\n", outputs.iter().map(|o| format!(" '{o}'")).collect::<String>()));
+    script.push_str("git -c user.name=worker -c user.email=worker@invalid commit -q -m 'Deliverable' || true\n");
+    script.push_str(&format!("candidate=$(git rev-parse HEAD)\n[ \"$candidate\" != '{base}' ] || {{ echo 'nothing is committed: write the deliverable first' >&2; exit 1; }}\n"));
+    let mut manifest = Vec::new();
+    for (index, output) in outputs.iter().enumerate() {
+        script.push_str(&format!("blob{index}=$(git rev-parse \"HEAD:{output}\")\n"));
+        manifest.push(format!(r#"{{"path":"{output}","oid":"$blob{index}"}}"#));
+    }
+    script.push_str("key=result-$(printf %s \"$attempt\" | cut -c1-100)\ndocument=$(mktemp)\ncat > \"$document\" <<EOF\n");
+    script.push_str(&format!(
+        r#"{{"idempotency_key":"$key","task_id":"{task}","contract_revision":{},"contract_digest":"{}","attempt_id":"$attempt","repository":"{repository}","base_oid":"{base}","candidate_oid":"$candidate","object_format":"{format}","artifact_manifest":[{}],"claimed_checks":[],"objects":[{{"oid":"{base}","relative_path":"{loose}"}},{{"oid":"$candidate","relative_path":"$(printf %s "$candidate" | cut -c1-2)/$(printf %s "$candidate" | cut -c3-)"}}]}}"#,
+        reference.revision, reference.digest, manifest.join(",")));
+    script.push_str(&format!("\nEOF\nherdr-projects --root '{}' result {slug} submit --input-file \"$document\"\n", root.display()));
+    Ok(format!(
+        "\n## When the deliverable is complete: submit it\n\nA result that is not submitted is never verified or integrated. Run exactly this script in the current directory. It commits the declared output(s) on your attempt branch and submits the result through your submission spool (the product's own command; it needs no network and is safe to run again). It must print a submission receipt containing `submission_id`; if it fails, fix what it reports and run it again. Only then stop and reply DONE.\n\n```sh\n{script}```\n"))
+}
+
 /// Record current observations and make the project active, unless it already
 /// is, needs no reconciliation and acknowledges the owner configuration as it is
 /// now (or `force` after a new binding). A configuration edited since control
@@ -334,8 +365,11 @@ fn steps(run: &mut Run, args: &Args) -> Result<Value> {
     }
     if let Some(output) = &args.plan_output {
         instructions.push_str(&format!(
-            "\n## Deliverable\n\nWrite the document `{output}` in the current directory (a disposable git worktree), with the plan as its content. Do not commit, do not change any other file, do not push and do not use the network. When the document is complete, stop and reply DONE.\n"));
+            "\n## Deliverable\n\nWrite the document `{output}` in the current directory (a disposable git worktree), with the plan as its content. Do not change any other file, do not push and do not use the network.\n"));
     }
+    let contract: Value = serde_json::from_slice(&fs::read(dir.join("contract.json")).context("the installed contract document is missing from the run directory")?)?;
+    let reference = runtime::task_contract(&project, &task_id)?.context("the task has no installed contract")?;
+    instructions.push_str(&finish_instructions(&ctx.root, run.slug.as_str(), &contract, &reference)?);
     let knowledge = {
         let _guard = herdr_projects::memory::mutation_guard(&project)?;
         let resolved = crate::agents::resolve::resolve(&args.profile, &ctx.config_dir.join("config.toml"), None)?;
@@ -381,7 +415,8 @@ fn report(run: &Run, task: &str, profile: &VersionedReference, kind: &str, herdr
         "steps":run.steps.iter().map(|s| json!({"step":s.name,"outcome":s.outcome,"detail":s.detail})).collect::<Vec<_>>(),
         "next":[
             format!("The ticker launches the worker; run it with HERDR_BIN_PATH={} so it uses the verified Herdr.", herdr.display()),
-            format!("Watch it with `scheduler {} inspect` and `operations {} inspect`; the worker's edits are captured with `result {} capture <attempt>`.", run.slug, run.slug, run.slug)
+            format!("Watch it with `scheduler {} inspect` and `operations {} inspect`. The worker's brief ends with the submission it must make; if it finishes without submitting, `result {} submit-captured <attempt>` captures its worktree and records the submission, and automatic verification and integration take it from there.", run.slug, run.slug, run.slug),
+            format!("When the task is finished the ticker stops its dedicated Herdr server; `launch {} stop --task {task}` does it explicitly.", run.slug)
         ]
     })
 }
