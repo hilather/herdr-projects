@@ -24,10 +24,11 @@ fn private_dir(path: &Path) -> bool {
 }
 
 fn base() -> Result<PathBuf> {
-    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
-        if runtime.is_absolute() && private_dir(&runtime) {
-            return Ok(runtime);
-        }
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)
+        && runtime.is_absolute()
+        && private_dir(&runtime)
+    {
+        return Ok(runtime);
     }
     let base = PathBuf::from(format!("/tmp/hp-sock-{}", unsafe { libc::geteuid() }));
     match fs::DirBuilder::new().mode(0o700).create(&base) {
