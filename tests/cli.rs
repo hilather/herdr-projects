@@ -3002,7 +3002,7 @@ fn controller_captures_uncommitted_worker_edits_for_submission_and_verification(
     assert_eq!((first["captured"].as_bool(),first["base_oid"].as_str(),first["branch"].as_str()),(Some(true),Some(start.as_str()),Some(branch.as_str())));
     assert_eq!(f.git(&["rev-parse",&branch]),candidate);assert_eq!(f.git(&["rev-parse",&format!("{candidate}^")]),start);
     assert_eq!(f.git(&["log","-1","--format=%an <%ae>|%cn <%ce>|%s",&candidate]),
-        format!("herdr-farm <capture@herdr-projects.invalid>|herdr-farm <capture@herdr-projects.invalid>|Capture attempt {attempt}"));
+        format!("herdr-projects <capture@herdr-projects.invalid>|herdr-projects <capture@herdr-projects.invalid>|Capture attempt {attempt}"));
     assert_eq!(f.git(&["diff-tree","-r","--name-only","--no-commit-id",&start,&candidate]),"src/.gitignore\nsrc/a.txt","ignored files stay out");
     assert_eq!(wt(&["status","--porcelain"]),"","the worktree index matches the capture");
     let again=ok(capture(&attempt));
@@ -5465,7 +5465,7 @@ fn fleet_action_opens_the_fleet_pane() {
     let call:Vec<&str>=call.lines().collect();
     assert_eq!(call[..7],["plugin","pane","open","--plugin","herdr-farm","--entrypoint","fleet"]);
     let envs:Vec<(&str,&str)>=call.windows(2).filter(|pair|pair[0]=="--env").map(|pair|pair[1].split_once('=').unwrap()).collect();
-    assert_eq!(envs.iter().map(|(name,_)|*name).collect::<Vec<_>>(),["HERDR_FARM_HANDOFF","HERDR_PROJECTS_ROOT"]);
+    assert_eq!(envs.iter().map(|(name,_)|*name).collect::<Vec<_>>(),["HERDR_FARM_HANDOFF","HERDR_FARM_ROOT"]);
     assert_eq!(envs[1].1,r);
     let out=Command::new(BIN).env_clear().env("HOME",home.path()).env("PATH","/usr/bin:/bin").env("HERDR_PLUGIN_STATE_DIR",&state)
         .env("HERDR_SOCKET_PATH",home.path().join("herdr.sock")).envs(envs.iter().copied()).args(command("panes")).stdin(std::process::Stdio::null()).output().unwrap();
