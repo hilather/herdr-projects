@@ -129,24 +129,30 @@ fn record(db: &Connection, version: u32, attempt: &str, task: &str, state: &str,
         _ if predates => status("unavailable", "predates_lifecycle_log"),
         _ => status("censored", if terminal { state } else { "open" }),
     };
-    let submission = db.prepare_cached("SELECT submission_id,candidate_oid,created_unix_ms,contract_revision FROM result_submissions WHERE attempt_id=?1 ORDER BY created_unix_ms,rowid LIMIT 1")?
+    let submission = db.prepare_cached("SELECT s.submission_id,s.candidate_oid,s.created_unix_ms,s.contract_revision FROM result_submissions s WHERE s.attempt_id=?1
+        ORDER BY EXISTS(SELECT 1 FROM task_contracts t JOIN verified_results r ON r.submission_id=s.submission_id
+            WHERE t.task_id=s.task_id AND t.contract_revision=s.contract_revision
+            AND t.contract_revision=(SELECT max(contract_revision) FROM task_contracts WHERE task_id=s.task_id)
+            AND (t.route='verify_only' OR EXISTS(SELECT 1 FROM integration_operations i JOIN integrated_commits c ON c.operation_id=i.operation_id WHERE i.verified_result_id=r.result_id))) DESC,
+            s.created_unix_ms DESC,s.rowid DESC LIMIT 1")?
         .query_row([attempt], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))).optional()?;
+    let submissions: i64 = db.query_row("SELECT count(*) FROM result_submissions WHERE attempt_id=?1", [attempt], |r| r.get(0))?;
     let revision = submission.as_ref().map(|s| s.3).or(decided_revision);
     let route: Option<String> = db.prepare_cached("SELECT route FROM task_contracts WHERE task_id=?1 AND contract_revision=?2")?.query_row(rusqlite::params![task, revision], |r| r.get(0)).optional()?;
     let integrates = route.as_deref() == Some("verify_then_integrate");
     let (result, verification, integration) = match &submission {
-        None => (json!({"state": "not_submitted"}), json!({"state": "not_submitted"}), json!({"state": if integrates { "not_submitted" } else { "not_applicable" }})),
+        None => (json!({"state": "not_submitted", "submissions": submissions}), json!({"state": "not_submitted"}), json!({"state": if integrates { "not_submitted" } else { "not_applicable" }})),
         Some((id, candidate, created, _)) => {
             let verification = verification(db, id, home)?;
             let integration = if !integrates { json!({"state": "not_applicable"}) } else {
                 db.prepare_cached("SELECT i.state,EXISTS(SELECT 1 FROM integrated_commits c WHERE c.operation_id=i.operation_id) FROM integration_operations i
-                    JOIN verified_results r ON r.result_id=i.verified_result_id WHERE r.submission_id=?1 ORDER BY i.created_unix_ms DESC,i.generation DESC LIMIT 1")?
+                    JOIN verified_results r ON r.result_id=i.verified_result_id WHERE r.submission_id=?1 ORDER BY EXISTS(SELECT 1 FROM integrated_commits c WHERE c.operation_id=i.operation_id) DESC,i.created_unix_ms DESC,i.generation DESC LIMIT 1")?
                         .query_row([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?))).optional()?
                     .map(|(state, committed)| json!({"state": if committed { "integrated" } else if state == "integrated" { "integrated_unconfirmed" } else { &state }}))
                     // Without an operation a rejected submission is not eligible (every policy needs an accepted run).
                     .unwrap_or_else(|| if verification["state"] == "rejected" { json!({"reason": "verification_rejected", "state": "not_applicable"}) } else { json!({"state": "pending"}) })
             };
-            (json!({"candidate_oid": candidate, "created_unix_ms": created, "state": "submitted", "submission_id": id}), verification, integration)
+            (json!({"candidate_oid": candidate, "created_unix_ms": created, "state": "submitted", "submission_id": id, "submissions": submissions}), verification, integration)
         }
     };
     // Contracts §6 `A`: evidence from any of this attempt's submissions for the current contract revision.
@@ -171,7 +177,8 @@ fn record(db: &Connection, version: u32, attempt: &str, task: &str, state: &str,
 /// Contracts §4 `verification` for one submission, combined over its
 /// acceptance policies (and any other policy that has a run): each policy's
 /// latest run decides it, `rejected` if any policy's does, `accepted` only
-/// when every policy's does, else `pending`. `policies` gives each one.
+/// when every policy's does, else `error` for a permanently failed job without a run, otherwise
+/// `pending`. `policies` gives each one.
 fn verification(db: &Connection, submission: &str, home: Option<&str>) -> rusqlite::Result<Value> {
     let runs = db.prepare_cached("SELECT p.policy_id,(SELECT state FROM verification_runs v WHERE v.submission_id=?1 AND v.policy_id=p.policy_id ORDER BY created_unix_ms DESC,rowid DESC LIMIT 1),
         (SELECT reason FROM verification_runs v WHERE v.submission_id=?1 AND v.policy_id=p.policy_id ORDER BY created_unix_ms DESC,rowid DESC LIMIT 1)
@@ -179,15 +186,28 @@ fn verification(db: &Connection, submission: &str, home: Option<&str>) -> rusqli
             UNION SELECT policy_id FROM verification_runs WHERE submission_id=?1) p ORDER BY p.policy_id")?
         .query_map([submission], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Option<String>>(2)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let policies: Vec<Value> = runs.iter().map(|(policy, state, reason)| {
-        let mut entry = json!({"policy_id": policy, "state": state.as_deref().unwrap_or("pending")});
+    let mut policies = Vec::new();
+    for (policy, state, reason) in &runs {
+        let failure: Option<Option<String>> = if state.is_none() {
+            db.prepare_cached("SELECT json_extract(d.last_outcome,'$.diagnostic') FROM operations o JOIN operation_delivery d ON d.operation_id=o.id
+                WHERE o.kind='verification.run' AND json_extract(o.payload,'$.submission_id')=?1
+                AND json_extract(o.payload,'$.policy_id')=?2 AND d.state='permanent_failure'
+                AND NOT EXISTS(SELECT 1 FROM operations newer WHERE newer.kind=o.kind
+                    AND json_extract(newer.payload,'$.submission_id')=?1 AND json_extract(newer.payload,'$.policy_id')=?2
+                    AND newer.expected_revision>o.expected_revision)
+                ORDER BY o.expected_revision DESC,o.rowid DESC LIMIT 1")?
+                .query_row([submission, policy], |r| r.get(0)).optional()?
+        } else { None };
+        let reason = reason.as_ref().or_else(|| failure.as_ref().and_then(Option::as_ref));
+        let mut entry = json!({"policy_id": policy, "state": state.as_deref().unwrap_or(if failure.is_some() { "error" } else { "pending" })});
         if let Some(reason) = reason { entry["reason"] = json!(crate::domain::excerpt(reason, home)); }
-        entry
-    }).collect();
+        policies.push(entry);
+    }
     let rejected = policies.iter().find(|p| p["state"] == "rejected");
+    let error = policies.iter().find(|p| p["state"] == "error");
     let accepted = !policies.is_empty() && policies.iter().all(|p| p["state"] == "accepted");
-    let mut combined = json!({"state": if rejected.is_some() { "rejected" } else if accepted { "accepted" } else { "pending" }});
-    if let Some(reason) = rejected.and_then(|p| p.get("reason")) { combined["reason"] = reason.clone(); }
+    let mut combined = json!({"state": if rejected.is_some() { "rejected" } else if error.is_some() { "error" } else if accepted { "accepted" } else { "pending" }});
+    if let Some(reason) = rejected.or(error).and_then(|p| p.get("reason")) { combined["reason"] = reason.clone(); }
     if !policies.is_empty() { combined["policies"] = json!(policies); }
     Ok(combined)
 }
@@ -207,7 +227,7 @@ pub fn text(report: &Value) -> String {
         format!("waits={} waiting_ms={} censored={} gaps={}", v["interventions"], v["waiting_ms"], v["censored_intervals"],
             v["gaps"].as_object().map_or(0, |g| g.values().filter_map(Value::as_i64).sum::<i64>()))
     } else { show(v) };
-    report["attempts"].as_array().into_iter().flatten().map(|a| format!("{} task={} state={} wall_ms={} result={} verification={} integration={} accepted={} attention={} usage={}\n",
+    report["attempts"].as_array().into_iter().flatten().map(|a| format!("{} task={} state={} wall_ms={} result={} submissions={} submission={} verification={} integration={} accepted={} attention={} usage={}\n",
         a["attempt_id"].as_str().unwrap_or(""), a["task_id"].as_str().unwrap_or(""), a["terminal_state"].as_str().unwrap_or(""), show(&a["active_ms"]),
-        show(&a["result"]), show(&a["verification"]), show(&a["integration"]), a["accepted"], attention(&a["attention"]), show(&a["usage"]))).collect()
+        show(&a["result"]), a["result"]["submissions"], a["result"]["submission_id"].as_str().unwrap_or("none"), show(&a["verification"]), show(&a["integration"]), a["accepted"], attention(&a["attention"]), show(&a["usage"]))).collect()
 }

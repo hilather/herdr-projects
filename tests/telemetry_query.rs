@@ -903,3 +903,62 @@ fn ticker_telemetry_disabled_and_untouched_projects_have_no_writes() {
         }
     }
 }
+
+#[test]
+fn attempt_outcome_selects_acceptance_and_reports_verifier_failure() {
+    let p = Planted::new();
+    let db = p.db();
+    for task in ["multiple", "single"] {
+        let attempt = format!("{task}-a1");
+        plant(&db, task, "running", Some("verify_then_integrate"), &[(&attempt, "completed", &[("reserved", 900)])], None, None);
+        let inputs = json!({"inputs":{"version":2,"effective_profile":{"kind":"fixture"}}}).to_string();
+        db.execute("INSERT INTO attempt_inputs(attempt_id,operation_id,payload,payload_hash) VALUES(?1,?1,?2,?3)", rusqlite::params![attempt, inputs, hex(&inputs)]).unwrap();
+        db.execute("INSERT INTO acceptance_policies VALUES(?1,1,'ci','ci')", [task]).unwrap();
+        first_candidate_submission(&db, task, &attempt, "first", 1000);
+        let submission = hex(&format!("{task}-first"));
+        db.execute("INSERT INTO operations(id,task_id,kind,target,payload_version,payload,payload_hash,expected_revision,due_unix_ms,idempotency_key)
+            VALUES(?1,?2,'verification.run','local',1,?3,?4,1,1000,?1)", rusqlite::params![task, task, json!({"submission_id":submission,"policy_id":"ci"}).to_string(), hex(task)]).unwrap();
+        db.execute("UPDATE operation_delivery SET state='permanent_failure',epoch=1,attempts=1,next_due_ms=1000,last_outcome=?2 WHERE operation_id=?1", rusqlite::params![task, json!({"diagnostic":format!("verifier stopped: git checkout failed {}/secret",p.tmp.path().join("home").display())}).to_string()]).unwrap();
+    }
+    drop(db);
+    let failed = p.json(&["attempts", "--json"]);
+    let single = failed["attempts"].as_array().unwrap().iter().find(|a| a["task_id"] == "single").unwrap();
+    assert_eq!(single["verification"]["state"], "error");
+    assert_eq!(single["verification"]["policies"][0]["state"], "error");
+    assert!(single["verification"]["reason"].as_str().unwrap().contains("git checkout failed"));
+    assert!(!single["verification"]["reason"].as_str().unwrap().contains(p.tmp.path().to_str().unwrap()));
+    assert_eq!(single["accepted"], false);
+    assert_eq!(single["result"]["submissions"], 1);
+    let db = p.db();
+    first_candidate_submission(&db, "multiple", "multiple-a1", "second", 2000);
+    candidate_verdict(&db, "multiple", "second", "ci", true, 2100);
+    let result = hex("multiple-second-ci");
+    db.execute("INSERT INTO integration_operations(operation_id,project_store,idempotency_key,payload_digest,repository,ref_name,expected_old_oid,verified_result_id,state,generation,object_format,checks_passed,created_unix_ms)
+        VALUES('op-multiple','store','op-multiple',?1,'/repo','refs/heads/main',?2,?3,'integrated',1,'sha1',1,2200)", rusqlite::params![hex("integration"), OID, result]).unwrap();
+    integrate(&db, "multiple", 2300);
+    drop(db);
+    let two = p.json(&["attempts", "--json"]);
+    let multiple = two["attempts"].as_array().unwrap().iter().find(|a| a["task_id"] == "multiple").unwrap();
+    assert_eq!(multiple["result"]["submissions"], 2);
+    assert_eq!(multiple["verification"]["state"], "accepted");
+    assert_eq!(multiple["integration"]["state"], "integrated");
+    assert_eq!(multiple["accepted"], true);
+    let db = p.db();
+    // A newer unverified submission must not hide the accepted one.
+    first_candidate_submission(&db, "multiple", "multiple-a1", "third", 3000);
+    drop(db);
+    let accepted = p.json(&["attempts", "--json"]);
+    let multiple = accepted["attempts"].as_array().unwrap().iter().find(|a| a["task_id"] == "multiple").unwrap();
+    assert_eq!(multiple["verification"]["state"], "accepted");
+    assert_eq!(multiple["integration"]["state"], "integrated");
+    assert_eq!(multiple["accepted"], true);
+    assert_eq!(multiple["result"]["submissions"], 3);
+    assert_eq!(multiple["result"]["submission_id"], hex("multiple-second"));
+    let db = p.db();
+    candidate_verdict(&db, "single", "first", "ci", true, 4000);
+    drop(db);
+    let retried = p.json(&["attempts", "--json"]);
+    let single = retried["attempts"].as_array().unwrap().iter().find(|a| a["task_id"] == "single").unwrap();
+    assert_eq!(single["verification"]["state"], "accepted");
+    assert!(single["verification"].get("reason").is_none());
+}

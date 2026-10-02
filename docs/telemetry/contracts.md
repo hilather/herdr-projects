@@ -280,9 +280,9 @@ reads `unavailable: predates_lifecycle_log`.
 | `terminal_state` | terminal mark, else `open` |
 | `active_ms` | `terminal − running` wall time, idle time at the prompt included (not an activity signal; attention is S4); open → `censored`; no running mark → `unavailable`. The text form labels it `wall_ms` |
 | `queue_to_launch_ms` | `launching − reserved` |
-| `result` | earliest `result_submissions` for the attempt: `submission_id`, `candidate_oid`, `created_unix_ms`; none → `not_submitted` |
-| `verification` | per acceptance policy of that submission, its latest `verification_runs` row: `rejected` (+ `reason` excerpt) if any policy's is, `accepted` only if every policy's is, else `pending`; `policies` lists each |
-| `integration` | route `verify_only` → `not_applicable`; else latest `integration_operations` state via `verified_results`; `integrated` needs an `integrated_commits` row |
+| `result` | latest submission meeting §6 `A` for the current contract (including confirmed integration when required), otherwise latest submission; ties use insertion order. `submission_id`, `candidate_oid`, `created_unix_ms` identify the chosen submission; `submissions` counts all submissions (0 when `not_submitted`) |
+| `verification` | per acceptance policy of that submission, its latest `verification_runs` row: `rejected` (+ `reason` excerpt) if any policy's is, `accepted` only if every policy's is, else `error` (+ diagnostic excerpt) for a permanently failed verification job without a run, otherwise `pending`; `policies` lists each |
+| `integration` | route `verify_only` → `not_applicable`; else confirmed integration preferred, otherwise latest `integration_operations` state via `verified_results`; `integrated` needs an `integrated_commits` row |
 | `accepted` | `true` iff the task's acceptance rule (§6 `A`) is met by evidence produced from this attempt |
 | `usage` | §5 sums if a certified bound rollout exists, else `unavailable` with reason `adapter_absent` (non-Codex kind), `not_bound`, `cli_version_uncertified`, `quarantined`, `records_not_accepted`, `collection_not_run` |
 | `attention` | B6b's per-attempt summary (contracts-accounting.md §6) once any attention sample exists; before that `unavailable`, reason `attention_not_collected` |
@@ -305,19 +305,21 @@ S3 refinements:
   not_running`. `queue_to_launch_ms` without a launch mark → `censored` with
   reason `open` or the terminal state (e.g. `cancelled`).
 - Shapes: `result` `{state: submitted|not_submitted, submission_id,
-  candidate_oid, created_unix_ms}`; `verification` `{state:
-  accepted|rejected|pending|not_submitted, reason?, policies?}` for the
-  earliest submission, combined over its contract's acceptance policies and
+  candidate_oid, created_unix_ms, submissions}`; `verification` `{state:
+  accepted|rejected|error|pending|not_submitted, reason?, policies?}` for the
+  chosen submission (text lines add `submissions=N submission=ID`), combined over its contract's acceptance policies and
   any other policy with a run: each policy is decided by its latest run
-  (`{policy_id, state, reason?}`, `pending` without a run); the submission is
+  (`{policy_id, state, reason?}`, `error` for a permanently failed current job without a run, otherwise `pending`); the submission is
   `rejected` if any policy is (reason of the first by `policy_id`),
-  `accepted` only if every policy is, else `pending`; reasons are excerpted
+  `error` if any remaining policy has a permanently failed job without a verdict,
+  `accepted` only if every policy is, else `pending`. A later retry verdict wins
+  over job failure; reset jobs return to pending. Reasons are excerpted
   with the reader's `HOME`;
   `integration` `{state}` from the same submission: `not_applicable` unless the
   route is `verify_then_integrate`, then `not_submitted`, `pending` (no
   operation), `not_applicable` with reason `verification_rejected` (no
   operation and the verification is rejected, so the submission is not
-  eligible), the latest operation state, `integrated` (with an
+  eligible), confirmed integration preferred, otherwise the latest operation state, `integrated` (with an
   `integrated_commits` row) or `integrated_unconfirmed` (state without a
   commit row); `classification` `{classification_id, class, band}`. A missing
   decision makes `configuration_id` and `classification` `unavailable:
