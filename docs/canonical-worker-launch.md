@@ -828,11 +828,58 @@ result submission (`result submit` through the attempt's submission spool, then
 `result capture`) are the agent-agnostic native paths; only the kind string,
 version format (`2.1.0 (Claude Code)`) and the home configuration differ.
 
-The worker authenticates through the owner's single login file, bound
-read-write into the isolated home (`~/.codex/auth.json`,
-`~/.claude/.credentials.json`; see [profiles.md](profiles.md#shared-login)). No
-credential is copied and the rest of the owner's agent directories stays hidden;
-`tests/worker_login_share.rs` proves both through the real sandbox.
+The Codex worker authenticates through the owner's single `~/.codex/auth.json`, bound
+read-write into the isolated home (Codex rewrites it in place, so the bound inode stays
+current; see [profiles.md](profiles.md#shared-login)). A Claude worker does **not** bind
+`~/.claude/.credentials.json`: Claude Code renames a new file over its credentials, which
+left the worker's mount with an expired inode ("Login expired" minutes after a passing
+verification). Its login is a long-lived setup token read from the file named by
+`[worker_isolation.login] claude_token_file` in the pinned owner configuration and passed
+as `CLAUDE_CODE_OAUTH_TOKEN` in the agent's environment only (via a descriptor opened
+before anything is hidden, never an argument, file or report). A Claude profile without
+one is refused by `profile verify-interaction` and `launch run`. No credential is copied
+and the rest of the owner's agent directories stays hidden;
+`tests/worker_login_share.rs` proves all of it through the real sandbox.
+
+### From "launched" to "landed" (W-COORD-1e)
+
+The first real canonical trial (`tactics-dev`, a Codex and a Claude worker) exposed seven
+gaps between a launched worker and a landed result; each is fixed and has an end-to-end
+test.
+
+1. **Claude login**: setup-token file instead of a bound credentials file (above).
+2. **Codex login**: it persists `auth.json` in place (truncate-and-write), so the bind
+   stays valid; an owner refresh is visible to a running worker
+   (`tests/worker_login_share.rs`).
+3. **Brief delivery is confirmed only when accepted.** After `agent.prompt` the
+   controller watches the agent for up to 6 s: its status leaving idle (working, or
+   blocked on a dialog of its own) or Herdr's visible-screen detector seeing it working.
+   Still idle (a startup banner swallowed the text), it re-sends the same brief, up to
+   three deliveries inside the 30 s claim lease, and then leaves the delivery
+   **ambiguous** (never confirmed, attempt not running) with an operator message; the
+   operator inspects the pane and retires the brief or stops the attempt.
+4. **Result submission.** The brief ends with an exact shell script (values from the
+   installed contract filled in) that commits the declared outputs on the attempt branch
+   and runs `herdr-projects --root ROOT result PROJECT submit --input-file DOC` through
+   the attempt's spool; the worker must see `submission_id` before replying DONE. For a
+   worker that finishes without submitting, `herdr-projects result PROJECT submit-captured
+   ATTEMPT` captures its worktree, builds the submission from the capture (frozen contract
+   revision and digest, base and candidate OIDs, artifact manifest = the blob of every
+   declared output at the candidate; objects staged from the repository) and records it
+   under a key bound to the candidate, so repeating it replays. With
+   `--integration-ref` automatic verification and integration then proceed.
+5. **`launch run` re-acknowledges an edited owner configuration.** The `project_control`
+   step compares the digest control acknowledges with the current configuration and, when
+   they differ, reconciles and sets the project active again with the expected revision
+   and head (reported as `done` with `owner_configuration_reacknowledged: true`).
+6. **Permission mode**: preparation sets the profile's mode and the other keys it owns on
+   every launch ([profiles.md](profiles.md#permission-mode-and-the-other-keys-the-product-owns)).
+7. **Dedicated servers are stopped.** `launch run` records the Herdr server it starts
+   (`.herdr-run/PROJECT-TASK/herdr/server.json`). The ticker stops it, only after proving
+   the recorded process is still that server (a `herdr server` process whose environment
+   names the recorded socket), once the task has no unfinished attempt, and removes its
+   socket directory; `herdr-projects launch PROJECT stop --task ID [--force]` does it
+   explicitly (refused while the attempt still holds its worker unless `--force`).
 
 ### One operator command
 

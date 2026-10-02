@@ -8,9 +8,13 @@ that command and only for a path you pass explicitly.
 
 ## 0. Once per machine
 
-* The owner is logged in with the agent CLIs (`codex login`, `claude`). Workers
-  reuse that login (see [Shared login](profiles.md#shared-login)); nothing is
-  copied.
+* The owner is logged in with the agent CLIs (`codex login`). A Codex worker reuses
+  that login (see [Shared login](profiles.md#shared-login)); nothing is copied. A
+  Claude worker uses a long-lived setup token instead: run `claude setup-token`, save
+  the token in a 0600 file outside the project and `~/.claude`, and add
+  `[worker_isolation.login] claude_token_file = "/abs/path"` to the owner
+  configuration **before** preparing and verifying the Claude profile. Without it
+  `verify-interaction` and `launch run` refuse the Claude profile.
 * A pinned owner configuration (`~/.config/herdr-projects/config.toml`) with the
   `[authority]` key and one profile per worker setup, for example:
 
@@ -117,6 +121,32 @@ herdr-projects result PROJECT jobs                 # verification and integratio
 herdr-projects telemetry PROJECT attempts
 ```
 
-The worker writes `docs/plan-*.md` in its worktree and does not commit; the
-controller's `result capture` commits it on the attempt branch, verification runs
-the signed acceptance policy, and integration lands it on the integration branch.
+The worker writes `docs/plan-*.md` in its worktree and finishes by running the
+script at the end of its brief, which commits the deliverable and submits it through
+its spool; verification then runs the signed acceptance policy and integration lands it
+on the integration branch (both automatic with `--integration-ref`). If a worker stops
+without submitting, finish it yourself:
+
+```sh
+herdr-projects result PROJECT submit-captured ATTEMPT   # capture + build + record the submission
+```
+
+(`result capture ATTEMPT` alone only commits the worktree and prints the candidate; it
+is not evidence.) Repeating either command is safe.
+
+If the brief is shown as `ambiguous` in `operations PROJECT inspect`, the agent never
+accepted it after three deliveries (a startup banner or dialog ate the text, or the
+pane is not at its prompt): look at the pane, then retire the brief or stop the attempt
+(`task cancel-attempt`); it is never reported as delivered.
+
+## 4. Clean up
+
+The dedicated Herdr server `launch run` started for a task is stopped by the running
+ticker once the task has no unfinished attempt, and its socket directory under the
+private runtime directory is removed. To do it yourself (for example after a failed
+run): `herdr-projects launch PROJECT stop --task ID` (add `--force` while the attempt
+still holds a worker). Servers you started (`--herdr-socket`) are never touched.
+
+Rerunning `launch run` after editing the owner configuration re-acknowledges it
+(`project_control` is reported as `done`); profiles must be prepared and verified
+against the edited bytes first, as their evidence is pinned to the configuration digest.

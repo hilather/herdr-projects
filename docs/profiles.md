@@ -241,17 +241,51 @@ reports what will be written.
 
 ## Shared login
 
-A worker authenticates as the owner's already-logged-in CLI: the sandbox binds the
-owner's single login file (`~/.codex/auth.json` for Codex,
-`~/.claude/.credentials.json` for Claude Code) read-write onto the same place in
-the isolated execution home before the owner's agent directory is hidden. It is
-the same file, never a copy, so a token refresh by the worker or the owner's own
-session is seen by both (the file is replaced in place; an agent that renames a new
-file over its login gets `EBUSY` on the mount point). Everything else in the owner's
-agent directories (`~/.codex`, `~/.claude`, `~/.claude.json`, `~/.gemini`,
-`~/.grok`, `~/.cursor`, `~/.copilot`, OpenCode and Muse data) stays hidden. If the
-login file does not exist the worker starts without one (its readiness check then
-fails visibly). The execution home keeps only an empty mount point.
+A worker authenticates as the owner, differently per kind.
+
+**Codex** shares the owner's single login file: the sandbox binds
+`~/.codex/auth.json` read-write onto the same place in the isolated execution home
+before the owner's agent directory is hidden. It is the same file, never a copy.
+Codex 0.159.x persists a refreshed login by opening `auth.json` with
+truncate-and-write (the same inode; its binary names no temporary file next to it),
+so a refresh by the worker or by the owner's own session is seen by both, and
+`tests/worker_login_share.rs` proves an in-place owner refresh reaches a running
+worker. (An agent that renamed a new file over its login would get `EBUSY` on the
+mount point and leave a stale inode behind; if a future Codex does that, switch
+Codex to a token file as below.) If the login file does not exist the worker starts
+without one (its readiness check then fails visibly). The execution home keeps only
+an empty mount point.
+
+**Claude Code** does not use a bound credentials file. Claude Code rotates its
+credentials by writing a new file and renaming it over the old one, so a bind of
+`~/.claude/.credentials.json` goes stale as soon as either side refreshes (observed:
+verification passed, then minutes later "Login expired · Please run /login"). A Claude
+worker instead authenticates with a long-lived **setup token**: create it once with
+`claude setup-token`, save it in a file only you can read (mode 0600, owned by you,
+one line, outside the project, the projects root and every agent directory such as
+`~/.claude`), and name it in the pinned owner configuration:
+
+```toml
+[worker_isolation.login]
+claude_token_file = "/home/me/.config/herdr-projects/claude-setup-token"
+```
+
+At launch the sandbox opens that file before anything is hidden and hands it to the
+agent as an inherited descriptor; a small wrapper reads and closes it and starts the
+agent with `CLAUDE_CODE_OAUTH_TOKEN` in its environment. The token is therefore in
+the agent's environment only: never in an argument of any process, never written into
+the execution home, never in a launch spec, report or log (the product itself only
+checks the file's owner, mode and shape, and never prints it), and the file itself is
+hidden from the worker. The owner's `~/.claude/.credentials.json` is never shared.
+`profile verify-interaction` and `launch run` refuse a Claude profile whose pinned
+configuration names no usable token file, before any server starts or anything is
+reserved, with a message saying what to configure (a worker without a login could only
+answer "Login expired"). Create the token file *before* `profile prepare` and verify
+the profile afterwards: the file name is part of the digest-pinned configuration.
+
+Everything else in the owner's agent directories (`~/.codex`, `~/.claude`,
+`~/.claude.json`, `~/.gemini`, `~/.grok`, `~/.cursor`, `~/.copilot`, OpenCode and Muse
+data) stays hidden.
 
 Overrides are part of the pinned owner configuration, so they are covered by its
 digest:
@@ -261,18 +295,34 @@ digest:
 share_login = true                       # default; false disables sharing
 [worker_isolation.login]
 codex = "/home/me/tokens/codex-auth.json"   # bind this file instead of ~/.codex/auth.json
+claude_token_file = "/home/me/tokens/claude-setup-token"   # a Claude worker's login
 ```
 
-A copy placed in the execution home by hand still works with `share_login = false`.
+(`claude = "..."` is rejected: there is no bound Claude credentials file any more.) A
+copy placed in the execution home by hand still works with `share_login = false`.
 
-The owner home (where the login is looked up and whose agent directories are
+The owner home (where the Codex login is looked up and whose agent directories are
 hidden) is the account's passwd home plus `HOME`. `HERDR_PROJECTS_OWNER_HOME`
 (absolute) declares a fixture owner home: the login is then looked up only
 there (so no test binds the real owner's login), and its agent directories are
 hidden **in addition to** the real owner home's. It can never remove the real
 home from the hidden set. A login source that does not exist adds nothing.
-An override path must not lie under `/tmp`, `/var/tmp` or `/dev/shm` (private in the
-sandbox). Other launch kinds get the same treatment as they become launchable.
+A Codex override path must not lie under `/tmp`, `/var/tmp` or `/dev/shm` (private in
+the sandbox); the Claude token file is opened first of all and may. Other launch
+kinds get the same treatment as they become launchable.
+
+### Permission mode and the other keys the product owns
+
+Preparation writes the agent's own configuration in the execution home on every launch
+and **sets** the keys it owns, replacing whatever an earlier run (or the agent itself)
+left there: Claude's `permissions.defaultMode = "acceptEdits"`, `DISABLE_AUTOUPDATER`
+and `hasCompletedOnboarding`; Codex's `approval_policy = "never"`, `sandbox_mode =
+"workspace-write"`, `sandbox_workspace_write.network_access = false` and
+`check_for_update_on_startup = false`; the model and effort pins; trust for exactly the
+attempt's directories. (A home whose `settings.json` already said `defaultMode = "auto"`
+used to keep it, because the value was only filled in when absent: the worker ran in
+auto mode.) Unrelated settings are preserved. There is no per-profile mode override
+yet; the profile's intended mode is the one written.
 
 ### Filesystem isolation
 

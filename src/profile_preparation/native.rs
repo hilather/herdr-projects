@@ -339,7 +339,10 @@ pub(super) fn verify(
     ensure!(store_metadata.is_file(), "native probe store must be a regular file");
     let source = (store_path, store_metadata.dev(), store_metadata.ino());
     let profile = &preparation.profile;
-    crate::profile_config::check_worker_login(profile, &project)?;
+    if interaction {
+        // The agent must really answer: a Claude profile needs its setup token.
+        crate::profile_config::check_worker_login(profile, &project)?;
+    }
     let config = crate::migration::read_plan_file(Path::new(&profile.config.path))?;
     ensure!(
         profile.config.digest.as_deref() == Some(digest(&config).as_str()),
