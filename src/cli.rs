@@ -1495,7 +1495,19 @@ pub fn run() -> Result<()> {
                 },
                 TaskCommand::CancelAttempt{attempt,expected_revision,expected_head,reason}=>println!("{}",serde_json::to_string_pretty(&runtime::cancel_attempt(&dir,&herdr_projects::domain::AttemptId::new(attempt).map_err(anyhow::Error::msg)?,expected_revision,expected_head,&reason)?)?),
                 TaskCommand::Complete{id,expected_revision}=>println!("{}",serde_json::to_string_pretty(&runtime::request_completion(&dir,&TaskId::new(id).map_err(anyhow::Error::msg)?,expected_revision)?)?),
-                TaskCommand::List=>println!("{}",serde_json::to_string_pretty(&runtime::snapshot(&dir)?)?),
+                TaskCommand::List=>{
+                    let mut listed=serde_json::to_value(runtime::snapshot(&dir)?)?;
+                    let automation=herdr_projects::migration::open_active(&dir)?.result_automation()?;
+                    listed["result_automation"]=serde_json::to_value(&automation)?;
+                    listed["completion_guidance"]=serde_json::json!(if !automation.verify {
+                        "Automatic completion is off: verify results and run task PROJECT complete TASK --expected-revision R."
+                    } else if !automation.integrate {
+                        "Automatic completion is on for verify_only. For verify_then_integrate, integration automation is off: integrate results and run task PROJECT complete TASK --expected-revision R."
+                    } else {
+                        "Accepted results complete automatically after verification and required integration; capacity releases only after worker termination is proven."
+                    });
+                    println!("{}",serde_json::to_string_pretty(&listed)?);
+                },
                 TaskCommand::Show{id}=>{
                     let id=TaskId::new(id).map_err(anyhow::Error::msg)?;
                     let task=runtime::snapshot(&dir)?.tasks.into_iter().find(|t|t.id==id).context("task not found")?;

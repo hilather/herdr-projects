@@ -14,7 +14,7 @@ pub(crate) struct TerminationWorker {
     pub delivery:crate::operations::Delivery,
     pub events:Vec<Event>,
     pub cancelled:bool,
-    /// An operator completion request: stop the worker without failing its task.
+    /// An operator or automatic completion request: stop the worker without failing its task.
     pub completion:bool,
 }
 impl SqliteStore {
@@ -485,8 +485,17 @@ const ACCEPTED_SUBMISSION: &str = "SELECT s.submission_id FROM result_submission
       AND NOT EXISTS(SELECT 1 FROM acceptance_policies p WHERE p.task_id=s.task_id AND p.contract_revision=s.contract_revision
           AND NOT EXISTS(SELECT 1 FROM verification_runs v JOIN verified_results r ON r.run_id=v.run_id
               JOIN verification_contract_checks k ON k.result_id=r.result_id AND k.version=2
-              WHERE v.submission_id=s.submission_id AND v.policy_id=p.policy_id AND v.state='accepted'))
-    ORDER BY s.created_unix_ms,s.submission_id";
+              WHERE v.submission_id=s.submission_id AND v.policy_id=p.policy_id AND v.state='accepted'))";
+
+// Automation is checked in the same transaction that requests termination.
+const AUTO_SUBMISSION_READY:&str="NOT EXISTS(SELECT 1 FROM acceptance_policies p WHERE p.task_id=s.task_id AND p.contract_revision=s.contract_revision
+    AND (SELECT v.state FROM verification_runs v WHERE v.submission_id=s.submission_id AND v.policy_id=p.policy_id
+         ORDER BY v.created_unix_ms DESC,v.rowid DESC LIMIT 1) IS NOT 'accepted') AND EXISTS(SELECT 1 FROM result_automation_control a WHERE a.verify=1
+    AND EXISTS(SELECT 1 FROM project_control WHERE singleton=1 AND state='active')
+    AND (c.route='verify_only' OR (c.route='verify_then_integrate' AND a.integrate=1
+        AND EXISTS(SELECT 1 FROM verified_results r JOIN integration_operations i ON i.verified_result_id=r.result_id
+            JOIN integrated_commits m ON m.operation_id=i.operation_id
+            WHERE r.submission_id=s.submission_id AND i.state='integrated' AND i.checks_passed=1))))";
 
 impl SqliteStore {
     /// Ask the controller to stop a task's started worker because its result
@@ -496,6 +505,10 @@ impl SqliteStore {
     /// succeeded. Dependents keep relying on verification or integration
     /// evidence, never on this state. A repeat returns the recorded request.
     pub fn request_completion(&mut self,task_id:&TaskId,expected_revision:u64,now:i64)->Result<CompletionChange> {
+        self.request_completion_mode(task_id,expected_revision,now,false)
+    }
+
+    fn request_completion_mode(&mut self,task_id:&TaskId,expected_revision:u64,now:i64,automatic:bool)->Result<CompletionChange> {
         super::delivery::now_check(now)?;
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         check_schema(&tx)?;
@@ -519,13 +532,27 @@ impl SqliteStore {
         }
         let started:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM attempt_inputs i JOIN events e ON e.entity=i.operation_id AND e.kind='runtime.launch_started' WHERE i.attempt_id=?1)",[active.as_str()],|row|row.get(0))?;
         if !started {return Err(StoreError::Invalid("worker has not started; cancel the attempt instead".into()));}
-        let accepted:Vec<String>=tx.prepare(ACCEPTED_SUBMISSION)?.query_map(params![task_id.as_str(),active.as_str()],|row|row.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let accepted:Vec<String>=tx.prepare(&format!("{ACCEPTED_SUBMISSION} ORDER BY s.created_unix_ms,s.submission_id"))?.query_map(params![task_id.as_str(),active.as_str()],|row|row.get(0))?.collect::<rusqlite::Result<_>>()?;
         if accepted.is_empty() {return Err(StoreError::Invalid("completion requires a submission of this attempt with accepted verification for every acceptance policy".into()));}
         // A seeded candidate (contracts-review.md §8) or a held candidate-group
         // submission (contracts-quality.md §3) never completes the task: that
         // would end its remaining arms. The first other accepted one does.
         let mut refusal=None;let mut submission=None;
         for candidate in accepted {
+            if automatic {
+                let enabled:bool=tx.query_row(&format!("SELECT {AUTO_SUBMISSION_READY} FROM result_submissions s
+                    JOIN task_contracts c ON c.task_id=s.task_id AND c.contract_revision=s.contract_revision AND c.raw_digest=s.contract_digest
+                    WHERE s.submission_id=?1"), [&candidate],|row|row.get(0))?;
+                if !enabled {continue;}
+                let mut current=true;
+                let integrations:Vec<String>=tx.prepare("SELECT m.integrated_id FROM verified_results r
+                    JOIN integration_operations i ON i.verified_result_id=r.result_id JOIN integrated_commits m ON m.operation_id=i.operation_id
+                    WHERE r.submission_id=?1 AND i.state='integrated'")?.query_map([&candidate],|row|row.get(0))?.collect::<rusqlite::Result<_>>()?;
+                for integration in integrations {
+                    current &= super::contract_binding::integrated_output_checks_current(&tx,&integration,None)?;
+                }
+                if !current {continue;}
+            }
             let hold=if super::seeded_defects::seeded_submission(&tx,&candidate)? {Some("a seeded candidate never completes its task")} else {super::candidate_groups::completion_hold(&tx,&candidate)?};
             match hold {None=>{submission=Some(candidate);break;} Some(reason)=>{refusal.get_or_insert(reason);}}
         }
@@ -538,4 +565,38 @@ impl SqliteStore {
         tx.commit()?;
         Ok(change)
     }
+}
+
+/// Reuse operator completion under project ownership. Selection is bounded;
+/// each request rechecks automation, result evidence and revision in its write
+/// transaction. Cancellation and already requested completion remain authoritative.
+pub fn service_project_result_completions(project:&Path)->anyhow::Result<bool> {
+    let _guard=crate::migration::runtime_mutation(project)?;
+    let mut db=crate::migration::open_active(project)?;
+    let version:u32=db.connection.query_row("PRAGMA user_version",[],|row|row.get(0))?;
+    if version<45 {return Ok(false);}
+    let mut accepted=ACCEPTED_SUBMISSION.replace("?1","t.id").replace("?2","a.id");
+    accepted.push_str(&format!(" AND {AUTO_SUBMISSION_READY}"));
+    if super::seeded_defects::registry_present(&db.connection)? {
+        accepted.push_str(" AND NOT EXISTS(SELECT 1 FROM seeded_candidates x WHERE x.submission_id=s.submission_id AND x.arm='seeded')");
+    }
+    if super::candidate_groups::groups_present(&db.connection)? {
+        accepted.push_str(&format!(" AND NOT {} AND NOT EXISTS(SELECT 1 FROM candidate_groups g WHERE g.task_id=s.task_id AND g.contract_revision=s.contract_revision
+            AND NOT EXISTS(SELECT 1 FROM candidate_selections x WHERE x.group_id=g.group_id AND x.outcome='selected' AND x.submission_id=s.submission_id))",super::candidate_groups::HELD_ARM));
+    }
+    let tasks:Vec<(String,u64)>=db.connection.prepare(&format!("SELECT t.id,t.revision FROM tasks t JOIN attempts a ON a.id=t.active_attempt
+        WHERE a.state='running' AND a.termination_observed=0 AND EXISTS({accepted})
+          AND EXISTS(SELECT 1 FROM attempt_inputs n JOIN events e ON e.entity=n.operation_id AND e.kind='runtime.launch_started' WHERE n.attempt_id=a.id)
+          AND NOT EXISTS(SELECT 1 FROM events e WHERE e.entity=a.id AND e.kind='attempt.completion_requested')
+          AND NOT EXISTS(SELECT 1 FROM attempt_cancellations c WHERE c.attempt_id=a.id)
+        ORDER BY t.id LIMIT 9"))?.query_map([],|row|Ok((row.get(0)?,row.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+    for (task,revision) in tasks.iter().take(8) {
+        let task=TaskId::new(task.clone()).map_err(anyhow::Error::msg)?;
+        match db.request_completion_mode(&task,*revision,jiff::Timestamp::now().as_millisecond(),true) {
+            Ok(_)|Err(StoreError::Conflict)|Err(StoreError::Invalid(_))=>{},
+            Err(error)=>return Err(error.into()),
+        }
+    }
+    // A new stop request needs another controller turn, as do remaining rows.
+    Ok(!tasks.is_empty())
 }

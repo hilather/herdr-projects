@@ -124,7 +124,22 @@ herdr-projects telemetry PROJECT attempts
 The worker writes `docs/plan-*.md` in its worktree and finishes by running the
 script at the end of its brief, which commits the deliverable and submits it through
 its spool; verification then runs the signed acceptance policy and integration lands it
-on the integration branch (both automatic with `--integration-ref`). If a worker stops
+on the integration branch (both automatic with `--integration-ref`). Once every signed
+acceptance policy accepts a submission, the ticker completes its started attempt;
+`verify_then_integrate` also requires successful integration with merged-output checks.
+The controller stops the worker, proves termination, releases capacity, and records
+attempt `completed` / task `succeeded`. Telemetry `active_ms` ends at that completion,
+including the stop, rather than waiting for the worker's wall budget.
+
+Automatic completion requires `result PROJECT auto --verify on` and, for
+`verify_then_integrate`, `--integrate on`. With either required switch off, verification
+or integration performed manually leaves completion to the operator:
+`task PROJECT complete TASK --expected-revision R`. `task PROJECT list` reports the
+switches and completion guidance. Rejected or errored verification leaves the worker
+running so it can resubmit. Repeated completion requests replay; cancellation retains
+priority, and capacity stays held until termination is proven.
+
+If a worker stops
 without submitting, finish it yourself:
 
 ```sh

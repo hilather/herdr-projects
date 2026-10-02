@@ -600,6 +600,152 @@ fn an_operator_finishes_a_worker_that_never_submitted_and_the_result_lands_autom
     assert_eq!(lab.git(&["cat-file", "-p", &format!("{candidate}:work.txt")]), "worker change");
 }
 
+// Like EDITING_AGENT, but commits and submits through the worker's public
+// CLI/spool, then stays idle. An owner marker asks it to resubmit a new commit.
+const SUBMITTING_EDITING_AGENT: &str = r#"
+use std::{fs, path::Path, process::Command, time::Duration};
+fn git(args: &[&str]) -> String {
+    let out = Command::new("/usr/bin/git").args(["-c", "user.name=worker", "-c", "user.email=worker@example.invalid"]).args(args).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--version") { println!("2.1.0 (Claude Code)"); return }
+    for index in 0..2 {
+        if index == 1 { while !Path::new("resubmit").exists() { std::thread::sleep(Duration::from_millis(50)); } }
+        fs::write("work.txt", format!("worker change {index}\n")).unwrap();
+        git(&["add", "work.txt"]); git(&["commit", "-qm", "worker change"]);
+        let candidate = git(&["rev-parse", "HEAD"]);
+        let blob = git(&["rev-parse", "HEAD:work.txt"]);
+        let objects = git(&["rev-list", "--objects", "HEAD"]).lines().map(|line| {
+            let oid = line.split_whitespace().next().unwrap();
+            format!("{{\"oid\":\"{oid}\",\"relative_path\":\"{}/{}\"}}", &oid[..2], &oid[2..])
+        }).collect::<Vec<_>>().join(",");
+        let document = TEMPLATE.replace("CANDIDATE", &candidate).replace("BLOB", &blob)
+            .replace("\"OBJECTS\"", &format!("[{objects}]")).replace("KEY", &format!("editing-{index}"));
+        fs::write("submission.json", document).unwrap();
+        let mut submitted = false;
+        for _ in 0..200 {
+            let out = Command::new("herdr-projects").args(["--root", ROOT, "result", "demo", "submit", "--input-file", "submission.json"]).output().unwrap();
+            if out.status.success() { submitted = true; break }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(submitted);
+        fs::write(format!("submitted-{index}"), "ok").unwrap();
+    }
+    loop { std::thread::park() }
+}
+"#;
+
+fn editing_submission_lab(route: &str, policy: &str, verify: bool, integrate: bool) -> (Lab, AttemptId, PathBuf) {
+    let mut lab = Lab::new("unknown_usage='allow_with_warning'\n");
+    let (contract, base) = lab.install_work_contract_policy(route, policy);
+    let (_, attempt) = lab.reserve("Retained instructions");
+    let worktree = lab.planned_worktree(&attempt);
+    let repository = lab.repo.canonicalize().unwrap().display().to_string();
+    lab.git(&["branch", "integration"]);
+    lab.ok(&["result", "demo", "configure-integration", "--repository", &repository, "--reference", "refs/heads/integration"]);
+    lab.ok(&["result", "demo", "auto", "--verify", if verify {"on"} else {"off"}, "--integrate", if integrate {"on"} else {"off"}, "--expected-head", &lab.head().to_string()]);
+    let template = json!({"idempotency_key":"KEY", "task_id":"work", "contract_revision":1, "contract_digest":contract,
+        "attempt_id":attempt.as_str(), "repository":repository, "base_oid":base, "candidate_oid":"CANDIDATE", "object_format":"sha256",
+        "artifact_manifest":[{"path":"work.txt", "oid":"BLOB"}], "claimed_checks":[], "objects":"OBJECTS"}).to_string();
+    lab.write_agent(SUBMITTING_EDITING_AGENT, &[("ROOT", lab.path("root").canonicalize().unwrap().display().to_string()), ("TEMPLATE", template)]);
+    (lab, attempt, worktree)
+}
+
+#[test]
+fn accepted_editing_worker_completes_automatically_after_integration() {
+    let (mut lab, attempt, _) = editing_submission_lab("verify_then_integrate", WORK_POLICY, true, true);
+    lab.serve();
+    let mut ticker = lab.spawn();
+    lab.wait_for(&mut ticker, "automatic completion and proven worker termination", &attempt, 120, &|| lab.attempt(&attempt).termination_observed);
+    let ended = lab.attempt(&attempt);
+    assert_eq!(ended.state, AttemptState::Completed);
+    assert!(!ended.retains_capacity());
+    assert_eq!(lab.state().tasks.iter().find(|t| t.id.as_str() == "work").unwrap().state, TaskState::Succeeded);
+    assert!(lab.git_ok(&["rev-parse", "--verify", "integration^2"]));
+    assert_eq!(lab.events("runtime.worker_terminated").len(), 1);
+    assert_eq!(lab.events("attempt.completion_requested").len(), 1);
+    let report = lab.ok_live(&|| ["telemetry", "demo", "attempts", "--json"].map(String::from).to_vec());
+    let outcome = report["attempts"].as_array().unwrap().iter().find(|a| a["attempt_id"] == attempt.as_str()).unwrap();
+    assert_eq!(outcome["terminal_state"], "completed", "{outcome}");
+    assert_eq!(outcome["accepted"], true, "{outcome}");
+    assert!(outcome["active_ms"].as_i64().is_some_and(|ms| ms < 600_000), "{outcome}");
+    let replay = lab.ok_live(&|| ["task", "demo", "complete", "work", "--expected-revision", "0"].map(String::from).to_vec());
+    assert_eq!(replay["replayed"], true);
+    lab.stop(ticker);
+    lab.run_for("completion-restart", 2);
+    assert_eq!(lab.events("attempt.completion_requested").len(), 1);
+    assert_eq!(lab.events("runtime.worker_terminated").len(), 1);
+}
+
+#[test]
+fn accepted_verify_only_editing_worker_completes_without_integration_automation() {
+    let (mut lab, attempt, _) = editing_submission_lab("verify_only", WORK_POLICY, true, false);
+    lab.serve();
+    let mut ticker = lab.spawn();
+    lab.wait_for(&mut ticker, "verify-only automatic completion", &attempt, 120, &|| lab.attempt(&attempt).termination_observed);
+    assert_eq!(lab.attempt(&attempt).state, AttemptState::Completed);
+    assert!(!lab.attempt(&attempt).retains_capacity());
+    assert_eq!(lab.state().tasks.iter().find(|t| t.id.as_str() == "work").unwrap().state, TaskState::Succeeded);
+    assert!(!lab.git_ok(&["rev-parse", "--verify", "-q", "integration^2"]));
+    lab.stop(ticker);
+}
+
+#[test]
+fn rejected_editing_worker_stays_running_and_can_resubmit() {
+    let (mut lab, attempt, worktree) = editing_submission_lab("verify_only", r#"{"version":1,"checks":["/usr/bin/false"]}"#, true, false);
+    lab.serve();
+    let mut ticker = lab.spawn();
+    lab.wait_for(&mut ticker, "rejected verification", &attempt, 120, &|| {
+        let report = herdr_projects::telemetry::outcome::attempts(&lab.project).unwrap();
+        report["attempts"].as_array().unwrap().iter().any(|a| a["attempt_id"] == attempt.as_str() && a["verification"]["state"] == "rejected")
+    });
+    assert_eq!(lab.attempt(&attempt).state, AttemptState::Running);
+    assert!(lab.attempt(&attempt).retains_capacity());
+    assert!(lab.events("attempt.completion_requested").is_empty());
+    fs::write(worktree.join("resubmit"), "go").unwrap();
+    lab.wait_for(&mut ticker, "worker resubmission", &attempt, 120, &|| {
+        lab.ok_live(&|| ["result", "demo", "show"].map(String::from).to_vec()).as_array().unwrap().len() == 2
+    });
+    assert_eq!(lab.attempt(&attempt).state, AttemptState::Running);
+    assert!(lab.events("attempt.completion_requested").is_empty());
+    lab.stop(ticker);
+}
+
+#[test]
+fn editing_worker_requires_operator_completion_when_automation_is_off() {
+    for (route, verify) in [("verify_only", false), ("verify_then_integrate", true)] {
+        let (mut lab, attempt, _) = editing_submission_lab(route, WORK_POLICY, verify, false);
+        lab.serve();
+        let mut ticker = lab.spawn();
+        lab.wait_for(&mut ticker, "worker submission", &attempt, 120, &|| {
+            lab.ok_live(&|| ["result", "demo", "show"].map(String::from).to_vec()).as_array().unwrap().len() == 1
+        });
+        lab.stop(ticker);
+        let shown = lab.ok(&["result", "demo", "show"]);
+        let policy = lab.path("policy.json");
+        fs::write(&policy, WORK_POLICY).unwrap();
+        let verified = lab.ok(&["result", "demo", "verify", shown[0]["submission_id"].as_str().unwrap(), "--policy-id", "clean", "--policy-file", policy.to_str().unwrap(),
+            "--idempotency-key", "manual-verify", "--work-dir", lab.path("manual-verify").to_str().unwrap()]);
+        assert_eq!(verified["state"], "accepted");
+        if route == "verify_then_integrate" {
+            let repository = lab.repo.canonicalize().unwrap().display().to_string();
+            let integrated = lab.ok(&["result", "demo", "integrate", verified["receipt"]["result_id"].as_str().unwrap(),
+                "--repository", &repository, "--idempotency-key", "manual-integrate", "--work-dir", lab.path("manual-integrate").to_str().unwrap()]);
+            assert_eq!(integrated["state"], "integrated");
+        }
+        lab.run_for("manual-completion", 3);
+        assert_eq!(lab.attempt(&attempt).state, AttemptState::Running);
+        assert!(lab.attempt(&attempt).retains_capacity());
+        assert!(lab.events("attempt.completion_requested").is_empty());
+        let listed = lab.ok(&["task", "demo", "list"]);
+        assert_eq!(listed["result_automation"]["verify"], verify);
+        assert_eq!(listed["result_automation"]["integrate"], false);
+        assert!(listed["completion_guidance"].as_str().unwrap().contains("task PROJECT complete"));
+    }
+}
+
 #[test]
 fn ticker_recovers_a_lost_creation_reply_without_creating_again() {
     let mut lab = Lab::new("unknown_usage='allow_with_warning'");
@@ -1348,12 +1494,15 @@ impl Lab {
     /// Install an owner-signed contract for the queued task `work` whose one
     /// output is `work.txt`, routed `route`; returns (contract digest, base commit).
     fn install_work_contract(&self, route: &str) -> (String, String) {
+        self.install_work_contract_policy(route, WORK_POLICY)
+    }
+    fn install_work_contract_policy(&self, route: &str, policy: &str) -> (String, String) {
         let base = self.git(&["rev-parse", "HEAD"]);
         let store = self.project.join(".state/state.db").canonicalize().unwrap().display().to_string();
         let mut document = serde_json::to_vec_pretty(&json!({
             "version": 3, "outputs": [{"path": "work.txt", "kind": "git_file"}], "scope": {"paths": [{"path": "work.txt", "access": "write"}]},
             "project_store": store, "expected_head": self.head(), "task_id": "work", "contract_revision": 1, "deliverable": "work", "non_goals": "none",
-            "acceptance_policies": [{"id": "clean", "text": WORK_POLICY}],
+            "acceptance_policies": [{"id": "clean", "text": policy}],
             "repository": self.repo.canonicalize().unwrap().display().to_string(), "base_oid": base,
             "object_format": "sha256", "dependencies": [], "capability_flags": [], "profile_kind": "claude", "retry_class": "none", "result_schema_id": "result-v1",
             "route": route, "authority": authority::policy_reference(&self.project).unwrap()})).unwrap();

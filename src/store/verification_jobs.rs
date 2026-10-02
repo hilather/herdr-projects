@@ -92,6 +92,15 @@ fn identity(tx: &Connection, candidate: &Candidate, policy_digest: &str) -> Resu
 }
 
 impl SqliteStore {
+    pub fn result_automation(&self) -> Result<ResultAutomationControl> {
+        let schema=version(&self.connection)?;
+        if schema<44 {return Ok(ResultAutomationControl {revision:0,verify:false,integrate:false});}
+        let sql=if schema>=45 {"SELECT revision,verify,integrate FROM result_automation_control WHERE singleton=1"}
+            else {"SELECT revision,verify,0 FROM result_automation_control WHERE singleton=1"};
+        Ok(self.connection.query_row(sql, [],
+            |row| Ok(ResultAutomationControl { revision:row.get(0)?,verify:row.get(1)?,integrate:row.get(2)? }))?)
+    }
+
     /// `None` leaves a switch unchanged. The integration switch needs schema 45.
     pub fn set_result_automation(&mut self, expected_head: u64, verify: Option<bool>, integrate: Option<bool>) -> Result<ResultAutomationControl> {
         let tx = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;check_schema(&tx)?;

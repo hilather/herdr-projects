@@ -870,7 +870,18 @@ test.
    `--integration-ref` automatic verification and integration then proceed: with
    automatic verification on, `submit-captured` enqueues the verification job itself (as a
    spooled submission does on the ticker's next turn), so the worker need not exit and the
-   attempt stays as it was.
+   attempt remains running while verification is pending or rejected. After every
+   acceptance policy accepts, the ticker requests completion through the same path as
+   `task PROJECT complete TASK --expected-revision R`. A `verify_then_integrate` route
+   first requires recorded successful integration and current merged-output checks.
+   Automatic completion requires verify automation on, plus integrate automation on
+   for that route. With a required switch off, `task PROJECT list` reports that the
+   operator must complete it. Verification errors and rejections never complete it.
+   Completion stops the worker and proves its termination before releasing capacity
+   and marking the attempt `completed` and task `succeeded`; telemetry `active_ms`
+   ends there, without charging the remaining wall budget. Requests are idempotent
+   across ticker restarts and operator completion races; cancellation takes priority.
+   Seeded candidates and unselected candidate-group submissions remain held.
    A canonical worker job (brief, preparation, termination) that lost a lock race or hit a
    transient failure is retried after two seconds, not thirty; project ownership itself is
    still taken without waiting, so status reads and exclusion checks never block. Configuring integration and enabling automation before a reserved

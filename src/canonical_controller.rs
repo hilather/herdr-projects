@@ -112,13 +112,14 @@ fn finish_poll(ctx:&Ctx,path:&Path,turn:u64,reachable:bool,observation_error:Opt
     let replan_work=service("replan request service",&|path|Ok(herdr_projects::store::service_project_replans(path)?.pending));
     let verification_work=service("verification job service",&|path|Ok(herdr_projects::store::service_project_verification_jobs(path)?.pending));
     let integration_work=service("integration job service",&|path|Ok(herdr_projects::store::service_project_integration_jobs(path)?.pending));
+    let completion_work=service("result completion service",&|path|herdr_projects::store::service_project_result_completions(path));
     let routine_work=match scheduled {Ok(report)=>{if let Some(error)=report.diagnostic {errors.push(format!("routine scheduling: {error}"));}report.active},Err(error)=>{errors.push(format!("routine scheduling: {error:#}"));false}};
     // An admission failure is diagnostic only. Already-prepared dispatch still runs.
     let (progress,unknown_effects)=match result {
         Ok((progress,admission))=>{if let Some(error)=admission {errors.push(format!("admission: {error}"));}(progress,false)}
         Err(error)=>{errors.push(format!("{error:#}"));(false,queued)}
     };
-    Ok(PollResult{reachable:reachable||progress,scheduled_work:routine_work||wait_work||stop_work||replan_work||verification_work||integration_work,unknown_effects,operation_error:(!errors.is_empty()).then(||errors.join("; ")),admission_log})
+    Ok(PollResult{reachable:reachable||progress,scheduled_work:routine_work||wait_work||stop_work||replan_work||verification_work||integration_work||completion_work,unknown_effects,operation_error:(!errors.is_empty()).then(||errors.join("; ")),admission_log})
 }
 fn process_next(ctx:&Ctx,path:&Path,turn:u64,effects:Option<&mut crate::copy_jobs::Queue>)->Result<bool> {
     Ok(process_next_with_launches(ctx,path,turn,effects,launch_dispatch_enabled()).1?.0)
