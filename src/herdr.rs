@@ -396,11 +396,11 @@ impl<'a> Herdr<'a> {
     }
 }
 
-pub const SOURCE: &str = "herdr-projects";
+pub const SOURCE: &str = "herdr-farm";
 
 impl<'a> Herdr<'a> {
     fn request(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, HerdrError> {
-        let line = serde_json::json!({ "id": "herdr-projects", "method": method, "params": params }).to_string();
+        let line = serde_json::json!({ "id": "herdr-farm", "method": method, "params": params }).to_string();
         let reply = self
             .runner
             .socket_request(&self.socket, &line, CALL_TIMEOUT)

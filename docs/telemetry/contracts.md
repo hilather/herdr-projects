@@ -463,7 +463,7 @@ S5 refinements:
   rollout unless `--json`); both print `{attempts, sessions}` as JSON,
   collect adds `collected{files, bytes, records, reevaluated, budget_exhausted}`. Budget:
   256 MiB per CLI collect, 8 MiB per ticker collect (once per 300 s per project,
-  `HERDR_PROJECTS_TELEMETRY_COLLECT_SECS`, `0` off; no sidecar is created for a
+  `HERDR_FARM_TELEMETRY_COLLECT_SECS`, `0` off; no sidecar is created for a
   project without a Codex home). Lines over 16 MiB are skipped whole. The
   ticker's telemetry pass (collect, then every lane's tick) runs on its own
   thread, one project at a time; the ticker's pass never waits for it
@@ -734,3 +734,5 @@ submission, verification and integrated-operation counts for the active attempt.
 Unchanged evidence suppresses retries and duplicate ticker log messages; changed
 evidence permits another request. This uses the existing event ledger and its
 backup/retention classification, with no schema change.
+
+Compatibility: legacy environment variables and existing data/config locations remain supported; see [renaming](../renaming.md).

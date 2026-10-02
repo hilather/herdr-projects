@@ -28,7 +28,7 @@ pub struct LaunchStartedReceipt {
 
 /// Not deserializable: parsing a reply does not establish its source or authority.
 /// ```compile_fail
-/// use herdr_projects::domain::PreparedLaunchStarted;
+/// use herdr_farm::domain::PreparedLaunchStarted;
 /// let _: PreparedLaunchStarted = serde_json::from_str("{}").unwrap();
 /// ```
 #[derive(Debug)]
@@ -156,7 +156,7 @@ pub struct LaunchCreationIntent {
     /// 1: existing workspace tab or historical shell/bootstrap workspace.
     /// 2: literal supervised first pane via workspace.create_command.
     /// 3: stock workspace.create whose default shell execs the fixed launcher
-    ///    (`herdr-projects launch-exec <spec>`); recovered exactly like 2.
+    ///    (`herdr-farm launch-exec <spec>`); recovered exactly like 2.
     pub version: u32,
     pub operation: OperationId,
     pub attempt: AttemptId,

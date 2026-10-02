@@ -5,9 +5,9 @@ use anyhow::{Result, bail, ensure};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use herdr_projects::profile_config::ProfileDefinition as Profile;
-pub(super) use herdr_projects::profile_config::Budget;
-pub use herdr_projects::profile_config::UnknownUsage;
+use herdr_farm::profile_config::ProfileDefinition as Profile;
+pub(super) use herdr_farm::profile_config::Budget;
+pub use herdr_farm::profile_config::UnknownUsage;
 
 /// Absence of adapter evidence is distinct from tested lack of support.
 #[derive(Debug, Serialize)]
@@ -110,7 +110,7 @@ fn load_text(text: &str, name: &str) -> Result<(Inspection, Option<Budget>)> {
         .map_err(|_| anyhow::anyhow!("invalid profile fields (source redacted); check the documented schema"))?;
     validate(&profile)?;
     let mut blockers = vec!["installed-version compatibility has not been verified", "no verified launch adapter evidence", "permission policy has not been resolved", "profile is not bound to an immutable attempt"];
-    let mapped = |value: &Option<String>| value.as_deref().filter(|v| herdr_projects::agent_home::supported(&profile.kind) && herdr_projects::agent_home::valid_pin(v)).map(str::to_owned);
+    let mapped = |value: &Option<String>| value.as_deref().filter(|v| herdr_farm::agent_home::supported(&profile.kind) && herdr_farm::agent_home::valid_pin(v)).map(str::to_owned);
     let (pinned_model, pinned_reasoning_effort) = (mapped(&profile.model), mapped(&profile.reasoning_effort));
     if profile.model.is_some() && pinned_model.is_none() { blockers.push("model request requires a verified adapter mapping"); }
     if profile.reasoning_effort.is_some() && pinned_reasoning_effort.is_none() { blockers.push("reasoning effort requires a verified adapter mapping"); }

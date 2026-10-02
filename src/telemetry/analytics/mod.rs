@@ -30,7 +30,7 @@ pub(crate) fn sha256(bytes: &[u8]) -> String {
     format!("sha256:{:x}", <sha2::Sha256 as sha2::Digest>::digest(bytes))
 }
 
-/// `herdr-projects telemetry <slug> metrics ...`
+/// `herdr-farm telemetry <slug> metrics ...`
 #[derive(clap::Subcommand)]
 pub enum MetricsCommand {
     /// The versioned metric registry: definitions, families, cohorts, units, certification and activation. Read-only.
@@ -40,7 +40,7 @@ pub enum MetricsCommand {
     },
 }
 
-/// `herdr-projects telemetry <slug> analytics ...`
+/// `herdr-farm telemetry <slug> analytics ...`
 #[derive(clap::Subcommand)]
 pub enum Command {
     /// Stream version of this lane's sidecar tables. Read-only.

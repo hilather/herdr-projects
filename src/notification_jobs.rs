@@ -1,6 +1,6 @@
 //! Inbox delivery under coordinator ownership; queue results are never receipts.
 use super::*;
-use herdr_projects::notification_claim::{Batch,Claim as Notice,Mode,Phase as NoticePhase};
+use herdr_farm::notification_claim::{Batch,Claim as Notice,Mode,Phase as NoticePhase};
 use crate::steps::{self,State};
 const UNCERTAIN:&str="Inbox delivery may already have occurred. Inspect the coordinator and notification history, then use notification acknowledge or notification retry with the recorded sequence.";
 fn validate(state:&State)->Result<()> {
@@ -21,7 +21,7 @@ fn mode(input:&Input,p:&Project)->Result<Mode> {
 fn payload(p:&Project,c:&Coordinator,batch:&Batch,mode:Mode)->Result<String> {
     Ok(serde_json::to_string(&match mode {
         Mode::Nudge=>serde_json::json!({"target":c.pane_id,"text":steps::NUDGE_TEXT}),
-        Mode::Toast=>serde_json::json!({"title":format!("herdr-projects: {}",p.slug),"body":format!("{} new inbox item(s). The coordinator reads them at its next turn.",batch.ids.len())}),
+        Mode::Toast=>serde_json::json!({"title":format!("herdr-farm: {}",p.slug),"body":format!("{} new inbox item(s). The coordinator reads them at its next turn.",batch.ids.len())}),
         Mode::Legacy=>anyhow::bail!("legacy uncertainty cannot dispatch"),
     })?)
 }
@@ -41,7 +41,7 @@ pub(super) fn recover(p:&Project,guard:&ProjectGuard)->Result<()> {
 }
 fn primed(c:&Coordinator)->Result<()> {
     super::validate(c)?;ensure!(!c.prime_pending,"coordinator priming is pending");
-    ensure!(c.launch_claim.as_ref().is_none_or(|claim|claim.phase!=herdr_projects::launch_claim::Phase::Pending&&(claim.phase!=herdr_projects::launch_claim::Phase::Uncertain||claim.generation!=c.prime_request))
+    ensure!(c.launch_claim.as_ref().is_none_or(|claim|claim.phase!=herdr_farm::launch_claim::Phase::Pending&&(claim.phase!=herdr_farm::launch_claim::Phase::Uncertain||claim.generation!=c.prime_request))
         &&c.prime_claim.as_ref().is_none_or(|claim|claim.delivery.phase!=Phase::Pending&&(claim.delivery.phase!=Phase::Uncertain||claim.request!=c.prime_request)),"coordinator needs reconciliation before nudging");Ok(())
 }
 pub(super) fn execute(input:&Input,control:&Control)->Result<()> {execute_with(input,control,||Ok(()))}
@@ -67,7 +67,7 @@ fn execute_with(input:&Input,control:&Control,after_claim:impl FnOnce()->Result<
     let payload=payload(&p,&c,&batch,mode)?;let authority=authority(input,&payload)?;
     if retry {let approved=state.notification_claim.as_ref().unwrap();ensure!(approved.batch.as_ref()==Some(&batch)&&approved.mode==mode&&approved.payload==payload&&approved.authority==authority,"approved notification retry inputs changed; reconcile again");}
     let h=crate::herdr::Herdr::new(&input.herdr,&input.socket,&crate::runner::RealRunner);
-    let probe=herdr_projects::supervision::run(h.cmd(crate::herdr::CALL_TIMEOUT).args(["remote-api-bridge","--check"]),control.deadline,control.cancellation.clone(),&locks)?;control.check()?;
+    let probe=herdr_farm::supervision::run(h.cmd(crate::herdr::CALL_TIMEOUT).args(["remote-api-bridge","--check"]),control.deadline,control.cancellation.clone(),&locks)?;control.check()?;
     ensure!(probe.success()&&probe.stdout.trim()=="herdr-api-bridge-v1","notification JSON API bridge unavailable");
     let mut terminal=None;
     if mode==Mode::Nudge {
@@ -89,7 +89,7 @@ fn execute_with(input:&Input,control:&Control,after_claim:impl FnOnce()->Result<
     ensure!(steps::try_load_state(&p)?.notification_claim.as_ref()==Some(&claim)&&capture(&p,&fresh,control)?==batch,"notification claim or inbox changed before send");
     let id=format!("notification-{}",claim.sequence);let params:serde_json::Value=serde_json::from_str(&claim.payload)?;
     let frame=serde_json::to_string(&serde_json::json!({"id":id,"method":if mode==Mode::Nudge{"agent.prompt"}else{"notification.show"},"params":params}))?+"\n";ensure!(frame.len()<=64*1024,"notification frame exceeds bounds");
-    let out=herdr_projects::supervision::run(h.cmd(crate::herdr::CALL_TIMEOUT).arg("remote-api-bridge").stdin(frame),control.deadline,control.cancellation.clone(),&locks)?;control.check()?;ensure!(out.success(),"notification command failed");
+    let out=herdr_farm::supervision::run(h.cmd(crate::herdr::CALL_TIMEOUT).arg("remote-api-bridge").stdin(frame),control.deadline,control.cancellation.clone(),&locks)?;control.check()?;ensure!(out.success(),"notification command failed");
     let reply:serde_json::Value=serde_json::from_str(&out.stdout)?;ensure!(reply["id"].as_str()==Some(&id)&&reply.get("error").is_none(),"notification acknowledgement mismatch");let result=&reply["result"];
     let not_shown=if mode==Mode::Nudge {
         ensure!(result["type"].as_str()==Some("agent_prompted")&&result["agent"]["terminal_id"].as_str()==terminal.as_deref(),"notification prompt acknowledgement mismatch");let agent:crate::herdr::Agent=serde_json::from_value(result["agent"].clone())?;ensure!(crate::coordinator::agent_matches(&c,&agent)&&agent.agent==kind,"notification prompt acknowledged another agent");None

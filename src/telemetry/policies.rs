@@ -266,7 +266,7 @@ fn simulate(input: &Path, seed: u64, sweep: Option<u64>) -> Result<Value> {
     Ok(json!({"schema": SIMULATION_SCHEMA, "read_only": true, "arms": names, "evaluations": evaluations}))
 }
 
-/// `herdr-projects telemetry <slug> policies ...`
+/// `herdr-farm telemetry <slug> policies ...`
 #[derive(clap::Subcommand)]
 pub enum Command {
     /// The operator switch (default `off`), configured policies, grants and assignment counts, as JSON. Read-only.

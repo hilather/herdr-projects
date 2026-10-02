@@ -8,7 +8,7 @@
 use serde_json::{json, Value};
 use std::{fs, io::{BufRead, BufReader, Write}, os::unix::fs::PermissionsExt, path::{Path, PathBuf}, process::{Command, Output}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 const FAKE_HERDR: &str = r#"#!/bin/sh
 case "$1 $2" in
@@ -174,7 +174,7 @@ fn overview_and_focus_refuse_a_path_like_slug() {
 fn unfocus_reads_herdr_stdout_reports_its_stderr_on_failure_and_survives_a_missing_binary() {
     let lab = Lab::new();
     let socket = lab.path("named.sock");
-    let requests = serve(&socket, r#"{"id":"herdr-projects","result":{}}"#);
+    let requests = serve(&socket, r#"{"id":"herdr-farm","result":{}}"#);
     fs::write(lab.path("sessions.json"), json!({"sessions": [{"name": "work", "default": false, "running": true, "socket_path": socket}]}).to_string()).unwrap();
     // Diagnostic noise on stderr does not disturb the JSON read from stdout.
     fs::write(lab.path("session-noise"), "").unwrap();
@@ -229,7 +229,7 @@ fn unfocus_sends_one_line_over_one_connection_and_reads_one_reply_line() {
             let mut request = Vec::new();
             let mut byte = [0u8; 1];
             while !request.ends_with(b"\n") && stream.read(&mut byte).unwrap() == 1 { request.push(byte[0]); }
-            stream.write_all(br#"{"id":"herdr-projects","#).unwrap();
+            stream.write_all(br#"{"id":"herdr-farm","#).unwrap();
             std::thread::sleep(Duration::from_millis(200));
             stream.write_all(b"\"result\":{}}\n{\"trailing\":").unwrap();
             // The client sends nothing more and closes its end.

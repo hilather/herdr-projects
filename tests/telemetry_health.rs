@@ -1,5 +1,5 @@
 //! TM4.5 health alerts and advisory recommendations end to end
-//! (docs/telemetry/contracts-health.md), through `herdr-projects telemetry`
+//! (docs/telemetry/contracts-health.md), through `herdr-farm telemetry`
 //! on the CLI over planted canonical and sidecar rows. Every expected value is
 //! hand-computed from the planted rows and the declared rule table
 //! (`health-rules.v3`); none is read back from a production aggregate.
@@ -9,7 +9,7 @@
 
 mod support;
 
-use herdr_projects::store::SqliteStore;
+use herdr_farm::store::SqliteStore;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{fs, path::{Path, PathBuf}, process::Command};
@@ -39,7 +39,7 @@ impl Planted {
         db
     }
     fn sidecar(&self) -> rusqlite::Connection { rusqlite::Connection::open(self.project.join(".state/telemetry.db")).unwrap() }
-    fn config_dir(&self) -> PathBuf { self.tmp.path().join("home/.config/herdr-projects") }
+    fn config_dir(&self) -> PathBuf { self.tmp.path().join("home/.config/herdr-farm") }
     fn command(&self, args: &[&str]) -> std::process::Output {
         Command::new(BIN).env_clear().env("HOME", self.tmp.path().join("home")).env("PATH", "/usr/bin:/bin")
             .args(["--root", self.root.to_str().unwrap(), "telemetry", "demo"]).args(args).output().unwrap()
@@ -555,7 +555,7 @@ fn cooldown_dedup_and_inbox_notice_written_once() {
     let rows = before(&p);
     let payload: Value = serde_json::from_str(&p.db().query_row("SELECT payload FROM inbox_items WHERE id=?1", [notices[0]["notice_id"].as_str().unwrap()], |r| r.get::<_, String>(0)).unwrap()).unwrap();
     assert_eq!((&payload["kind"], &payload["subject"], &payload["body"]), (&json!("telemetry-health"), &json!("quota_headroom"), &json!("")));
-    assert_eq!(payload["summary"], json!("telemetry health warn: quota_headroom [services service=codex] headroom_low; advisory — `herdr-projects telemetry demo health alerts`"));
+    assert_eq!(payload["summary"], json!("telemetry health warn: quota_headroom [services service=codex] headroom_low; advisory — `herdr-farm telemetry demo health alerts`"));
     let second = p.json(&["health", "notify"]);
     assert!(second["delivered"].as_array().unwrap().is_empty(), "{second}");
     p.evaluate();
@@ -700,7 +700,7 @@ fn reopened_fix_increase_raises_the_regression_rule() {
     let opened = fixes(&["open", &finding, "--assign", "fast"]);
     let repair = opened["event"]["subject"]["repair_seq"].as_i64().unwrap().to_string();
     let factory = Factory::open(&f);
-    factory.attempt("fix-a1", &herdr_projects::domain::agent_configuration(&fast).id);
+    factory.attempt("fix-a1", &herdr_farm::domain::agent_configuration(&fast).id);
     fixes(&["bind", &repair, "--attempt", "fix-a1"]);
     factory.submission(&rep('4'), "fix-a1", &oid('4'), 6_000);
     factory.run(&rep('d'), &rep('4'), "fix-a1", &oid('4'), &rep('f'));
@@ -836,12 +836,12 @@ fn no_recommendation_when_the_comparison_refuses_to_rank() {
 /// owner-signed and imported through the CLI.
 mod world {
     #![allow(dead_code)]
-    use herdr_projects::{authority, domain::*, migration, runtime};
+    use herdr_farm::{authority, domain::*, migration, runtime};
     use serde_json::{json, Value};
     use sha2::{Digest, Sha256};
     use std::{collections::BTreeMap, fs, os::unix::fs::{MetadataExt, PermissionsExt}, path::{Path, PathBuf}, process::{Command, Output}};
 
-    const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+    const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
     fn now() -> i64 { jiff::Timestamp::now().as_millisecond() }
 
     pub struct World {
@@ -859,7 +859,7 @@ mod world {
             let key = home.path().join("owner");
             assert!(Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).output().unwrap().status.success());
             let public = fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
-            let config = home.path().join(".config/herdr-projects/config.toml");
+            let config = home.path().join(".config/herdr-farm/config.toml");
             fs::create_dir_all(config.parent().unwrap()).unwrap();
             fs::write(&config, format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[profiles.worker]\nkind='codex'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=60\nunknown_usage='allow_with_warning'\n")).unwrap();
             let repo = home.path().join("repo");
@@ -888,7 +888,7 @@ mod world {
                 let id = TaskId::new(*task).unwrap();
                 let revision = runtime::snapshot(&f.project).unwrap().tasks.into_iter().find(|t| t.id == id).unwrap().revision;
                 let change = runtime::create_binding(&f.project, Some(&id), Some(revision), f.head(), &route).unwrap();
-                observations.push(herdr_projects::reconcile::RuntimeObservation { binding: change.binding.id.clone(), binding_revision: change.binding.revision,
+                observations.push(herdr_farm::reconcile::RuntimeObservation { binding: change.binding.id.clone(), binding_revision: change.binding.revision,
                     task_revision: change.task_revision, observed_unix_ms: now(), collector: "herdr-git-v2".into(),
                     config_digest: migration::config_reference(&config).unwrap().digest, ..Default::default() });
                 f.bindings.insert(task.to_string(), change.binding.id);
@@ -940,7 +940,7 @@ mod world {
         /// Prepare `worker` over fake binaries; only the native interaction
         /// evidence, which needs a real agent session, is planted.
         pub fn launchable_profile(&self) -> VersionedReference {
-            use herdr_projects::worker_supervision::{ProcessIncarnation, SupervisorIdentity};
+            use herdr_farm::worker_supervision::{ProcessIncarnation, SupervisorIdentity};
             let bin = self.path("bin");
             let agent_home = self.path("agent-home");
             fs::create_dir_all(&bin).unwrap();
@@ -1062,18 +1062,18 @@ fn differences(a: &Value, b: &Value, path: String, out: &mut Vec<String>) {
 /// `fast`. The budget rule reads the signed policy (1000 attempts, 41 used): ok.
 #[test]
 fn recommendations_and_notices_change_no_canonical_state_and_no_dispatch() {
-    use herdr_projects::domain::{BudgetLimits, UnknownUsagePolicy};
+    use herdr_farm::domain::{BudgetLimits, UnknownUsagePolicy};
     let w = world::World::new(2, &[], &[("next", json!([]))]);
     let store = w.project.join(".state/state.db");
-    let config = w.path(".config/herdr-projects/config.toml");
-    let config_ref = herdr_projects::migration::config_reference(&config).unwrap();
+    let config = w.path(".config/herdr-farm/config.toml");
+    let config_ref = herdr_farm::migration::config_reference(&config).unwrap();
     // Owner-signed contract for the queued task.
     let contract = json!({"version":1,"project_store":w.store,"expected_head":w.head(),"task_id":"next","contract_revision":1,
         "deliverable":"next","non_goals":"no worker launch","acceptance_policies":[{"id":"builds","text":"{\"version\":1,\"checks\":[\"/usr/bin/git\",\"diff\",\"--quiet\"]}"}],
         "repository":w.repo.canonicalize().unwrap(),"base_oid":w.base,"object_format":"sha256","dependencies":[],"scope":{"paths":[],"named_resources":[]},
         "capability_flags":[],"profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_only",
-        "authority":herdr_projects::authority::policy_reference(&w.project).unwrap()});
-    let (doc, sig) = w.sign("contract.json", &serde_json::to_vec(&contract).unwrap(), herdr_projects::authority::CONTRACT_SIGNATURE_NAMESPACE);
+        "authority":herdr_farm::authority::policy_reference(&w.project).unwrap()});
+    let (doc, sig) = w.sign("contract.json", &serde_json::to_vec(&contract).unwrap(), herdr_farm::authority::CONTRACT_SIGNATURE_NAMESPACE);
     w.ok(&["task", "demo", "contract", "put", "--input-file", &doc, "--signature", &sig]);
     // Signed budget policy.
     let budget = w.budget(1, BudgetLimits { max_attempts: Some(1000), max_provider_tokens: None, unknown_usage: UnknownUsagePolicy::AllowIncomplete });
@@ -1081,13 +1081,13 @@ fn recommendations_and_notices_change_no_canonical_state_and_no_dispatch() {
     // A second retained worker profile.
     let fast = codex_profile(&config_ref, "claude", "fast", Some(&w.path("fast-home")));
     plant_profile(&store, fast.clone());
-    let fast_config = herdr_projects::domain::agent_configuration(&fast);
-    let worker_profile: herdr_projects::domain::FrozenProfile = {
+    let fast_config = herdr_farm::domain::agent_configuration(&fast);
+    let worker_profile: herdr_farm::domain::FrozenProfile = {
         let db = rusqlite::Connection::open(&store).unwrap();
         let report: String = db.query_row("SELECT report FROM native_profiles WHERE profile_digest=?1", [&w.profile.digest], |r| r.get(0)).unwrap();
         serde_json::from_value(serde_json::from_str::<Value>(&report).unwrap()["preparation"]["profile"].clone()).unwrap()
     };
-    let worker_config = herdr_projects::domain::agent_configuration(&worker_profile);
+    let worker_config = herdr_farm::domain::agent_configuration(&worker_profile);
     // Comparison evidence: FK-valid terminal tasks on both configurations.
     {
         let db = rusqlite::Connection::open(&store).unwrap();
@@ -1138,7 +1138,7 @@ fn recommendations_and_notices_change_no_canonical_state_and_no_dispatch() {
     let selection = w.selection("next");
     let (draft_before, _approval) = w.approve(&selection);
     rusqlite::Connection::open(&store).unwrap().execute("UPDATE project_control SET factory_admission='on' WHERE singleton=1", []).unwrap();
-    let admission_before = serde_json::to_value(herdr_projects::admission::prepared_admission_inputs(&w.project).unwrap().expect("a ready candidate")).unwrap();
+    let admission_before = serde_json::to_value(herdr_farm::admission::prepared_admission_inputs(&w.project).unwrap().expect("a ready candidate")).unwrap();
     // A health condition to notify: a current quota window with 12.5 % left.
     telemetry(&["collect"]);
     let now = unix_ms();
@@ -1147,7 +1147,7 @@ fn recommendations_and_notices_change_no_canonical_state_and_no_dispatch() {
     fs::create_dir_all(&outbox).unwrap();
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&outbox, fs::Permissions::from_mode(0o700)).unwrap();
-    let alerts_config = w.path(".config/herdr-projects/telemetry-alerts.toml");
+    let alerts_config = w.path(".config/herdr-farm/telemetry-alerts.toml");
     fs::write(&alerts_config, format!("schema = \"telemetry-alerts-config.v1\"\n[external]\nenabled = true\ndestination = \"directory\"\ndirectory = \"{}\"\n", outbox.display())).unwrap();
     fs::set_permissions(&alerts_config, fs::Permissions::from_mode(0o600)).unwrap();
 
@@ -1204,15 +1204,15 @@ fn recommendations_and_notices_change_no_canonical_state_and_no_dispatch() {
     let mut diff = Vec::new();
     differences(&draft_answer(&draft_after), &draft_answer(&draft_before), String::new(), &mut diff);
     assert!(diff.is_empty(), "the launch draft is the same answer: {diff:?}");
-    let admission_after = serde_json::to_value(herdr_projects::admission::prepared_admission_inputs(&w.project).unwrap().expect("a ready candidate")).unwrap();
+    let admission_after = serde_json::to_value(herdr_farm::admission::prepared_admission_inputs(&w.project).unwrap().expect("a ready candidate")).unwrap();
     assert_eq!(serde_json::to_vec(&admission_after).unwrap(), serde_json::to_vec(&admission_before).unwrap(), "admission prepares the same bytes");
-    let chosen = |inputs: &Value| herdr_projects::domain::agent_configuration(&serde_json::from_value(inputs["effective_profile"].clone()).unwrap()).id;
+    let chosen = |inputs: &Value| herdr_farm::domain::agent_configuration(&serde_json::from_value(inputs["effective_profile"].clone()).unwrap()).id;
     assert_eq!(chosen(&admission_after), worker_config.id);
     assert_eq!(chosen(&draft_after["inputs"]), worker_config.id);
     assert_ne!(worker_config.id, fast_config.id);
     // The next task is admitted on `worker`, not on the recommended `fast`.
     let (_, _) = w.approve(&selection);
-    herdr_projects::admission::admit_once(&w.project).unwrap();
+    herdr_farm::admission::admit_once(&w.project).unwrap();
     let (chosen_id, reasons): (String, String) = rusqlite::Connection::open(&store).unwrap()
         .query_row("SELECT chosen_configuration_id,reason_codes FROM dispatch_decisions WHERE task_id='next'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
     assert_eq!(chosen_id, worker_config.id);

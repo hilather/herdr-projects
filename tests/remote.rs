@@ -7,7 +7,7 @@
 use serde_json::{json, Value};
 use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 const FAKE_HERDR: &str = "#!/bin/sh\ncase \"$*\" in\n--version) echo 'herdr 0.9.1';;\n'machine list --json') cat \"$HOME/machines.json\" || exit 1;;\n*) echo '{\"result\":{}}';;\nesac\n";
 
@@ -38,7 +38,7 @@ impl Lab {
         match machines { Some(list) => fs::write(self.path("machines.json"), list.to_string()).unwrap(), None => { let _ = fs::remove_file(self.path("machines.json")); } }
     }
     fn config(&self, text: &str) {
-        let dir = self.path(".config/herdr-projects");
+        let dir = self.path(".config/herdr-farm");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("config.toml"), text).unwrap();
     }

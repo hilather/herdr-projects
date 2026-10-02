@@ -5,11 +5,11 @@
 //! admission and memory reconciliation, observed through `scheduler inspect`
 //! and the stored `dependency_satisfactions` rows. Attempts are recorded through
 //! the public store API because no worker is launched.
-use herdr_projects::{authority, domain::*, memory::*, migration, runtime};
+use herdr_farm::{authority, domain::*, memory::*, migration, runtime};
 use serde_json::{json, Value};
 use std::{fs, path::PathBuf, process::{Command, Output}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 const POLICY: &str = r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#;
 
 struct Factory { home: tempfile::TempDir, project: PathBuf, key: PathBuf, repo: PathBuf, store: String, base: String, candidate: String, format: &'static str }
@@ -73,7 +73,7 @@ impl Factory {
         assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y", "sign", "-f"]).arg(&self.key).args(["-n", namespace]).arg(&path).output().unwrap().status.success());
         (path, signature)
     }
-    fn db(&self) -> herdr_projects::store::SqliteStore { migration::open_active(&self.project).unwrap() }
+    fn db(&self) -> herdr_farm::store::SqliteStore { migration::open_active(&self.project).unwrap() }
     fn memory(&self) -> MemoryStore { MemoryStore::from_sqlite(self.db(), self.project.join(".state/objects")) }
     /// A contract document for `task` that may integrate, writing `scope`.
     fn contract_body(&self, task: &str, revision: u64, deliverable: &str, scope: Value) -> Value {

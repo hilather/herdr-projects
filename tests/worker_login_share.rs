@@ -9,7 +9,7 @@
 //! file instead: handed to the agent alone as an environment variable, never
 //! bound, copied into the home or put in any argument.
 //! Runs the real sandbox with a probe script standing in for the agent.
-use herdr_projects::{
+use herdr_farm::{
     execution_guard::GatedSpawn,
     worker_supervision::{Isolation, isolated_gated_command},
 };

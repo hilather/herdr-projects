@@ -265,7 +265,7 @@ fn import(git: &Git, project: &Path, receipt: &WorktreeReceipt, target: Target) 
             ensure!(live(&git), "Git quarantine import cancelled or deadline expired");
             return refused(format!("attempt branch moved to {current} outside the worker; {tip} does not extend it"));
         }
-        git.run(repository, &["update-ref", "-m", "herdr-projects: import attempt branch from its Git quarantine", &branch, &tip, &current])?;
+        git.run(repository, &["update-ref", "-m", "herdr-farm: import attempt branch from its Git quarantine", &branch, &tip, &current])?;
     }
     Ok(Outcome::Imported { commit: tip })
 }

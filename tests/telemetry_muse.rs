@@ -347,7 +347,7 @@ fn native_muse_parent_without_a_timestamp_cannot_bind_children() {
 
 #[test]
 fn otlp_explicit_usage_yields_to_native_muse_children() {
-    use herdr_projects::telemetry::otlp;
+    use herdr_farm::telemetry::otlp;
     let f = muse();
     f.cli("collect");
     f.cli_args(&["accounting", "sync"]);

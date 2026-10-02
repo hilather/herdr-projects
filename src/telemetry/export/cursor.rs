@@ -68,9 +68,9 @@ pub fn project_scope(project: &Path) -> Result<String> {
 impl Keyring {
     pub fn new(config_dir: &Path) -> Self { Keyring { dir: Some(config_dir.to_path_buf()), key: OnceCell::new() } }
 
-    /// `$HOME/.config/herdr-projects`, the product config directory (`paths::Env::config_dir`).
+    /// `$HOME/.config/herdr-farm`, the product config directory (`paths::Env::config_dir`).
     pub fn from_home() -> Self {
-        let dir = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(|h| PathBuf::from(h).join(".config").join("herdr-projects"));
+        let dir = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(|h| crate::product_environment::config_dir_for_home(&PathBuf::from(h)));
         Keyring { dir, key: OnceCell::new() }
     }
 

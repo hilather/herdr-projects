@@ -3,7 +3,7 @@
 //! Everything it does is "check on an interval, compare with last time, act".
 //! It exits on request through a stop file, never through signals.
 
-use herdr_projects::execution_guard::GatedSpawn;
+use herdr_farm::execution_guard::GatedSpawn;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -411,8 +411,8 @@ pub fn run(ctx: &Ctx) -> Result<()> {
             #[cfg(all(feature="state-store",target_os="linux"))]
             for slug in project::list_slugs(root) {
                 let dir=root.join(&slug);
-                if !herdr_projects::submission_spool::pending(&dir) {continue;}
-                match herdr_projects::submission_spool::ingest(&dir) {
+                if !herdr_farm::submission_spool::pending(&dir) {continue;}
+                match herdr_farm::submission_spool::ingest(&dir) {
                     Ok(lines)=>for line in lines {log.line(&format!("{slug}: {line}"));},
                     Err(error)=>log.line(&format!("{slug}: submission spool: {error:#}")),
                 }
@@ -478,7 +478,7 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
     // Per-project read-only store reads on this thread reuse one connection
     // within and across passes instead of reloading the schema for each read.
     #[cfg(feature="state-store")]
-    let _reads=herdr_projects::store::identity_inventory::reuse::pass();
+    let _reads=herdr_farm::store::identity_inventory::reuse::pass();
     #[cfg(feature="state-store")]
     let _telemetry_start=TELEMETRY_START.get_or_init(Instant::now);
     memory.tick += 1;
@@ -513,9 +513,9 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
             // Recovery is independent of source/session reachability. The worker
             // re-resolves remote routing and checks retained authority itself.
             let recovered=(||->Result<()> {
-                if project.try_coordinator()?.is_some_and(|c|c.prime_claim.as_ref().is_some_and(|claim|claim.delivery.phase==herdr_projects::prompt_claim::Phase::Pending||!claim.delivery.notified)
-                    ||c.launch_claim.as_ref().is_some_and(|claim|claim.phase==herdr_projects::launch_claim::Phase::Pending||!claim.notified)) {
-                    let guard=herdr_projects::execution_guard::ProjectGuard::acquire(&project.dir())?;
+                if project.try_coordinator()?.is_some_and(|c|c.prime_claim.as_ref().is_some_and(|claim|claim.delivery.phase==herdr_farm::prompt_claim::Phase::Pending||!claim.delivery.notified)
+                    ||c.launch_claim.as_ref().is_some_and(|claim|claim.phase==herdr_farm::launch_claim::Phase::Pending||!claim.notified)) {
+                    let guard=herdr_farm::execution_guard::ProjectGuard::acquire(&project.dir())?;
                     crate::coordinator_jobs::recover(&project,&guard)?;
                 }
                 Ok(())
@@ -523,9 +523,9 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
             if let Err(error)=recovered {log.line(&format!("{slug}: coordinator prime recovery: {error:#}"));continue;}
             let recovered=(||->Result<()> {
                 let state=steps::try_load_state(&project)?;
-                if state.notification_claim.as_ref().is_some_and(|c|c.phase==herdr_projects::notification_claim::Phase::Pending)
+                if state.notification_claim.as_ref().is_some_and(|c|c.phase==herdr_farm::notification_claim::Phase::Pending)
                     ||(state.notification_claim.is_none()&&!state.notification_retry.hash.is_empty()&&state.notification_retry.retry.attempts>0) {
-                    let guard=herdr_projects::execution_guard::ProjectGuard::acquire(&project.dir())?;
+                    let guard=herdr_farm::execution_guard::ProjectGuard::acquire(&project.dir())?;
                     crate::coordinator_jobs::recover_notification(&project,&guard)?;
                 }Ok(())
             })();
@@ -533,11 +533,11 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
             let (threads,diagnostics)=thread::list_with_diagnostics(&project);
             for error in diagnostics {log.line(&format!("{slug}: {error}"));}
             if threads.iter().any(|t|t.launch_claim.as_ref().is_some_and(|claim|claim.phase==thread::launch_delivery::Phase::Pending||!claim.notified)) {
-                let recovered=(||->Result<()> {let guard=herdr_projects::execution_guard::ProjectGuard::acquire(&project.dir())?;thread::launch_delivery::recover(&project,&guard)})();
+                let recovered=(||->Result<()> {let guard=herdr_farm::execution_guard::ProjectGuard::acquire(&project.dir())?;thread::launch_delivery::recover(&project,&guard)})();
                 if let Err(error)=recovered {log.line(&format!("{slug}: launch recovery: {error:#}"));continue;}
             }
             if threads.iter().any(|t|t.prompt_claim.as_ref().is_some_and(|claim|claim.phase==thread::prompt_delivery::Phase::Pending||!claim.notified)) {
-                let recovered=(||->Result<()> {let guard=herdr_projects::execution_guard::ProjectGuard::acquire(&project.dir())?;thread::prompt_delivery::recover(&project,&guard)})();
+                let recovered=(||->Result<()> {let guard=herdr_farm::execution_guard::ProjectGuard::acquire(&project.dir())?;thread::prompt_delivery::recover(&project,&guard)})();
                 if let Err(error)=recovered {log.line(&format!("{slug}: brief recovery: {error:#}"));continue;}
             }
             for t in &threads {
@@ -578,10 +578,10 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
                     if let Some(error)=result.operation_error {log.line(&format!("{slug}: canonical operation: {error}"));}
                 }
                 Err(error)=>{
-                    if let Some(store)=error.downcast_ref::<herdr_projects::store::StoreError>() {
-                        let _=herdr_projects::watchdog::note(&ctx.root.join(slug),store);
-                        if let Some(reason)=herdr_projects::watchdog::cause(store) {
-                            log.line(&herdr_projects::watchdog::admission_log_line(reason,None,0));
+                    if let Some(store)=error.downcast_ref::<herdr_farm::store::StoreError>() {
+                        let _=herdr_farm::watchdog::note(&ctx.root.join(slug),store);
+                        if let Some(reason)=herdr_farm::watchdog::cause(store) {
+                            log.line(&herdr_farm::watchdog::admission_log_line(reason,None,0));
                         }
                     }
                     memory.canonical_effects_unknown=true;log.line(&format!("{slug}: canonical controller: {error:#}"));
@@ -590,7 +590,7 @@ pub fn tick(ctx: &Ctx, log: &Log, memory: &mut Memory) -> bool {
             // Isolated workers submit through their attempt's spool: ingest
             // each pending request through the store's own submission path.
             #[cfg(target_os="linux")]
-            match herdr_projects::submission_spool::ingest(&ctx.root.join(slug)) {
+            match herdr_farm::submission_spool::ingest(&ctx.root.join(slug)) {
                 Ok(lines)=>for line in lines {log.line(&format!("{slug}: {line}"));},
                 Err(error)=>log.line(&format!("{slug}: submission spool: {error:#}")),
             }
@@ -672,7 +672,7 @@ static TELEMETRY_START:std::sync::OnceLock<Instant>=std::sync::OnceLock::new();
 #[cfg(feature="state-store")]
 static TELEMETRY_RUNNING:std::sync::Mutex<Option<std::thread::JoinHandle<()>>>=std::sync::Mutex::new(None);
 #[cfg(feature="state-store")]
-static TELEMETRY_DERIVED:std::sync::Mutex<Option<herdr_projects::telemetry::background::DeferredLanes>>=std::sync::Mutex::new(None);
+static TELEMETRY_DERIVED:std::sync::Mutex<Option<herdr_farm::telemetry::background::DeferredLanes>>=std::sync::Mutex::new(None);
 // Graceful shutdown preserves a whole telemetry pass, but crash-safe work must
 // not keep the ticker alive indefinitely if a lane stalls.
 #[cfg(feature="state-store")]
@@ -716,14 +716,14 @@ struct TelemetryTimes {observed:Option<u64>,collected:Option<Instant>}
 /// Schedule after controller services; never wait for an unfinished worker.
 #[cfg(feature="state-store")]
 fn telemetry_pass(ctx:&Ctx,log:&Log,session:&str) {
-    use herdr_projects::telemetry::{codex,operating,sidecar};
+    use herdr_farm::telemetry::{codex,operating,sidecar};
     // Canonical effects can shorten controller ticks to 250 ms. Neither the
     // project scan nor operating writes should follow that accelerated cadence.
     static SCAN:std::sync::Mutex<Option<(Instant,u64)>>=std::sync::Mutex::new(None);
     // Last operating sample and collection, respectively; only this scheduler
     // touches these clocks, so the worker never holds a scheduling mutex.
     static LAST:std::sync::Mutex<std::collections::BTreeMap<PathBuf,TelemetryTimes>>=std::sync::Mutex::new(std::collections::BTreeMap::new());
-    let secs=ctx.env.var("HERDR_PROJECTS_TELEMETRY_COLLECT_SECS").and_then(|v|v.parse().ok()).unwrap_or(300u64);
+    let secs=ctx.env.var("HERDR_FARM_TELEMETRY_COLLECT_SECS").and_then(|v|v.parse().ok()).unwrap_or(300u64);
     if secs==0 {return;}
     let Ok(mut running)=TELEMETRY_RUNNING.lock() else {return};
     if running.as_ref().is_some_and(|pass|!pass.is_finished()) {return;}
@@ -747,7 +747,7 @@ fn telemetry_pass(ctx:&Ctx,log:&Log,session:&str) {
         }
         if collected.is_none_or(|at|at.elapsed()>=Duration::from_secs(secs)) {
             let configured=existing || match codex::collection_configured(&project).and_then(|native| {
-                if native {Ok(true)} else {herdr_projects::telemetry::otlp::configured(&project,&ctx.config_dir)}
+                if native {Ok(true)} else {herdr_farm::telemetry::otlp::configured(&project,&ctx.config_dir)}
             }) {
                 Ok(configured)=>configured,
                 Err(error)=>{log.line(&format!("{slug}: telemetry sources: {error:#}"));false},
@@ -762,24 +762,24 @@ fn telemetry_pass(ctx:&Ctx,log:&Log,session:&str) {
     let scheduled_observations=observations.clone();
     let scheduled_collection=due.as_ref().map(|(_,project,existing,_)|(project.clone(),*existing));
     let pass=std::thread::Builder::new().name("telemetry-pass".into()).spawn(move||{
-        herdr_projects::telemetry::background::idle_priority(|warning|line.line(warning));
+        herdr_farm::telemetry::background::idle_priority(|warning|line.line(warning));
         for (slug,project) in &observations {
             if let Err(error)=operating::observe_project(project,&session,TICK.as_millis() as i64) {line.line(&format!("{slug}: operating observation: {error:#}"));}
         }
         let Some((slug,project,existing,_))=due else {return};
-        if let Err(error)=herdr_projects::telemetry::otlp::start_configured(&project,&otlp_config) {line.line(&format!("{slug}: OTLP config: {error}"));}
+        if let Err(error)=herdr_farm::telemetry::otlp::start_configured(&project,&otlp_config) {line.line(&format!("{slug}: OTLP config: {error}"));}
         if let Err(error)=codex::collect(&project,codex::Budget::TICK,false) {line.line(&format!("{slug}: telemetry collect: {error:#}"));}
         // A source-backed collect can opt a previously untouched project in.
         // Start its observed prefix now, without backfilling any earlier time.
         if !existing&&sidecar::path(&project).is_file()
             && let Err(error)=operating::observe_project(&project,&session,TICK.as_millis() as i64) {line.line(&format!("{slug}: operating observation: {error:#}"));}
-        if let Err(error)=herdr_projects::telemetry::accounting::tick(&project,codex::Budget::TICK) {line.line(&format!("{slug}: telemetry accounting tick: {error:#}"));}
+        if let Err(error)=herdr_farm::telemetry::accounting::tick(&project,codex::Budget::TICK) {line.line(&format!("{slug}: telemetry accounting tick: {error:#}"));}
         if let Ok(mut derived)=TELEMETRY_DERIVED.lock() {
             if derived.is_none() {
                 let derived_log=line.clone();
-                match herdr_projects::telemetry::background::DeferredLanes::new(move |project| {
-                    herdr_projects::telemetry::background::idle_priority(|warning|derived_log.line(warning));
-                    for lane in herdr_projects::telemetry::LANES.iter().filter(|lane|lane.stream!="accounting") {
+                match herdr_farm::telemetry::background::DeferredLanes::new(move |project| {
+                    herdr_farm::telemetry::background::idle_priority(|warning|derived_log.line(warning));
+                    for lane in herdr_farm::telemetry::LANES.iter().filter(|lane|lane.stream!="accounting") {
                         if let Err(error)=(lane.tick)(project,codex::Budget::TICK) {derived_log.line(&format!("{}: telemetry {} tick: {error:#}",project.display(),lane.stream));}
                     }
                 }) {
@@ -805,21 +805,21 @@ fn telemetry_pass(ctx:&Ctx,log:&Log,session:&str) {
     }
 }
 /// Whole-store check off the ticker's pass: at most once per interval per
-/// project (default one hour, `HERDR_PROJECTS_INTEGRITY_CHECK_SECS`), on its
+/// project (default one hour, `HERDR_FARM_INTEGRITY_CHECK_SECS`), on its
 /// own thread and connection with its own budget (default 30 s,
-/// `HERDR_PROJECTS_INTEGRITY_CHECK_BUDGET_MS`). An unfinished check records
+/// `HERDR_FARM_INTEGRITY_CHECK_BUDGET_MS`). An unfinished check records
 /// its progress and resumes on a later pass; the pass never waits for it.
 #[cfg(feature="state-store")]
 fn integrity_pass(ctx:&Ctx,log:&Log,slug:&str) {
-    use herdr_projects::migration::{integrity_check_due,periodic_integrity_check,IntegrityOutcome};
+    use herdr_farm::migration::{integrity_check_due,periodic_integrity_check,IntegrityOutcome};
     static RUNNING:std::sync::Mutex<std::collections::BTreeMap<PathBuf,std::thread::JoinHandle<()>>>=std::sync::Mutex::new(std::collections::BTreeMap::new());
-    let interval=Duration::from_secs(ctx.env.var("HERDR_PROJECTS_INTEGRITY_CHECK_SECS").and_then(|v|v.parse().ok()).unwrap_or(3600));
-    let budget=Duration::from_millis(ctx.env.var("HERDR_PROJECTS_INTEGRITY_CHECK_BUDGET_MS").and_then(|v|v.parse().ok()).unwrap_or(30_000));
+    let interval=Duration::from_secs(ctx.env.var("HERDR_FARM_INTEGRITY_CHECK_SECS").and_then(|v|v.parse().ok()).unwrap_or(3600));
+    let budget=Duration::from_millis(ctx.env.var("HERDR_FARM_INTEGRITY_CHECK_BUDGET_MS").and_then(|v|v.parse().ok()).unwrap_or(30_000));
     let project=ctx.root.join(slug);
     let Ok(mut running)=RUNNING.lock() else {return};
     if running.get(&project).is_some_and(|check|!check.is_finished()) || !integrity_check_due(&project,interval) {return;}
     // A single table still has a hard limit, so a stuck read cannot pin the thread.
-    let control=herdr_projects::store::controlled::ReadControl::new(Instant::now()+budget.max(Duration::from_secs(30)).saturating_mul(10),Default::default());
+    let control=herdr_farm::store::controlled::ReadControl::new(Instant::now()+budget.max(Duration::from_secs(30)).saturating_mul(10),Default::default());
     let (line,slug,path)=(log.clone(),slug.to_owned(),project.clone());
     let check=std::thread::Builder::new().name("integrity-check".into()).spawn(move||{let log=line;match periodic_integrity_check(&path,interval,budget,control) {
         Ok(IntegrityOutcome::Corrupt)=>log.line(&format!("{slug}: store integrity check failed; admission and effect dispatch paused (integrity_check_failed); preserve the store and restore it, never auto-repair")),
@@ -844,7 +844,7 @@ fn admit_background(_ctx:&Ctx,log:&Log,memory:&mut Memory,canonical:Vec<PathBuf>
     #[cfg(all(feature="state-store",target_os="linux"))]
     if let Some(queue)=memory.copy_jobs.as_mut() {
         let reads=memory.canonical_observations.as_ref();
-        for error in queue.admit_verifier(|project|!reads.is_some_and(|reads|reads.pending_project(project))&&herdr_projects::watchdog::effects_paused(Path::new(project)).is_none()){log.line(&error);}
+        for error in queue.admit_verifier(|project|!reads.is_some_and(|reads|reads.pending_project(project))&&herdr_farm::watchdog::effects_paused(Path::new(project)).is_none()){log.line(&error);}
     }
     // The exclusive slot is still one ticket. Declared transfers may already be
     // running; top those up without admitting a launch or a routine beside them.
@@ -1060,7 +1060,7 @@ fn tick_cheap(ctx: &Ctx, project: &Project) -> Result<Option<Seen>> {tick_cheap_
 fn tick_cheap_reports(ctx: &Ctx, project: &Project,mut reads:Option<&mut crate::local_reports::Reads>,mut copies:Option<&mut crate::copy_jobs::Queue>,observations:Option<&mut crate::local_observations::Reads>) -> Result<Option<Seen>> {
     let lease = crate::cleanup::lease(&ctx.root);
     let _project_guard = if lease.is_err() {
-        Some(herdr_projects::execution_guard::ProjectGuard::acquire(&project.dir())?)
+        Some(herdr_farm::execution_guard::ProjectGuard::acquire(&project.dir())?)
     } else {None};
     if project.try_status()? != Status::Active { return Ok(None); }
     status_observation::deliver(project)?;
@@ -1461,7 +1461,7 @@ mod tests {
         std::fs::write(f.project.dir().join(".state/ticker.json"),state).unwrap();
         let runner=FakeRunner::new();runner.on("agent list",ok(&with_cwd(AGENT_READY,&f)));runner.on("pane list",ok(&with_cwd(PANE,&f)));
         let ctx=Ctx{env:&f.env,root:f.root.clone(),config_dir:f.root.join("cfg"),runner:&runner,detached_ticker:false};
-        let guard=herdr_projects::execution_guard::ProjectGuard::acquire(&other.dir()).unwrap();
+        let guard=herdr_farm::execution_guard::ProjectGuard::acquire(&other.dir()).unwrap();
         assert!(tick_cheap(&ctx,&f.project).unwrap().is_some());
         let current=thread::load(&f.project,&t.id).unwrap();assert_eq!(current.last_state,"idle");assert_eq!(current.last_group,"idle");assert_eq!(current.status_notice_sequence,1);assert!(current.pending_status_notice.is_none());
         assert!(current.report_hash.is_empty() && current.last_review_item_hash.is_empty());
@@ -1469,7 +1469,7 @@ mod tests {
         assert_eq!(runner.calls.borrow().len(),2);assert_eq!(std::fs::read(f.project.dir().join(".state/ticker.json")).unwrap(),state);
         assert!(tick_cheap(&ctx,&f.project).unwrap().is_some());assert_eq!(thread::load(&f.project,&t.id).unwrap().status_notice_sequence,1);
         // Same-project ownership and exclusive root maintenance still refuse.
-        let own=herdr_projects::execution_guard::ProjectGuard::acquire(&f.project.dir()).unwrap();assert!(tick_cheap(&ctx,&f.project).is_err());drop(own);drop(guard);
+        let own=herdr_farm::execution_guard::ProjectGuard::acquire(&f.project.dir()).unwrap();assert!(tick_cheap(&ctx,&f.project).is_err());drop(own);drop(guard);
         let root=crate::cleanup::lease(&f.root).unwrap();assert!(tick_cheap(&ctx,&f.project).is_err());drop(root);
     }
 

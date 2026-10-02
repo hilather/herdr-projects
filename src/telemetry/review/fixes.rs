@@ -15,7 +15,7 @@ const OPERATOR: &str = "operator:cli";
 const TRIAGE_AUTHORITY: &str = "operator_owner.v1";
 const DAY_MS: i64 = 86_400_000;
 
-/// `herdr-projects telemetry <slug> review fixes ...`
+/// `herdr-farm telemetry <slug> review fixes ...`
 #[derive(clap::Subcommand)]
 pub enum FixesCommand {
     /// Findings' remediation, resolution intervals, reopenings and role

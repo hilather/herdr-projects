@@ -15,7 +15,7 @@ deletes abort. Analytics only: never read to grant launch.
   the attempt's retained effective profile (no `LaunchInputs` change).
 - 0052 gives every attempt that exists at migration one `predates_binding`
   revision (`source = migration_0052`).
-- `herdr-projects telemetry <slug> collectors revoke <attempt>` appends a
+- `herdr-farm telemetry <slug> collectors revoke <attempt>` appends a
   `revoked` revision (copying collector and home) and prints
   `{binding, written}`. Revoking a revoked binding writes nothing
   (`written: false`); an attempt without a binding or with `predates_binding`
@@ -137,7 +137,7 @@ Unknown top-level kinds are skipped by `type` without reading further and are
 not quarantined. A partial last line still waits for its newline. Before A3
 such lines were skipped without a record.
 
-**Capabilities.** `herdr-projects telemetry <slug> collectors capabilities
+**Capabilities.** `herdr-farm telemetry <slug> collectors capabilities
 [--json]` reads nothing and creates no file. It prints `{adapters: [{adapter,
 interface, certified_versions, uncertified_version, fields}]}` with one entry
 per field, `{kind, field, available, basis, certified, caveat, reason}`:
@@ -341,7 +341,7 @@ of five: `parent_thread_id`, `depth`, `agent_path`, `agent_nickname`,
   fields (absent ones as `null`) with `measurement.normalization_version` 2;
   other kinds stay at 1. An envelope with the same `event_id` and a lower
   normalization version is superseded in place, not a `digest_conflict`.
-- `herdr-projects telemetry <slug> collectors sessions` (read-only, JSON):
+- `herdr-farm telemetry <slug> collectors sessions` (read-only, JSON):
   per rollout source `{session_id, path_digest, binding, attempt_id,
   records, model_provider, forked_from_id, subagent {kind,
   parent_thread_id, depth}, record_times {stored, timed, first_unix_ms,
@@ -385,7 +385,7 @@ Same harness and isolation as [codex-live-0.154.0.md](codex-live-0.154.0.md)
 session run one shell command and, where the profile allows, spawn one
 subagent and trigger one auto-review. Then, from the disposable root:
 
-1. `herdr-projects --root <d>/root telemetry demo collect`, then
+1. `herdr-farm --root <d>/root telemetry demo collect`, then
    `collectors sessions`, `usage --json`, `collectors capabilities`.
 2. A key census of every rollout, printing structure only (never values):
 
@@ -661,7 +661,7 @@ replace it.
   `codex.custom_tool_call_output.v1`, `codex.function_call_output.v1` and
   `codex.item_completed.v1`. An `item_completed` payload always holds every
   allowlisted path, `null` outside `CommandExecution`.
-- `herdr-projects telemetry <slug> collectors tools [--json]` (read-only):
+- `herdr-farm telemetry <slug> collectors tools [--json]` (read-only):
   per session `{session_id, attempt_ids (bound), tool_calls: [{call_id,
   call_kind, name, status, turn_id, called_unix_ms, output_kind,
   output_unix_ms, call_to_output_ms}], exec_items: [{item_id, thread_id,

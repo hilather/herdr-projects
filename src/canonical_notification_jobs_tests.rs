@@ -1,6 +1,6 @@
 use super::*;
 use std::{fs,os::unix::{fs::PermissionsExt,net::UnixListener}};
-use herdr_projects::{domain::{RuntimeRoute,ProjectState},operations::DeliveryState};
+use herdr_farm::{domain::{RuntimeRoute,ProjectState},operations::DeliveryState};
 struct Fixture {world:crate::scenarios::World,path:PathBuf,env:Env,operation:Operation,_socket:UnixListener}
 impl Fixture {
     fn new(mode:&str)->Self {
@@ -45,7 +45,7 @@ print(json.dumps({{'id':'wrong' if mode=='foreign' else request['id'],'result':r
     }
     fn ctx(&self)->Ctx<'_>{Ctx{env:&self.env,root:self.world.root.clone(),config_dir:self.world.ctx().config_dir,runner:&crate::runner::RealRunner,detached_ticker:false}}
     fn input(&self)->Input{let snapshot=runtime::snapshot(&self.path).unwrap();let binding=snapshot.runtime_bindings.iter().find(|b|b.id=="coordinator").unwrap();serde_json::from_str(request(&self.ctx(),&self.path,&self.operation,1,&binding.identity.socket).unwrap().command.stdin.as_deref().unwrap()).unwrap()}
-    fn delivery(&self)->herdr_projects::operations::Delivery{runtime::snapshot(&self.path).unwrap().deliveries.into_iter().find(|d|d.operation==self.operation.id).unwrap()}
+    fn delivery(&self)->herdr_farm::operations::Delivery{runtime::snapshot(&self.path).unwrap().deliveries.into_iter().find(|d|d.operation==self.operation.id).unwrap()}
 }
 fn control()->Control{Control{deadline:Instant::now()+BUDGET,cancellation:Default::default()}}
 

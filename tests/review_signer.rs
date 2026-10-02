@@ -10,12 +10,12 @@
 
 mod support;
 
-use herdr_projects::{authority, domain::*, migration, runtime};
+use herdr_farm::{authority, domain::*, migration, runtime};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{fs, os::unix::fs::{MetadataExt, PermissionsExt}, path::{Path, PathBuf}, process::{Command, Output, Stdio}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 const GRANT_NS: &str = "code-review-authority@herdr-projects";
 const REVOKE_NS: &str = "code-review-revocation@herdr-projects";
 const AUTHOR_ATTEMPT: &str = "author-attempt-0001";
@@ -29,7 +29,7 @@ const POLICY_2: &str = "{\n  \"schema\": \"review_signer_policy.v1\",\n  \"revis
 const POLICY_2_DIGEST: &str = "sha256:47539cd4a2be3403818a548417036c514b2ea7c60306f74c20861a9c3c116ec0";
 
 /// An active project with an owner key in a temporary `HOME` (its pinned
-/// configuration at `HOME/.config/herdr-projects/config.toml`), a SHA-256
+/// configuration at `HOME/.config/herdr-farm/config.toml`), a SHA-256
 /// repository, the queued task `work` bound to a (never started) Herdr route
 /// and the `worker` profile (Claude, execution home `HOME/agent-home`).
 struct Lab { home: tempfile::TempDir, project: PathBuf, key: PathBuf, repo: PathBuf, profile: VersionedReference, binding: String }
@@ -45,7 +45,7 @@ impl Lab {
         let key = home.path().join("owner");
         assert!(Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).output().unwrap().status.success());
         let public = fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
-        let config = home.path().join(".config/herdr-projects/config.toml");
+        let config = home.path().join(".config/herdr-farm/config.toml");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         fs::write(&config, format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[profiles.worker]\nkind='claude'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=600\nunknown_usage='allow_with_warning'\n")).unwrap();
         for dir in ["repo", "bin", "agent-home", "lab"] { fs::create_dir(home.path().join(dir)).unwrap(); }
@@ -66,7 +66,7 @@ impl Lab {
         let revision = runtime::snapshot(&lab.project).unwrap().tasks.into_iter().find(|t| t.id == id).unwrap().revision;
         lab.binding = runtime::create_binding(&lab.project, Some(&id), Some(revision), lab.head(), &route).unwrap().binding.id;
         let state = runtime::snapshot(&lab.project).unwrap();
-        let observations = state.runtime_bindings.iter().map(|binding| herdr_projects::reconcile::RuntimeObservation { binding: binding.id.clone(), binding_revision: binding.revision,
+        let observations = state.runtime_bindings.iter().map(|binding| herdr_farm::reconcile::RuntimeObservation { binding: binding.id.clone(), binding_revision: binding.revision,
             task_revision: binding.task.as_ref().map(|id| state.tasks.iter().find(|t| &t.id == id).unwrap().revision),
             observed_unix_ms: jiff::Timestamp::now().as_millisecond(), collector: "herdr-git-v2".into(),
             config_digest: migration::config_reference(&config).unwrap().digest.clone(), ..Default::default() }).collect::<Vec<_>>();
@@ -128,7 +128,7 @@ impl Lab {
     /// Prepare `worker` over the lab binaries; only the native interaction
     /// evidence, which needs a real agent session, is planted.
     fn prepare_profile(&mut self) {
-        use herdr_projects::worker_supervision::{ProcessIncarnation, SupervisorIdentity};
+        use herdr_farm::worker_supervision::{ProcessIncarnation, SupervisorIdentity};
         let prepared = self.ok(&["profile", "prepare", "demo", "worker", "--herdr-executable", self.path("bin/herdr").to_str().unwrap(),
             "--agent-executable", self.path("bin/claude").to_str().unwrap(), "--execution-home", self.path("agent-home").to_str().unwrap()]);
         let mut profile: FrozenProfile = serde_json::from_value(prepared["profile"].clone()).unwrap();
@@ -249,7 +249,7 @@ impl Lab {
         let signature = self.sign(&self.key, GRANT_NS, file);
         self.ok(&["telemetry", "demo", "review", "authority", "import", file.to_str().unwrap(), &signature])["grant"]["grant_id"].as_str().unwrap().to_owned()
     }
-    fn signer_dir(&self, token: &str) -> PathBuf { self.path(".config/herdr-projects/review-signer").join(token) }
+    fn signer_dir(&self, token: &str) -> PathBuf { self.path(".config/herdr-farm/review-signer").join(token) }
 }
 
 fn mode(path: &Path) -> u32 { fs::symlink_metadata(path).unwrap().mode() & 0o777 }
@@ -398,7 +398,7 @@ fn signer_refuses_bad_key_permissions_worker_context_and_revoked_grants() {
         let out = lab.cli_in(&agent_home, &all);
         assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("worker execution context"), "{}", String::from_utf8_lossy(&out.stderr));
     }
-    assert!(!agent_home.join(".config/herdr-projects/review-signer").exists());
+    assert!(!agent_home.join(".config/herdr-farm/review-signer").exists());
     assert_eq!(lab.decisions(), 0, "every refusal decided nothing");
 
     // A grant naming carol with someone else's key is never used by this signer.
@@ -456,7 +456,7 @@ fn signer_refuses_bad_key_permissions_worker_context_and_revoked_grants() {
 /// The same probe as the owner, outside the sandbox, reads the key.
 #[test]
 fn isolated_worker_cannot_read_the_signer_key() {
-    use herdr_projects::worker_supervision::{Isolation, isolated_gated_command};
+    use herdr_farm::worker_supervision::{Isolation, isolated_gated_command};
     use std::io::Write;
     let lab = Lab::new();
     let world = lab.review_world();
@@ -470,9 +470,9 @@ fn isolated_worker_cannot_read_the_signer_key() {
     // directory under /tmp (the sandbox's private scratch directory) beside
     // an owner secret: the binary is exposed as the file itself, read-only,
     // and the sibling stays hidden.
-    let bin_tmp = tempfile::Builder::new().prefix("herdr-projects-bin-").tempdir_in("/tmp").unwrap();
+    let bin_tmp = tempfile::Builder::new().prefix("herdr-farm-bin-").tempdir_in("/tmp").unwrap();
     let bin_dir = bin_tmp.path().canonicalize().unwrap();
-    let bin = bin_dir.join("herdr-projects");
+    let bin = bin_dir.join("herdr-farm");
     std::os::unix::fs::symlink(Path::new(BIN).canonicalize().unwrap(), &bin).unwrap();
     let sibling = bin_dir.join("owner-secret");
     fs::write(&sibling, "SENTINEL-BIN-SIBLING\n").unwrap();
@@ -486,12 +486,12 @@ fn isolated_worker_cannot_read_the_signer_key() {
     let owner = Command::new("/bin/sh").args(["-c", &probe]).env_clear().env("HOME", lab.home.path()).env("PATH", "/usr/bin:/bin").output().unwrap();
     let owner = String::from_utf8_lossy(&owner.stdout).into_owned();
     assert!(owner.contains(&format!("READ {}", key.display())) && owner.contains(&body), "{owner}");
-    assert!(owner.contains(&format!("READ {}", sibling.display())) && owner.contains("BINLIST herdr-projects owner-secret"), "{owner}");
+    assert!(owner.contains(&format!("READ {}", sibling.display())) && owner.contains("BINLIST herdr-farm owner-secret"), "{owner}");
     assert!(owner.contains("BIN-WRITABLE"), "the owner's control writes its binary:\n{owner}");
 
     let home = lab.path("agent-home").canonicalize().unwrap();
     let cwd = lab.repo.canonicalize().unwrap();
-    let config = lab.path(".config/herdr-projects/config.toml");
+    let config = lab.path(".config/herdr-farm/config.toml");
     // This test's own binary is not the product binary: name it, as the
     // controller's `current_exe` is named in production.
     let isolation = Isolation::for_agent(&lab.project, &home, &cwd, Path::new("/bin/sh"), &[cwd.as_path()], &[], Some(&config), Some(&lab.path("lab/native.sock")), &[])
@@ -504,7 +504,7 @@ fn isolated_worker_cannot_read_the_signer_key() {
     let report = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(!report.contains(&body) && !report.contains("PRIVATE KEY"), "the signer key reached the worker:\n{report}");
     assert!(!report.contains("SENTINEL-BIN-SIBLING") && !report.contains("BIN-WRITABLE"), "{report}");
-    assert!(report.contains("\nBINLIST herdr-projects\n"), "only the binary is visible in its directory:\n{report}");
+    assert!(report.contains("\nBINLIST herdr-farm\n"), "only the binary is visible in its directory:\n{report}");
     for path in [&key, &dir.join("policy.json"), &dir.join("audit.jsonl"), &sibling] {
         assert!(report.contains(&format!("DENIED {}", path.display())), "{} was readable:\n{report}", path.display());
     }

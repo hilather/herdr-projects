@@ -113,7 +113,7 @@ may only be shortened.
 
 <!-- transcript: classes -->
 ```text
-$ herdr-projects telemetry demo maintenance classes
+$ herdr-farm telemetry demo maintenance classes
 retention.v1
 sidecar.operating_intervals retain - source_of_truth destructive
 sidecar.otlp retain - source_of_truth destructive
@@ -151,7 +151,7 @@ still apply; the tombstone reason is `operator_deletion`).
 
 <!-- transcript: plan -->
 ```text
-$ herdr-projects telemetry demo maintenance plan
+$ herdr-farm telemetry demo maintenance plan
 plan retention.v1 demo items=1 destructive=1 digest=sha256:<digest>
 sidecar.normalized_sessions 90d destructive: eligible=1 blocked=0 held=0
   delete session:00000000-0000-4000-8000-00000000c0de
@@ -167,8 +167,8 @@ optin.external_export_files 7d destructive: eligible=0 blocked=0 held=0
 
 <!-- transcript: apply-unconfirmed -->
 ```text
-$ herdr-projects telemetry demo maintenance apply
-herdr-projects: apply would delete 1 destructive item(s); review `maintenance plan` and pass --confirm sha256:<digest>
+$ herdr-farm telemetry demo maintenance apply
+herdr-farm: apply would delete 1 destructive item(s); review `maintenance plan` and pass --confirm sha256:<digest>
 ```
 
 A hold blocks deletion of its class (or `all`) and optional scope (a
@@ -179,7 +179,7 @@ deleted session's id; a scope shaped like a credential is refused.
 
 <!-- transcript: hold-add -->
 ```text
-$ herdr-projects telemetry demo maintenance hold add --class sidecar.normalized_sessions --scope 00000000-0000-4000-8000-00000000c0de --reason "litigation hold 42"
+$ herdr-farm telemetry demo maintenance hold add --class sidecar.normalized_sessions --scope 00000000-0000-4000-8000-00000000c0de --reason "litigation hold 42"
 {
   "class": "sidecar.normalized_sessions",
   "hold_id": "hold-1",
@@ -193,7 +193,7 @@ $ herdr-projects telemetry demo maintenance hold add --class sidecar.normalized_
 
 <!-- transcript: plan-held -->
 ```text
-$ herdr-projects telemetry demo maintenance plan
+$ herdr-farm telemetry demo maintenance plan
 plan retention.v1 demo items=0 destructive=0 digest=sha256:<digest>
 sidecar.normalized_sessions 90d destructive: eligible=0 blocked=0 held=1
   held session:00000000-0000-4000-8000-00000000c0de (hold-1)
@@ -209,7 +209,7 @@ optin.external_export_files 7d destructive: eligible=0 blocked=0 held=0
 
 <!-- transcript: hold-release -->
 ```text
-$ herdr-projects telemetry demo maintenance hold release hold-1 --reason "released by counsel"
+$ herdr-farm telemetry demo maintenance hold release hold-1 --reason "released by counsel"
 {
   "hold_id": "hold-1",
   "release_reason": "released by counsel",
@@ -225,7 +225,7 @@ finishes an interrupted earlier run), and records the run in
 
 <!-- transcript: apply -->
 ```text
-$ herdr-projects telemetry demo maintenance apply --confirm sha256:<digest>
+$ herdr-farm telemetry demo maintenance apply --confirm sha256:<digest>
 applied digest=sha256:<digest> tombstones_added=2
   deleted sidecar.normalized_sessions session:00000000-0000-4000-8000-00000000c0de
 ```
@@ -307,7 +307,7 @@ are not secure deletion.
 
 <!-- transcript: backup-create -->
 ```text
-$ herdr-projects telemetry demo backup create --out <tmp>/backup-2026-09-30
+$ herdr-farm telemetry demo backup create --out <tmp>/backup-2026-09-30
 {
   "backup_id": "sha256:<digest>",
   "canonical_store": "not included: back up state.db with the canonical procedure",
@@ -341,7 +341,7 @@ file digest without restoring:
 
 <!-- transcript: backup-verify -->
 ```text
-$ herdr-projects telemetry demo backup verify --from <tmp>/backup-2026-09-30
+$ herdr-farm telemetry demo backup verify --from <tmp>/backup-2026-09-30
 {
   "backup_id": "sha256:<digest>",
   "files": [
@@ -389,7 +389,7 @@ $ herdr-projects telemetry demo backup verify --from <tmp>/backup-2026-09-30
 
 <!-- transcript: restore -->
 ```text
-$ herdr-projects telemetry demo backup restore --from <tmp>/backup-2026-09-30
+$ herdr-farm telemetry demo backup restore --from <tmp>/backup-2026-09-30
 {
   "backup_created_unix_ms": <unix_ms>,
   "backup_id": "sha256:<digest>",
@@ -525,3 +525,5 @@ space for the rewrite. No automatic destructive retention is introduced:
 the reviewed plan and confirmed apply. Active/held sessions and retained
 valuation/latest history can grow indefinitely. Certificate-scale §4.15 records
 the 100k storage, default-retention and vacuum measurements.
+
+Compatibility: legacy environment variables and existing data/config locations remain supported; see [renaming](../renaming.md).

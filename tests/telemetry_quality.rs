@@ -1,6 +1,6 @@
 //! Lane C quality proxies end to end: a real reserved attempt plus planted
 //! submissions and pinned-CI runs over a real Git repository, observed with
-//! `herdr-projects telemetry <slug> quality collect` and read with `quality report`.
+//! `herdr-farm telemetry <slug> quality collect` and read with `quality report`.
 
 #![cfg(all(feature = "state-store", target_os = "linux"))]
 #![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
@@ -252,7 +252,7 @@ fn group_arms_fixed_before_outcomes_and_losers_keep_cost() {
     plant_profile(&db_path, fast);
     plant_profile(&db_path, codex_profile(&f.config, "claude", "claude", None));
     {
-        let mut db = herdr_projects::store::SqliteStore::open(&db_path).unwrap();
+        let mut db = herdr_farm::store::SqliteStore::open(&db_path).unwrap();
         let snapshot = db.read_snapshot(None).unwrap();
         db.set_scheduler_policy(snapshot.head, snapshot.scheduler.unwrap().policy.revision, 1, 5).unwrap();
     }
@@ -671,8 +671,8 @@ fn a_worker_cannot_create_a_group_or_select_its_own_arm() {
     let mut planted = Planted::default();
     planted.group(&f, "g", 1, &["codex", "fast"], &["rej", "acc"]);
     let group = planted.ids["g"].clone();
-    let mut store = herdr_projects::store::SqliteStore::open(&db_path).unwrap();
-    let choice = herdr_projects::store::SelectionChoice::Arm { arm: 1, submission: None, runner_up: vec![] };
+    let mut store = herdr_farm::store::SqliteStore::open(&db_path).unwrap();
+    let choice = herdr_farm::store::SelectionChoice::Arm { arm: 1, submission: None, runner_up: vec![] };
     for principal in ["worker:g-a1", "g-a1", "import:bot"] {
         let err = format!("{:?}", store.select_candidate(&group, &choice, "operator_judgment", principal, unix_ms()).unwrap_err());
         assert!(err.contains("cannot select a candidate"), "{principal}: {err}");

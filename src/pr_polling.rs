@@ -55,7 +55,7 @@ mod tests {
     #[test]
     #[cfg(feature="state-store")]
     fn merged_pr_observation_and_restart_cannot_satisfy_canonical_dependencies() {
-        use herdr_projects::{domain::*,migration};
+        use herdr_farm::{domain::*,migration};
         use std::{fs,os::unix::fs::PermissionsExt};
         let root=tempfile::tempdir().unwrap();
         let project=crate::project::create(&root.path().join("projects"),"demo","",vec![]).unwrap();project.set_status(crate::project::Status::Paused).unwrap();

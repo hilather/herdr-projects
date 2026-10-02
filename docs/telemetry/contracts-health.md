@@ -198,7 +198,7 @@ subject the rule, empty body, one-line summary of labels and reason codes
 only, e.g.
 
 ```
-telemetry health warn: quota_headroom [services service=codex] headroom_low; advisory — `herdr-projects telemetry demo health alerts`
+telemetry health warn: quota_headroom [services service=codex] headroom_low; advisory — `herdr-farm telemetry demo health alerts`
 ```
 
 The alert then records `notified_unix_ms`/`notice_id`, so a second run, a

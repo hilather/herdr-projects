@@ -5,7 +5,7 @@ from pathlib import Path
 if len(sys.argv)!=4:
  raise SystemExit('usage: scripts/test-factory-package PACKAGE_DIRECTORY PRIOR_BINARY PRIOR_SHA256')
 repo=Path(__file__).resolve().parent.parent
-package=Path(sys.argv[1]).resolve();binary=package/'herdr-projects'
+package=Path(sys.argv[1]).resolve();binary=package/'herdr-farm'
 legacy=Path(sys.argv[2]).resolve();prior=sys.argv[3]
 assert hashlib.sha256(legacy.read_bytes()).hexdigest()==prior
 subprocess.run(['sha256sum','-c','SHA256SUMS'],cwd=package,check=True,capture_output=True)

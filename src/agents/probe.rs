@@ -125,7 +125,7 @@ fn identity(path: &Path, control: &Control) -> Result<Identity> {
 }
 
 fn version(kind: &str, text: &str) -> Option<String> {
-    herdr_projects::profile_config::observed_version(kind, text)
+    herdr_farm::profile_config::observed_version(kind, text)
 }
 
 #[cfg(test)]

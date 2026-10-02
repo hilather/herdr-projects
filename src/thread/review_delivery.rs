@@ -1,13 +1,13 @@
 //! Prepare review intent under the record lock; replay delivery independently.
 use super::*;
-use herdr_projects::review_notice::ReviewNotice;
+use herdr_farm::review_notice::ReviewNotice;
 
 pub fn validate(t: &Thread) -> Result<()> {
     anyhow::ensure!(t.review_notice_sequence <= i64::MAX as u64, "review sequence exhausted");
     if let Some(notice) = &t.pending_review_notice { notice.validate(&t.id,t.review_notice_sequence)?; }
     Ok(())
 }
-fn receipt(t: &Thread) -> Option<&herdr_projects::copy_receipt::CopyReceipt> {
+fn receipt(t: &Thread) -> Option<&herdr_farm::copy_receipt::CopyReceipt> {
     t.copy_receipt.as_ref().filter(|r|r.execution == execution_fingerprint(t) && r.report_hash == t.report_hash)
 }
 fn due(t: &Thread) -> bool {

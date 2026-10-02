@@ -1,4 +1,4 @@
-use herdr_projects::execution_guard::GatedSpawn;
+use herdr_farm::execution_guard::GatedSpawn;
 use super::*;
 use std::{fs,os::unix::{fs::PermissionsExt,net::UnixListener}};
 struct Fixture {root:tempfile::TempDir,p:Project,t:Thread,input:Input,_socket:UnixListener}
@@ -35,7 +35,7 @@ elif r['method']=='pane.list':
  result={{'panes':[] if mode=='no-pane' else [a,a] if mode=='duplicate-pane' else [a]}}
 elif r['method']=='pane.report_metadata':
  assert set(r['params'])=={{'pane_id','source','ttl_ms','tokens'}}
- assert r['params']['pane_id']=='p' and r['params']['source']=='herdr-projects' and r['params']['ttl_ms']==300000
+ assert r['params']['pane_id']=='p' and r['params']['source']=='herdr-farm' and r['params']['ttl_ms']==300000
  with open(root/'sent','a') as f:f.write(json.dumps(r['params'])+'\n')
  if mode=='lost':sys.exit(1)
  if mode=='blocked':time.sleep(60)

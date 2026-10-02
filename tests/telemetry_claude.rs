@@ -415,7 +415,7 @@ fn claude_model_identifiers_and_planted_secret_conformance() {
 
 #[test]
 fn otlp_request_fallback_yields_to_later_native_attempt_source() {
-    use herdr_projects::telemetry::otlp;
+    use herdr_farm::telemetry::otlp;
     for native_first in [false, true] {
         let f = claude();
         f.cli("collect");
@@ -455,7 +455,7 @@ fn otlp_request_fallback_yields_to_later_native_attempt_source() {
 
 #[test]
 fn accepted_otlp_cannot_hide_an_uncertified_native_surface() {
-    use herdr_projects::telemetry::otlp;
+    use herdr_farm::telemetry::otlp;
     let f = claude();
     transcript(&f, SID, &f.worktree(), "2.1.99", f.decided + 1000);
     f.cli("collect");

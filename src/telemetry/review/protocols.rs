@@ -16,7 +16,7 @@ const OPERATOR: &str = "operator:cli";
 const TRIAGE_AUTHORITY: &str = "operator_owner.v1";
 const MAX_DEFINITION_BYTES: u64 = 8 * 1024;
 
-/// `herdr-projects telemetry <slug> review protocols ...`
+/// `herdr-farm telemetry <slug> review protocols ...`
 #[derive(clap::Subcommand)]
 pub enum ProtocolsCommand {
     /// Register a versioned review protocol from a `review_protocol.v1` JSON file.
@@ -51,7 +51,7 @@ pub enum ProtocolsCommand {
     },
 }
 
-/// `herdr-projects telemetry <slug> review experiments ...`
+/// `herdr-farm telemetry <slug> review experiments ...`
 #[derive(clap::Subcommand)]
 pub enum ExperimentsCommand {
     /// Preregister an experiment from a `review_experiment.v1` JSON file (frozen).

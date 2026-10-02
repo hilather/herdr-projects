@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{fs, os::unix::fs::PermissionsExt, path::{Path, PathBuf}, process::{Command, Output, Stdio}, time::{Duration, Instant}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 const FAKE_HERDR: &str = r#"#!/bin/sh
 printf '%s\n' "$*" >> "$HOME/herdr-calls"
@@ -239,7 +239,7 @@ fn report_review_ack_and_resolve_copy_home() {
     assert_eq!(resolved["status"].as_str(), Some("resolved"));
     assert_eq!(lab.list()["t-0001"], ("Resolved".to_string(), "manual".to_string()));
     // Resolving takes the thread's labels off its pane.
-    let clear = "pane report-metadata w0:p2 --source herdr-projects --clear-token project --clear-token thread --clear-token review --clear-token rank --clear-token telemetry";
+    let clear = "pane report-metadata w0:p2 --source herdr-farm --clear-token project --clear-token thread --clear-token review --clear-token rank --clear-token telemetry";
     assert!(lab.calls().lines().any(|l| l == clear), "{}", lab.calls());
 }
 
@@ -318,7 +318,7 @@ fn start_restart_and_adopt_write_briefs_branches_and_launch_line() {
     for (pane, id) in [("w1:p1", "t-0001"), ("w2:p1", "t-0002")] {
         // TM4.8: the sidebar suffix names the agent and unavailable usage coverage, never a number.
         let agent = lab.record(id)["agent"].as_str().unwrap().to_owned();
-        let line = format!("pane report-metadata {pane} --source herdr-projects --ttl-ms 300000 --token project=demo --token thread={id} --token review=working --token rank=3 --token telemetry={agent} ○");
+        let line = format!("pane report-metadata {pane} --source herdr-farm --ttl-ms 300000 --token project=demo --token thread={id} --token review=working --token rank=3 --token telemetry={agent} ○");
         assert!(calls.lines().any(|l| l == line), "{line}\n{calls}");
     }
 
@@ -501,7 +501,7 @@ fn reprime_updates_only_the_priming_fields_of_the_coordinator_record() {
 #[test]
 fn thread_start_uses_agent_arguments_only_for_the_kind_they_are_bound_to() {
     let lab = Lab::new();
-    let config = lab.path(".config/herdr-projects/config.toml");
+    let config = lab.path(".config/herdr-farm/config.toml");
     fs::create_dir_all(config.parent().unwrap()).unwrap();
     let safety = format!("[safety.{:?}]\n", lab.project().canonicalize().unwrap().display().to_string());
     fs::write(lab.path("task.md"), "Do the thing.").unwrap();

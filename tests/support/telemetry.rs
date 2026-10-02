@@ -1,13 +1,13 @@
 //! Shared telemetry test fixture: a real reserved Codex attempt and helpers
-//! to write rollouts and run `herdr-projects telemetry` on the CLI. Used by
+//! to write rollouts and run `herdr-farm telemetry` on the CLI. Used by
 //! every telemetry test crate through `mod support;`.
 #![allow(dead_code)] // Each test crate uses a different subset.
 
-use herdr_projects::{domain::*, store::SqliteStore};
+use herdr_farm::{domain::*, store::SqliteStore};
 use sha2::{Digest, Sha256};
 use std::{fs, path::{Path, PathBuf}, process::Command};
 
-pub const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+pub const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 pub const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/telemetry/codex-0.154.0");
 pub const SID: &str = "00000000-0000-4000-8000-00000000c0de";
 /// sha256 of the canonical payloads, computed with `sha256sum` outside the crate.
@@ -15,7 +15,7 @@ pub const DIGEST_1: &str = "sha256:c56c0b798f22b872890b69470f332d6be530384c7f5d5
 pub const DIGEST_2: &str = "sha256:6c2dcf23c84488655ff53556237af61da2717e13172cdf50dad886d53e84be41";
 pub const DIGEST_2B: &str = "sha256:49f430f4555d26b959282f29656f343ad7e239dadf49714298b21d46e61e698f";
 
-pub struct Fixture { pub tmp: tempfile::TempDir, pub root: PathBuf, pub project: PathBuf, pub home: PathBuf, pub attempt: String, pub decided: i64, pub config: herdr_projects::migration::ConfigReference }
+pub struct Fixture { pub tmp: tempfile::TempDir, pub root: PathBuf, pub project: PathBuf, pub home: PathBuf, pub attempt: String, pub decided: i64, pub config: herdr_farm::migration::ConfigReference }
 
 impl Fixture {
     /// Project `demo` with one attempt reserved by automatic admission on a Codex
@@ -47,7 +47,7 @@ impl Fixture {
         fs::create_dir_all(base.join("home")).unwrap();
         let db_path = project.join(".state/state.db");
         fs::write(base.join("owner.toml"), "version = 1\n").unwrap();
-        let config = herdr_projects::migration::config_reference(&base.join("owner.toml")).unwrap();
+        let config = herdr_farm::migration::config_reference(&base.join("owner.toml")).unwrap();
         let digest = config.digest.clone().unwrap();
         let mut db = SqliteStore::create(&db_path).unwrap();
         let id = TaskId::new("work").unwrap();
@@ -60,9 +60,9 @@ impl Fixture {
         db.set_scheduler_policy(snapshot.head, snapshot.scheduler.unwrap().policy.revision, 1, 3).unwrap();
         let snapshot = db.read_snapshot(None).unwrap();
         let binding = &snapshot.runtime_bindings[0];
-        db.record_observations(snapshot.head, &[herdr_projects::reconcile::RuntimeObservation { binding: binding.id.clone(), binding_revision: binding.revision,
+        db.record_observations(snapshot.head, &[herdr_farm::reconcile::RuntimeObservation { binding: binding.id.clone(), binding_revision: binding.revision,
             task_revision: Some(snapshot.tasks[0].revision), observed_unix_ms: unix_ms(), collector: "herdr-git-v1".into(), config_digest: Some(digest.clone()),
-            ..herdr_projects::reconcile::RuntimeObservation::default() }]).unwrap();
+            ..herdr_farm::reconcile::RuntimeObservation::default() }]).unwrap();
         let snapshot = db.read_snapshot(None).unwrap();
         db.set_project_state(snapshot.head, snapshot.control.unwrap().revision, ProjectState::Active, unix_ms(), Some(&digest)).unwrap();
         drop(db);
@@ -71,9 +71,9 @@ impl Fixture {
         // Fixture only. Production code has no writer for this column.
         rusqlite::Connection::open(&db_path).unwrap().execute("UPDATE project_control SET factory_admission='on' WHERE singleton=1", []).unwrap();
         worker_snapshots(&project, None);
-        let inputs = herdr_projects::admission::prepared_admission_inputs(&project).unwrap().expect("a ready candidate");
+        let inputs = herdr_farm::admission::prepared_admission_inputs(&project).unwrap().expect("a ready candidate");
         insert_grant(&db_path, &inputs);
-        herdr_projects::admission::admit_once(&project).unwrap();
+        herdr_farm::admission::admit_once(&project).unwrap();
         let (attempt, decided) = rusqlite::Connection::open(&db_path).unwrap()
             .query_row("SELECT attempt_id,decided_unix_ms FROM dispatch_decisions", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         plant_profile(&db_path, codex_profile(&config, "codex", "other", Some(&base.join("other-home"))));
@@ -162,17 +162,17 @@ impl Fixture {
         db.record_native_capability_evidence(unix_ms(), unix_ms() + 3_600_000).unwrap();
         drop(db);
         worker_snapshots(&self.project, Some(profile));
-        let inputs = herdr_projects::admission::prepared_admission_inputs(&self.project).unwrap().expect("a ready candidate");
+        let inputs = herdr_farm::admission::prepared_admission_inputs(&self.project).unwrap().expect("a ready candidate");
         assert_eq!(inputs.effective_profile.as_ref().unwrap().name, profile);
         insert_grant(&db_path, &inputs);
-        herdr_projects::admission::admit_once(&self.project).unwrap();
+        herdr_farm::admission::admit_once(&self.project).unwrap();
         assert_eq!(rusqlite::Connection::open(&db_path).unwrap().query_row("SELECT count(*) FROM attempts WHERE state='reserved'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
     }
 }
 
 pub fn unix_ms() -> i64 { jiff::Timestamp::now().as_millisecond() }
 
-pub fn codex_profile(config: &herdr_projects::migration::ConfigReference, kind: &str, name: &str, home: Option<&Path>) -> FrozenProfile {
+pub fn codex_profile(config: &herdr_farm::migration::ConfigReference, kind: &str, name: &str, home: Option<&Path>) -> FrozenProfile {
     let evidence = VersionedReference { id: "sim-evidence".into(), revision: 1, digest: "a".repeat(64) };
     let supported = CapabilityEvidence::Supported { evidence: evidence.clone() };
     FrozenProfile {
@@ -216,7 +216,7 @@ pub fn worker_snapshots(project: &Path, only: Option<&str>) {
         let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM memory_snapshots WHERE task_id='work' AND task_revision=?1 AND profile_name=?2)",
             rusqlite::params![revision, profile.name], |r| r.get(0)).unwrap();
         if exists { continue; }
-        let mut memory = herdr_projects::memory::MemoryStore::from_sqlite(SqliteStore::open(&db_path).unwrap(), project.join(".state/objects"));
+        let mut memory = herdr_farm::memory::MemoryStore::from_sqlite(SqliteStore::open(&db_path).unwrap(), project.join(".state/objects"));
         memory.create_worker_snapshot(SnapshotRequest { schema_version: 1, task_id: "work".into(), profile: profile.name.clone(), domains: vec![], paths: vec![], pinned_keys: vec![], sensitivity: "default".into() },
             &profile.name, &profile.definition_digest, profile.config.digest.as_deref(), 32000, "Factory fixture instructions", unix_ms(), None).unwrap();
     }

@@ -1,5 +1,5 @@
 //! TM4.4 configuration comparisons and experiment reports end to end
-//! (docs/telemetry/contracts-evaluation.md), through `herdr-projects
+//! (docs/telemetry/contracts-evaluation.md), through `herdr-farm
 //! telemetry` on the CLI over planted canonical and sidecar rows. Expected
 //! values are hand-computed from plan docs 07 §6 and 10 §5a; bootstrap bounds
 //! come from an independent Python SplitMix64 oracle with exact fractions
@@ -11,7 +11,7 @@
 
 mod support;
 
-use herdr_projects::store::SqliteStore;
+use herdr_farm::store::SqliteStore;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{fs, path::PathBuf, process::Command};

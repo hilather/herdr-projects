@@ -1,7 +1,7 @@
 //! Cross-binary fixture: the library test owns native processes and canonical
 //! reservations with internally prepared approvals; this binary drives the real controller queue and executor.
 use super::*;
-use herdr_projects::operations::DeliveryState;
+use herdr_farm::operations::DeliveryState;
 use std::{fs,path::PathBuf,sync::Arc,time::{Duration,Instant}};
 
 #[test]
@@ -35,7 +35,7 @@ fn enabled_dispatch_fixture_driver() {
         assert!(Instant::now()<deadline,"enabled dispatch timed out: {errors:?}");
         errors.extend(queue.drain());
         let states=projects.iter().map(|p|runtime::snapshot(p).unwrap()).collect::<Vec<_>>();
-        let started=|s:&herdr_projects::domain::Snapshot|s.events.iter().any(|e|e.kind=="runtime.launch_started");
+        let started=|s:&herdr_farm::domain::Snapshot|s.events.iter().any(|e|e.kind=="runtime.launch_started");
         if started(&states[1])&&!started(&states[0]) {observed_other_before_retry=true;}
         let ready=states[..2].iter().all(|s|s.deliveries.iter().any(|d|d.state==DeliveryState::Confirmed&&s.operations.iter().any(|o|o.id==d.operation&&o.kind=="runtime.worker_brief")));
         if ready&&!cancellation_sent&&!queue.pending() {
@@ -44,7 +44,7 @@ fn enabled_dispatch_fixture_driver() {
             // cancellation solely from durable records through a fresh queue.
             queue=crate::copy_jobs::Queue::new(pool.clone());
             for (path,state) in projects[..2].iter().zip(&states) {
-                let record=&state.attempt_inputs[0];let output=herdr_projects::domain::worker_output_path(&record.inputs,&record.attempt).unwrap();
+                let record=&state.attempt_inputs[0];let output=herdr_farm::domain::worker_output_path(&record.inputs,&record.attempt).unwrap();
                 fs::create_dir_all(Path::new(&output).join("library")).unwrap();fs::write(Path::new(&output).join("report.md"),b"controller fixture report").unwrap();fs::write(Path::new(&output).join("library/result"),[0,255,7]).unwrap();
                 migration::open_active(path).unwrap().cancel_attempt(&state.attempts[0].id,state.attempts[0].revision,state.head,"stop controller fixture",jiff::Timestamp::now().as_millisecond()).unwrap();
             }
@@ -61,12 +61,12 @@ fn enabled_dispatch_fixture_driver() {
     assert!(observed_other_before_retry,"lost acknowledgment monopolized controller admission: {errors:?}");
     for path in &projects[..2] {
         let state=runtime::snapshot(path).unwrap();assert!(state.attempts[0].termination_observed&&!state.attempts[0].retains_capacity());
-        assert_eq!(state.tasks[0].state,herdr_projects::domain::TaskState::Cancelled);
-        let stop:herdr_projects::domain::WorkerTerminationReceipt=serde_json::from_value(state.events.iter().find(|e|e.kind=="runtime.worker_terminated").unwrap().payload.clone()).unwrap();
+        assert_eq!(state.tasks[0].state,herdr_farm::domain::TaskState::Cancelled);
+        let stop:herdr_farm::domain::WorkerTerminationReceipt=serde_json::from_value(state.events.iter().find(|e|e.kind=="runtime.worker_terminated").unwrap().payload.clone()).unwrap();
         assert!(stop.output_snapshot.as_ref().unwrap().digest.is_some());
         assert_eq!(stop.repository_snapshots.len(),state.attempt_inputs[0].inputs.repositories.len());
         let binding=state.runtime_bindings.iter().find(|b|b.id==stop.binding).unwrap();
-        let saved=herdr_projects::worktree_preservation::load_binding_outputs(path,&state,binding,&herdr_projects::source_tree::Control::default()).unwrap().unwrap();
+        let saved=herdr_farm::worktree_preservation::load_binding_outputs(path,&state,binding,&herdr_farm::source_tree::Control::default()).unwrap().unwrap();
         for (name,bytes) in [("report.md",b"controller fixture report".as_slice()),("library/result",&[0,255,7])] {
             let entry=saved.manifest().entries.iter().find(|e|e.path==name).unwrap();assert_eq!(saved.bytes(entry).unwrap(),bytes);
         }
@@ -125,14 +125,14 @@ print(json.dumps({{'result':result}}))
             let states=projects.iter().map(|p|runtime::snapshot(p).unwrap()).collect::<Vec<_>>();
             let pending=memory.copy_jobs.as_ref().unwrap().pending();
             let briefs=states[..2].iter().all(|s|s.deliveries.iter().any(|d|d.state==DeliveryState::Confirmed&&s.operations.iter().any(|o|o.id==d.operation&&o.kind=="runtime.worker_brief")));
-            let observed=states.iter().enumerate().all(|(n,s)|s.observations.iter().any(|o|o.collector=="herdr-git-v2"&&(n==2||o.pane==herdr_projects::reconcile::ResourceState::Present)));
+            let observed=states.iter().enumerate().all(|(n,s)|s.observations.iter().any(|o|o.collector=="herdr-git-v2"&&(n==2||o.pane==herdr_farm::reconcile::ResourceState::Present)));
             if briefs&&observed&&!stopped&&!pending {
                 // Drain the entire production executor and restart ticker memory.
                 memory.pr_reads.as_mut().unwrap().stop().unwrap();
                 memory=crate::ticker::background_memory(&ctx).unwrap();
                 for path in &projects[..2] {
                     let state=runtime::snapshot(path).unwrap();let record=&state.attempt_inputs[0];
-                    let source=herdr_projects::domain::worker_output_path(&record.inputs,&record.attempt).unwrap();fs::create_dir_all(&source).unwrap();fs::write(Path::new(&source).join("report.md"),b"ticker result").unwrap();
+                    let source=herdr_farm::domain::worker_output_path(&record.inputs,&record.attempt).unwrap();fs::create_dir_all(&source).unwrap();fs::write(Path::new(&source).join("report.md"),b"ticker result").unwrap();
                     migration::open_active(path).unwrap().cancel_attempt(&record.attempt,state.attempts[0].revision,state.head,"ticker restart cancellation",jiff::Timestamp::now().as_millisecond()).unwrap();
                 }
                 stopped=true;
@@ -146,8 +146,8 @@ print(json.dumps({{'result':result}}))
     assert!(root.join(".maintenance-probes").is_file());
     for path in &projects[..2] {
         let state=runtime::snapshot(path).unwrap();assert!(!state.attempts[0].retains_capacity());
-        assert_eq!(state.tasks[0].state,herdr_projects::domain::TaskState::Cancelled);
-        let outputs=herdr_projects::worktree_preservation::load_binding_outputs(path,&state,&state.runtime_bindings[0],&herdr_projects::source_tree::Control::default()).unwrap().unwrap();
+        assert_eq!(state.tasks[0].state,herdr_farm::domain::TaskState::Cancelled);
+        let outputs=herdr_farm::worktree_preservation::load_binding_outputs(path,&state,&state.runtime_bindings[0],&herdr_farm::source_tree::Control::default()).unwrap().unwrap();
         let report=outputs.manifest().entries.iter().find(|e|e.path=="report.md").unwrap();assert_eq!(outputs.bytes(report).unwrap(),b"ticker result");
     }
     let state=runtime::snapshot(&projects[2]).unwrap();assert!(state.approvals.iter().all(|a|a.consumed.is_none()));
@@ -163,7 +163,7 @@ fn live_dispatch_workflow_driver() {
     let initial=runtime::snapshot(&project).unwrap();assert_eq!(initial.attempts.len(),1);
     let input=&initial.attempt_inputs[0];let profile=input.inputs.effective_profile.as_ref().unwrap();
     assert_eq!(profile.kind,"codex");
-    let output=PathBuf::from(herdr_projects::domain::worker_output_path(&input.inputs,&input.attempt).unwrap());
+    let output=PathBuf::from(herdr_farm::domain::worker_output_path(&input.inputs,&input.attempt).unwrap());
     assert!(!output.exists(),"outputs must not be supplied by the fixture");
     let home=tempfile::tempdir().unwrap();
     let env=crate::paths::Env::for_test(home.path(),&[("HERDR_BIN_PATH",&profile.herdr.path)]);
@@ -198,19 +198,19 @@ fn live_dispatch_workflow_driver() {
     assert!(restarted&&cancelled);
     let state=runtime::snapshot(&project).unwrap();
     assert!(!state.attempts[0].retains_capacity());
-    assert_eq!(state.tasks[0].state,herdr_projects::domain::TaskState::Cancelled);
+    assert_eq!(state.tasks[0].state,herdr_farm::domain::TaskState::Cancelled);
     for kind in ["runtime.launch_creation","runtime.launch_release","runtime.launch_started","runtime.worker_terminated"] {
         assert_eq!(state.events.iter().filter(|e|e.kind==kind).count(),1,"{kind}");
     }
     let brief=state.operations.iter().find(|o|o.kind=="runtime.worker_brief").unwrap();
     assert_eq!(state.deliveries.iter().find(|d|d.operation==brief.id).unwrap().attempts,1);
-    let stop:herdr_projects::domain::WorkerTerminationReceipt=serde_json::from_value(state.events.iter().find(|e|e.kind=="runtime.worker_terminated").unwrap().payload.clone()).unwrap();
+    let stop:herdr_farm::domain::WorkerTerminationReceipt=serde_json::from_value(state.events.iter().find(|e|e.kind=="runtime.worker_terminated").unwrap().payload.clone()).unwrap();
     assert!(stop.output_snapshot.as_ref().unwrap().digest.is_some());
-    assert!(herdr_projects::worker_supervision::SupervisorObservation::recover_exited(&stop.supervisor).unwrap());
+    assert!(herdr_farm::worker_supervision::SupervisorObservation::recover_exited(&stop.supervisor).unwrap());
     // Delete only the disposable output source, then prove receipt-bound recovery.
     assert!(output.starts_with(project.join(".state/worker-output")));fs::remove_dir_all(&output).unwrap();
     let binding=state.runtime_bindings.iter().find(|b|b.id==stop.binding).unwrap();
-    let saved=herdr_projects::worktree_preservation::load_binding_outputs(&project,&state,binding,&herdr_projects::source_tree::Control::default()).unwrap().unwrap();
+    let saved=herdr_farm::worktree_preservation::load_binding_outputs(&project,&state,binding,&herdr_farm::source_tree::Control::default()).unwrap().unwrap();
     for (name,bytes) in [("report.md",b"CANONICAL_RETAINED_MEMORY_OK\n".as_slice()),("library/result.txt",b"CANONICAL_WORKER_RESULT_OK\n".as_slice())] {
         let entry=saved.manifest().entries.iter().find(|e|e.path==name).unwrap();assert_eq!(saved.bytes(entry).unwrap(),bytes);
     }

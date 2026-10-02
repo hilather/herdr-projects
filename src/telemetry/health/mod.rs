@@ -23,7 +23,7 @@ pub const STREAM: &str = "health";
 pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/health/0001_health_alerts.sql")];
 pub const CONTRACT: &str = "telemetry-health.v1";
 
-/// `herdr-projects telemetry <slug> health [...]`
+/// `herdr-farm telemetry <slug> health [...]`
 #[derive(clap::Args, Clone, Debug)]
 pub struct Args {
     #[command(subcommand)]
@@ -108,7 +108,7 @@ fn alerts_text(v: &Value) -> String {
     out
 }
 
-/// `herdr-projects telemetry <slug> health ...`
+/// `herdr-farm telemetry <slug> health ...`
 pub fn run(project: &Path, config_dir: &Path, args: Args) -> Result<String> {
     let pretty = |v: &Value| -> Result<String> { Ok(serde_json::to_string_pretty(v)? + "\n") };
     match args.command {
@@ -133,7 +133,7 @@ pub fn run(project: &Path, config_dir: &Path, args: Args) -> Result<String> {
     }
 }
 
-/// `herdr-projects telemetry <slug> recommend ...`
+/// `herdr-farm telemetry <slug> recommend ...`
 pub fn run_recommend(project: &Path, args: &recommend::Args) -> Result<String> {
     let v = recommend::run(project, args)?;
     Ok(if args.json { serde_json::to_string_pretty(&v)? + "\n" } else { recommend::text(&v) })

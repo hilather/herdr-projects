@@ -3,7 +3,7 @@
 //! outside every worker, and holds one reviewer key in
 //! `<config_dir>/review-signer/<token>/` (directory 0700, key 0600), a
 //! directory the canonical worker sandbox hides (`worker_supervision::Isolation`
-//! hides `~/.config/herdr-projects` and `<pinned config dir>/review-signer`).
+//! hides `~/.config/herdr-farm` and `<pinned config dir>/review-signer`).
 //! It decides completed reviews only under an installed owner-signed
 //! `code_review` grant whose subject key is its own, by an owner-configured,
 //! versioned, mechanical policy (never the review's content), and submits
@@ -37,7 +37,7 @@ const DEFAULT_POLICY: &str = "{\n  \"schema\": \"review_signer_policy.v1\",\n  \
 const MAX_PER_PASS: u32 = 128;
 const MAX_POLICY_BYTES: u64 = 4096;
 
-/// `herdr-projects telemetry <slug> review signer ...`
+/// `herdr-farm telemetry <slug> review signer ...`
 #[derive(clap::Subcommand)]
 pub enum SignerCommand {
     /// Generate the signer's Ed25519 key in `<config_dir>/review-signer/<token>/`,

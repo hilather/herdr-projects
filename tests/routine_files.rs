@@ -6,7 +6,7 @@
 use serde_json::{json, Value};
 use std::{fs, os::unix::{fs::PermissionsExt, net::UnixListener}, path::PathBuf, process::{Command, Output, Stdio}, time::{Duration, Instant}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 /// One session: lists `$HOME/agents` and `$HOME/panes`, and acknowledges
 /// nothing else (no test here needs an effect).
@@ -55,8 +55,8 @@ impl Lab {
     fn routine(&self, name: &str, text: &str) { fs::write(self.project().join(format!("routines/{name}.md")), text).unwrap(); }
     fn safety(&self, routine_commands: bool) {
         let canonical = fs::canonicalize(self.project()).unwrap();
-        fs::create_dir_all(self.path(".config/herdr-projects")).unwrap();
-        fs::write(self.path(".config/herdr-projects/config.toml"), format!("[safety.{:?}]\nroutine_commands = {routine_commands}\n", canonical.display().to_string())).unwrap();
+        fs::create_dir_all(self.path(".config/herdr-farm")).unwrap();
+        fs::write(self.path(".config/herdr-farm/config.toml"), format!("[safety.{:?}]\nroutine_commands = {routine_commands}\n", canonical.display().to_string())).unwrap();
     }
     fn list(&self) -> Vec<String> { self.ok(&["routine", "list", "demo"]).lines().map(str::to_string).collect() }
     /// A reachable coordinator session for the project, idle in pane `p`.
@@ -174,7 +174,7 @@ fn routine_approve_refuses_without_a_terminal() {
         assert!(stderr.contains("must be run by a person at a terminal"), "{stderr}");
         assert!(!String::from_utf8_lossy(&out.stdout).contains("echo hi"), "the command was shown for approval");
     }
-    assert!(!lab.path(".config/herdr-projects/approved-routines.json").exists());
+    assert!(!lab.path(".config/herdr-farm/approved-routines.json").exists());
     assert_eq!(lab.list(), ["watch\tevery 1m\tenabled\tcommand: NOT approved (or edited since approval)"]);
 }
 

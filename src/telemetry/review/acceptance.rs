@@ -16,7 +16,7 @@ pub(super) const AUTHORITY: &str = "delegated_code_review.v1";
 /// Why acceptance is unavailable on a store without the authority tables.
 pub(super) const ABSENT: &str = "review_authority_absent";
 
-/// `herdr-projects telemetry <slug> review authority ...`
+/// `herdr-farm telemetry <slug> review authority ...`
 #[derive(clap::Subcommand)]
 pub enum AuthorityCommand {
     /// Install an owner-signed `code_review` grant (`code_review_authority.v1`,

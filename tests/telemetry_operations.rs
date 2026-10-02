@@ -1,5 +1,5 @@
 //! TM5.3 retention, deletion, backup and restore end to end, through
-//! `herdr-projects telemetry <slug> maintenance|backup` on the CLI over a real
+//! `herdr-farm telemetry <slug> maintenance|backup` on the CLI over a real
 //! reserved Codex attempt, hand-written rollouts and planted canonical rows
 //! (docs/telemetry/operations-runbook.md, plan doc 09). Expected values are
 //! hand-computed from the fixtures (two usage records 1000/120 and 500/60,
@@ -47,7 +47,7 @@ fn class<'a>(plan: &'a Value, id: &str) -> &'a Value {
 }
 
 fn config(f: &Fixture) -> PathBuf {
-    let dir = f.tmp.path().join("home/.config/herdr-projects");
+    let dir = f.tmp.path().join("home/.config/herdr-farm");
     fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -255,7 +255,7 @@ fn current_sidecar_opens_while_a_collector_holds_the_write_lock() {
     let tx = writer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
     // The public writable-open path must not request a migration write lock
     // on an already current store. The collector retains its lock throughout.
-    let opened = herdr_projects::telemetry::sidecar::open(&f.project, false).unwrap().unwrap();
+    let opened = herdr_farm::telemetry::sidecar::open(&f.project, false).unwrap().unwrap();
     let totals: (i64, i64) = opened.query_row("SELECT sum(input_tokens),sum(output_tokens) FROM usage_entries WHERE basis='delta'", [],
         |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
     assert_eq!(totals, (1500, 180));
@@ -428,8 +428,8 @@ fn backup_restore_reapplies_tombstones_and_never_writes_canonical_state() {
     // again dedupes, nothing is new usage and nothing is quarantined.
     let g = collected();
     let observed = unix_ms();
-    herdr_projects::telemetry::operating::observe(&g.project,"backup-run",true,1,observed-1000,1000).unwrap();
-    herdr_projects::telemetry::operating::observe(&g.project,"backup-run",true,1,observed,1000).unwrap();
+    herdr_farm::telemetry::operating::observe(&g.project,"backup-run",true,1,observed-1000,1000).unwrap();
+    herdr_farm::telemetry::operating::observe(&g.project,"backup-run",true,1,observed,1000).unwrap();
     let before = g.report();
     let out = g.tmp.path().join("backup-2");
     json_of(&g, &["backup", "create", "--out", out.to_str().unwrap()]);
@@ -728,7 +728,7 @@ fn runbook_transcripts_are_the_fixture_run() {
         let out = command(&f, args, None, None);
         assert_eq!(out.status.success(), expect_ok, "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
         let shown = args.iter().map(|a| if a.contains(' ') { format!("\"{a}\"") } else { (*a).to_owned() }).collect::<Vec<_>>().join(" ");
-        let text = format!("$ herdr-projects telemetry demo {shown}\n{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let text = format!("$ herdr-farm telemetry demo {shown}\n{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         transcripts.push((name, normalize(&text, &f)));
         String::from_utf8_lossy(&out.stdout).into_owned()
     };
@@ -824,7 +824,7 @@ fn compact_storage_upgrade_preserves_envelopes_lineage_and_pinned_answers() {
         UPDATE telemetry_streams SET version=15 WHERE stream='accounting';
         PRAGMA user_version=3;
         COMMIT;").unwrap();
-    let db = herdr_projects::telemetry::sidecar::open(&f.project, false).unwrap().unwrap();
+    let db = herdr_farm::telemetry::sidecar::open(&f.project, false).unwrap().unwrap();
     assert!(!db.prepare("PRAGMA foreign_key_check").unwrap().exists([]).unwrap());
     drop(db);
     assert_eq!(logical_rows(&f, envelopes_sql), envelopes);

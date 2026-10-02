@@ -35,7 +35,7 @@ mod actions;
 mod agents;
 mod artifacts;
 #[cfg(all(feature = "state-store", target_os = "linux"))]
-use herdr_projects::source_tree;
+use herdr_farm::source_tree;
 #[cfg(not(all(feature = "state-store", target_os = "linux")))]
 mod source_tree;
 mod copy_jobs;
@@ -53,7 +53,7 @@ mod coordinator;
 mod coordinator_jobs;
 mod notification_inventory;
 mod doctor;
-use herdr_projects::herdr;
+use herdr_farm::herdr;
 mod inbox;
 mod lifecycle;
 mod overview;
@@ -114,18 +114,18 @@ fn main() {
     if std::env::args().nth(1).as_deref() == Some("verification-setup") {
         #[cfg(all(feature = "state-store", target_os = "linux"))]
         {
-            let code = herdr_projects::verification::setup_main();
+            let code = herdr_farm::verification::setup_main();
             std::process::exit(code);
         }
         #[cfg(not(all(feature = "state-store", target_os = "linux")))]
         {
-            eprintln!("herdr-projects: verification-setup requires Linux state-store");
+            eprintln!("herdr-farm: verification-setup requires Linux state-store");
             std::process::exit(72);
         }
     }
     extend_path();
     if let Err(error) = cli::run() {
-        eprintln!("herdr-projects: {error:#}");
+        eprintln!("herdr-farm: {error:#}");
         std::process::exit(1);
     }
 }

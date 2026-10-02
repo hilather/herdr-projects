@@ -33,8 +33,8 @@ impl Owner {
     pub fn command_line(&self, slug: &str) -> String {
         let quote = |a: &String| if !a.is_empty() && a.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.:/#=,".contains(&b)) { a.clone() } else { format!("'{}'", a.replace('\'', "'\\''")) };
         match self {
-            Owner::Quality(args) => format!("herdr-projects telemetry {slug} quality {}", args.iter().map(quote).collect::<Vec<_>>().join(" ")),
-            Owner::Replay(args) => format!("herdr-projects replay {slug} {}", args.iter().map(quote).collect::<Vec<_>>().join(" ")),
+            Owner::Quality(args) => format!("herdr-farm telemetry {slug} quality {}", args.iter().map(quote).collect::<Vec<_>>().join(" ")),
+            Owner::Replay(args) => format!("herdr-farm replay {slug} {}", args.iter().map(quote).collect::<Vec<_>>().join(" ")),
         }
     }
 

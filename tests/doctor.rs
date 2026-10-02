@@ -5,7 +5,7 @@
 //! and gh are fakes; git, ssh and rsync are the real tools.
 use std::{fs, os::unix::fs::PermissionsExt, path::{Path, PathBuf}, process::{Command, Output}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 fn script(path: &Path, body: &str) {
     fs::write(path, body).unwrap();

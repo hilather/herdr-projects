@@ -3,7 +3,7 @@ use std::{path::{Path,PathBuf},os::unix::fs::MetadataExt,sync::Arc,time::{Durati
 use anyhow::{Result,Context,ensure};
 use serde::{Serialize,Deserialize};
 use crate::{executor::{Identity,Lane,Request},paths::{self,Ctx},project::{self,Project},runner::{Cmd,Output,Runner,InheritedLock},source_tree::Control,thread::{self,Thread}};
-use herdr_projects::execution_guard::ProjectGuard;
+use herdr_farm::execution_guard::ProjectGuard;
 #[path="brief_jobs_ownership.rs"]
 pub(crate) mod ownership;
 #[path="launch_jobs.rs"]
@@ -47,7 +47,7 @@ impl Input {
 }
 fn run(mut cmd:Cmd,control:&Control,locks:&[InheritedLock])->Result<serde_json::Value> {
     control.check()?;cmd.capture_limit=1024*1024;
-    let out=herdr_projects::supervision::run(cmd,control.deadline,control.cancellation.clone(),locks)?;
+    let out=herdr_farm::supervision::run(cmd,control.deadline,control.cancellation.clone(),locks)?;
     control.check()?;ensure!(out.success(),"supervised brief command failed");
     let reply:serde_json::Value=serde_json::from_str(&out.stdout)?;
     ensure!(reply.get("error").is_none()&&reply.get("result").is_some(),"brief command did not return success");Ok(reply["result"].clone())
@@ -55,7 +55,7 @@ fn run(mut cmd:Cmd,control:&Control,locks:&[InheritedLock])->Result<serde_json::
 fn check_route(input:&Input,control:&Control,locks:&[InheritedLock])->Result<()> {
     let Some(remote)=&input.remote else{return Ok(());};
     control.check()?;let mut cmd=Cmd::new(&input.herdr,crate::remote::SSH_TIMEOUT).args(["machine","list","--json"]);cmd.capture_limit=1024*1024;
-    let output=herdr_projects::supervision::run(cmd,control.deadline,control.cancellation.clone(),locks)?;control.check()?;
+    let output=herdr_farm::supervision::run(cmd,control.deadline,control.cancellation.clone(),locks)?;control.check()?;
     let current=crate::remote_api::resolve(&output,&remote.selector)?;
     ensure!(remote.route.same_destination(&current),"remote brief route changed");Ok(())
 }
@@ -114,10 +114,10 @@ pub fn request(ctx:&Ctx,project:&Project,t:&Thread)->Result<Request> {
 }
 pub fn request_remote(ctx:&Ctx,project:&Project,t:&Thread,route:&crate::remote_api::Route)->Result<Request> {
     ensure!(t.is_remote(),"remote brief requires a remote thread");
-    request_with_route(ctx,project,t,Some(Remote{route:route.clone(),selector:t.machine.clone(),binary:ctx.env.var("HERDR_PROJECTS_REMOTE_HERDR_BIN").unwrap_or("herdr").into()}),false)
+    request_with_route(ctx,project,t,Some(Remote{route:route.clone(),selector:t.machine.clone(),binary:ctx.env.var("HERDR_FARM_REMOTE_HERDR_BIN").unwrap_or("herdr").into()}),false)
 }
 pub fn request_launch(ctx:&Ctx,project:&Project,t:&Thread,route:Option<&crate::remote_api::Route>)->Result<Request> {
-    let remote=route.map(|route|Remote{route:route.clone(),selector:t.machine.clone(),binary:ctx.env.var("HERDR_PROJECTS_REMOTE_HERDR_BIN").unwrap_or("herdr").into()});
+    let remote=route.map(|route|Remote{route:route.clone(),selector:t.machine.clone(),binary:ctx.env.var("HERDR_FARM_REMOTE_HERDR_BIN").unwrap_or("herdr").into()});
     request_with_route(ctx,project,t,remote,true)
 }
 fn request_with_route(ctx:&Ctx,project:&Project,t:&Thread,remote:Option<Remote>,launch:bool)->Result<Request> {
@@ -131,7 +131,7 @@ fn request_with_route(ctx:&Ctx,project:&Project,t:&Thread,remote:Option<Remote>,
 
 #[cfg(all(test,target_os="linux"))]
 mod tests {
-    use herdr_projects::execution_guard::GatedSpawn;
+    use herdr_farm::execution_guard::GatedSpawn;
     use super::*;
     use std::{fs,os::unix::{fs::PermissionsExt,net::UnixListener}};
     struct Fixture {root:tempfile::TempDir,project:Project,t:Thread,input:Input,_listener:UnixListener}
@@ -197,7 +197,7 @@ mod tests {
             if variant=="corrupt" {fs::write(other.dir().join("threads/t-0001.toml"),"corrupt [").unwrap();}
             if variant=="canonical" {
                 #[cfg(feature="state-store")]
-                {other.set_status(project::Status::Paused).unwrap();project::write_json(&other.state_dir().join("coordinator.json"),&project::Coordinator::default()).unwrap();let plan=herdr_projects::migration::inspect(&other.dir()).unwrap();herdr_projects::migration::apply(&other.dir(),&plan,true).unwrap();let snapshot=herdr_projects::runtime::snapshot(&other.dir()).unwrap();herdr_projects::runtime::rebind(&other.dir(),"coordinator",1,snapshot.head,&herdr_projects::domain::RuntimeRoute{socket:socket.display().to_string(),pane_id:"p".into(),workspace_id:"w".into(),tab_id:"tab".into(),cwd:"/fixture".into(),..Default::default()}).unwrap();}
+                {other.set_status(project::Status::Paused).unwrap();project::write_json(&other.state_dir().join("coordinator.json"),&project::Coordinator::default()).unwrap();let plan=herdr_farm::migration::inspect(&other.dir()).unwrap();herdr_farm::migration::apply(&other.dir(),&plan,true).unwrap();let snapshot=herdr_farm::runtime::snapshot(&other.dir()).unwrap();herdr_farm::runtime::rebind(&other.dir(),"coordinator",1,snapshot.head,&herdr_farm::domain::RuntimeRoute{socket:socket.display().to_string(),pane_id:"p".into(),workspace_id:"w".into(),tab_id:"tab".into(),cwd:"/fixture".into(),..Default::default()}).unwrap();}
                 #[cfg(not(feature="state-store"))]
                 fs::write(other.state_dir().join("format.json"),"{}").unwrap();
             }
@@ -244,7 +244,7 @@ mod tests {
     #[test]
     fn nonconflicting_canonical_neighbor_allows_supervised_brief() {
         let f=Fixture::new();let other=project::create(f.root.path(),"canonical","",vec![]).unwrap();other.set_status(project::Status::Paused).unwrap();
-        project::write_json(&other.state_dir().join("coordinator.json"),&project::Coordinator::default()).unwrap();let plan=herdr_projects::migration::inspect(&other.dir()).unwrap();herdr_projects::migration::apply(&other.dir(),&plan,true).unwrap();
+        project::write_json(&other.state_dir().join("coordinator.json"),&project::Coordinator::default()).unwrap();let plan=herdr_farm::migration::inspect(&other.dir()).unwrap();herdr_farm::migration::apply(&other.dir(),&plan,true).unwrap();
         execute(&f.input,&Control::default()).unwrap();assert!(f.sent());assert!(!thread::load(&f.project,&f.t.id).unwrap().prompt_pending);
     }
 

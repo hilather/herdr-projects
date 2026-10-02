@@ -6,9 +6,9 @@ use crate::{paths::Ctx, project::Project, runner::Cmd, thread::{self, Thread}};
 
 /// Excludes supported launch/prompt/adopt/ticker operations within this root.
 /// It is deliberately separate from the short project-record transaction lock.
-pub struct Lease { _guard:herdr_projects::execution_guard::RootGuard }
+pub struct Lease { _guard:herdr_farm::execution_guard::RootGuard }
 pub fn lease(root: &Path) -> Result<Lease> {
-    Ok(Lease{_guard:herdr_projects::execution_guard::RootGuard::exclusive(root)?})
+    Ok(Lease{_guard:herdr_farm::execution_guard::RootGuard::exclusive(root)?})
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Removal {

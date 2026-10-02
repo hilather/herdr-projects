@@ -5,11 +5,11 @@
 //! `memory propose/review/promote/import`; unrelated work is `task add`.
 //! A worker's input snapshot and running attempt are recorded through the
 //! public store API, as no CLI path launches a worker here.
-use herdr_projects::{authority, domain::*, memory::MemoryStore, migration, runtime};
+use herdr_farm::{authority, domain::*, memory::MemoryStore, migration, runtime};
 use serde_json::{json, Value};
 use std::{fs, path::PathBuf, process::{Command, Output}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 struct Project { home: tempfile::TempDir, project: PathBuf, key: PathBuf, store: String }
 
@@ -21,7 +21,7 @@ impl Project {
         let key = home.path().join("owner");
         assert!(Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).output().unwrap().status.success());
         let public = fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
-        let config = home.path().join(".config/herdr-projects/config.toml");
+        let config = home.path().join(".config/herdr-farm/config.toml");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         fs::write(&config, format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n")).unwrap();
         let p = Project { project: home.path().join("root/demo"), key, store: String::new(), home };

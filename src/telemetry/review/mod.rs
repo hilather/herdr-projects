@@ -32,7 +32,7 @@ const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
 /// Recorded on the owner's finding triage (contracts-review.md §5).
 const TRIAGE_AUTHORITY: &str = "operator_owner.v1";
 
-/// `herdr-projects telemetry <slug> review ...`
+/// `herdr-farm telemetry <slug> review ...`
 #[derive(clap::Subcommand)]
 pub enum Command {
     /// Stream version of this lane's sidecar tables. Read-only.
@@ -163,7 +163,7 @@ pub enum Command {
     Seeds(seeds::SeedsCommand),
 }
 
-/// `herdr-projects telemetry <slug> review accept draft ...`
+/// `herdr-farm telemetry <slug> review accept draft ...`
 #[derive(clap::Subcommand)]
 pub enum AcceptCommand {
     /// Write the exact canonical `review_acceptance.v1` request for the
@@ -183,7 +183,7 @@ pub enum AcceptCommand {
     },
 }
 
-/// `herdr-projects telemetry <slug> review findings ...`. Every write is a
+/// `herdr-farm telemetry <slug> review findings ...`. Every write is a
 /// triage decision or correction by `operator:cli`, the project owner.
 #[derive(clap::Subcommand)]
 pub enum FindingsCommand {
@@ -350,7 +350,7 @@ pub fn bind_review_brief(project: &Path, opportunity: &str, task: &str, snapshot
 }
 
 /// The command's stdout. `config_dir` is the product configuration
-/// directory (`~/.config/herdr-projects`), where the review signer lives.
+/// directory (`~/.config/herdr-farm`), where the review signer lives.
 pub fn run(project: &Path, config_dir: &Path, command: Command) -> Result<String> {
     // A worker may run only the blind reviewer view, its own session and the receipt channel.
     if !matches!(command, Command::Present { .. } | Command::Session { .. } | Command::Submit { .. }) { refuse_worker_context(project)?; }

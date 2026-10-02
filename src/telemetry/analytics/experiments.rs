@@ -14,7 +14,7 @@ use std::path::Path;
 pub const PLAN_CONTRACT: &str = "experiment-planning.v1";
 pub const REPORT_CONTRACT: &str = "experiment-report.v1";
 
-/// `herdr-projects telemetry <slug> experiments ...`
+/// `herdr-farm telemetry <slug> experiments ...`
 #[derive(clap::Subcommand)]
 pub enum Command {
     /// Sample size to detect a stated difference in a rate metric: unpaired and

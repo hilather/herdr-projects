@@ -15,7 +15,7 @@ use crate::paths::{Ctx, SessionFlags};
 use crate::project::{self, Status};
 use crate::{doctor, lifecycle, overview};
 
-const PLUGIN_ID: &str = "herdr-projects";
+const PLUGIN_ID: &str = "herdr-farm";
 mod handoff;
 
 /// What an action hands to the popup it opens.
@@ -57,7 +57,7 @@ fn socket(ctx: &Ctx) -> Result<String> {
 fn open_pane(ctx: &Ctx, entrypoint: &str, handoff: &Handoff) -> Result<()> {
     let id = handoff::create(ctx, entrypoint, handoff)?;
     let binding = format!("{}={id}", handoff::ENV);
-    let root_binding = format!("HERDR_PROJECTS_ROOT={}", std::path::absolute(&ctx.root)?.display());
+    let root_binding = format!("HERDR_FARM_ROOT={}", std::path::absolute(&ctx.root)?.display());
     let herdr = Herdr::new(ctx.env.herdr_bin(), socket(ctx)?, ctx.runner);
     herdr.call(&["plugin", "pane", "open", "--plugin", PLUGIN_ID, "--entrypoint", entrypoint, "--env", &binding, "--env", &root_binding], CALL_TIMEOUT).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
@@ -106,8 +106,8 @@ pub fn run_action(ctx: &Ctx, id: &str) -> Result<()> {
         "doctor" => {
             let healthy = doctor::run(ctx, &SessionFlags::default())?;
             let herdr = Herdr::new(ctx.env.herdr_bin(), socket(ctx)?, ctx.runner);
-            let body = if healthy { "All required checks passed. Details: herdr plugin log --plugin herdr-projects" } else { "Some checks FAILED. Details: herdr plugin log --plugin herdr-projects" };
-            let _ = herdr.notification_show("herdr-projects doctor", body);
+            let body = if healthy { "All required checks passed. Details: herdr plugin log --plugin herdr-farm" } else { "Some checks FAILED. Details: herdr plugin log --plugin herdr-farm" };
+            let _ = herdr.notification_show("herdr-farm doctor", body);
             Ok(())
         }
         other => bail!("unknown action `{other}`"),
@@ -197,7 +197,7 @@ pub fn run_pane(ctx: &Ctx, id: &str) -> Result<()> {
 /// The store identity a `fleet` handoff binds for `slug` (empty without a project).
 #[cfg(feature = "state-store")]
 fn fleet_store(ctx: &Ctx, slug: &str) -> String {
-    use herdr_projects::telemetry::views;
+    use herdr_farm::telemetry::views;
     if slug.is_empty() { return String::new(); }
     views::scope(&ctx.root, slug).and_then(|scope| views::store_identity(&scope)).unwrap_or_default()
 }
@@ -210,7 +210,7 @@ fn fleet_store(_ctx: &Ctx, _slug: &str) -> String { String::new() }
 /// the popup can tell its own workspace's project, name that project.
 #[cfg(feature = "state-store")]
 fn check_fleet_handoff(ctx: &Ctx, handoff: &Handoff) -> Result<()> {
-    use herdr_projects::telemetry::views;
+    use herdr_farm::telemetry::views;
     let scope = views::scope(&ctx.root, &handoff.slug)?;
     anyhow::ensure!(!handoff.store.is_empty() && views::store_identity(&scope)? == handoff.store,
         "the handoff names project `{}` but was not issued for its store", handoff.slug);
@@ -229,7 +229,7 @@ fn fleet(ctx: &Ctx) {
     { let _ = ctx; println!("fleet panel unavailable: this build lacks the `state-store` feature; rebuild with `cargo build --release --locked --features state-store`"); }
     #[cfg(feature = "state-store")]
     {
-        use herdr_projects::telemetry::{panel, views, workspace};
+        use herdr_farm::telemetry::{panel, views, workspace};
         let handoff = ctx.env.var(handoff::ENV).map(|_| handoff::consume(ctx, "fleet"));
         let slug = match handoff {
             Some(Err(error)) => { println!("error: {error:#}"); return; }
@@ -271,8 +271,8 @@ fn fleet(ctx: &Ctx) {
 /// The project a TM4.8 pane acts on: the handoff's (bound to its store and to
 /// the invoking workspace's project, as `fleet`), else the operator's answer.
 #[cfg(feature = "state-store")]
-fn workspace_scope(ctx: &Ctx, handoff: &Handoff) -> Result<herdr_projects::telemetry::views::Scope> {
-    use herdr_projects::telemetry::views;
+fn workspace_scope(ctx: &Ctx, handoff: &Handoff) -> Result<herdr_farm::telemetry::views::Scope> {
+    use herdr_farm::telemetry::views;
     if !handoff.slug.is_empty() {
         check_fleet_handoff(ctx, handoff).context("fleet handoff refused")?;
         return views::scope(&ctx.root, &handoff.slug);
@@ -288,12 +288,12 @@ fn fleet_watch(ctx: &Ctx) -> Result<()> {
     { let _ = ctx; println!("fleet pane unavailable: this build lacks the `state-store` feature"); hold_open(); Ok(()) }
     #[cfg(feature = "state-store")]
     {
-        use herdr_projects::telemetry::workspace;
+        use herdr_farm::telemetry::workspace;
         let scope = handoff::consume(ctx, "fleet-watch").and_then(|handoff| workspace_scope(ctx, &handoff));
         let scope = match scope { Ok(scope) => scope, Err(error) => { println!("error: {error:#}"); hold_open(); return Err(error); } };
-        let interval = ctx.env.var("HERDR_PROJECTS_FLEET_INTERVAL").and_then(|s| s.parse().ok()).filter(|s| (1..=workspace::WATCH_MAX_SECS).contains(s))
+        let interval = ctx.env.var("HERDR_FARM_FLEET_INTERVAL").and_then(|s| s.parse().ok()).filter(|s| (1..=workspace::WATCH_MAX_SECS).contains(s))
             .unwrap_or(workspace::WATCH_DEFAULT_SECS);
-        let iterations = ctx.env.var("HERDR_PROJECTS_FLEET_ITERATIONS").and_then(|s| s.parse().ok());
+        let iterations = ctx.env.var("HERDR_FARM_FLEET_ITERATIONS").and_then(|s| s.parse().ok());
         workspace::watch(&ctx.root, &scope.slug, &ctx.config_dir, &workspace::WatchArgs { interval_secs: interval, iterations })
     }
 }
@@ -307,7 +307,7 @@ fn owner_popup(ctx: &Ctx, id: &str, handoff: &Handoff) -> Result<()> {
     { let _ = (ctx, id, handoff); bail!("candidate groups and the replay suite need the `state-store` feature") }
     #[cfg(feature = "state-store")]
     {
-        use herdr_projects::telemetry::workspace::owner::{self, Owner};
+        use herdr_farm::telemetry::workspace::owner::{self, Owner};
         let scope = workspace_scope(ctx, handoff)?;
         let slug = scope.slug.as_str();
         let owner = match id {
@@ -353,7 +353,7 @@ fn owner_popup(ctx: &Ctx, id: &str, handoff: &Handoff) -> Result<()> {
                 println!("\nPreview: {}", preview.command_line(slug));
                 print!("{}", owner::run(&scope.dir, &preview)?);
                 #[cfg(target_os = "linux")]
-                let head = herdr_projects::runtime::snapshot(&scope.dir)?.head.to_string();
+                let head = herdr_farm::runtime::snapshot(&scope.dir)?.head.to_string();
                 #[cfg(not(target_os = "linux"))]
                 let head = String::from("0");
                 Owner::Replay(vec!["run".into(), "--suite".into(), suite, "--configuration".into(), configuration, "--subset".into(), subset, "--seed".into(), seed,
@@ -406,8 +406,8 @@ mod tests {
         run_action(&ctx, "pause").unwrap();
         let calls = world.runner.calls.borrow();
         let opened = calls.iter().find(|c| c.display().contains("plugin pane open")).unwrap();
-        assert!(opened.display().contains("--plugin herdr-projects --entrypoint pick"));
-        assert!(opened.args.iter().any(|a| a == &format!("HERDR_PROJECTS_ROOT={}", world.root.display())));
+        assert!(opened.display().contains("--plugin herdr-farm --entrypoint pick"));
+        assert!(opened.args.iter().any(|a| a == &format!("HERDR_FARM_ROOT={}", world.root.display())));
         drop(calls);
         assert_eq!(consume_opened(&world, "pick").command, "pause");
     }

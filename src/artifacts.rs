@@ -274,7 +274,7 @@ fn artifact_lock(project:&Project,canonical:bool)->Result<ArtifactLock> {
     {
         // Separate entry point: legacy mutation guards are never disabled.
         // The caller retains the root execution lease across the complete copy.
-        herdr_projects::migration::open_active(&project.dir())?;
+        herdr_farm::migration::open_active(&project.dir())?;
         real_dir(&project.state_dir())?;
         let file=OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(project.state_dir().join("lock"))?;
         file.try_lock().context("project metadata is busy")?;
@@ -291,7 +291,7 @@ pub fn load_canonical_controlled(project:&Project,record:&Thread,id:&str,control
 /// Convert verified stop evidence into the established artifact receipt format.
 /// The immutable source identity is retained; no worker directory is recreated.
 #[cfg(all(feature="state-store",target_os="linux"))]
-pub fn capture_preserved_outputs(project:&Project,record:&Thread,outputs:&herdr_projects::worktree_preservation::VerifiedOutputs,control:&Control,mut authorize:impl FnMut()->Result<()>)->Result<Snapshot> {
+pub fn capture_preserved_outputs(project:&Project,record:&Thread,outputs:&herdr_farm::worktree_preservation::VerifiedOutputs,control:&Control,mut authorize:impl FnMut()->Result<()>)->Result<Snapshot> {
     control.check()?;authorize()?;
     ensure!(!record.is_remote()&&outputs.manifest().source==record.thread_dir,"preserved output source mismatch");
     let staging=staging_mode_controlled(project,record,true,control)?;

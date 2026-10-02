@@ -23,7 +23,7 @@ fn drain(memory:&mut Memory) {
 #[test]
 fn copy_and_routine_backlogs_alternate_only_after_ticket_drain() {
     let(world,path)=crate::canonical_controller::tests::routine_fixture(&[("check",b"true",1000)]);
-    herdr_projects::routines::schedule(&path,"check",herdr_projects::runtime::snapshot(&path).unwrap().head).unwrap();
+    herdr_farm::routines::schedule(&path,"check",herdr_farm::runtime::snapshot(&path).unwrap().head).unwrap();
     let project=world.project("legacy","session.sock");let t=world.thread(&project,world.home.path(),|_|{});
     let pool=Arc::new(Executor::new(Limits::default(),Arc::new(Immediate)).unwrap());let ctx=world.ctx();let mut memory=Memory::new(&ctx);
     memory.copy_jobs=Some(crate::copy_jobs::Queue::new(pool.clone()));memory.routine_jobs=Some(crate::routine_jobs::Queue::new(pool.clone()));
@@ -36,14 +36,14 @@ fn copy_and_routine_backlogs_alternate_only_after_ticket_drain() {
         assert_eq!(memory.copy_jobs.as_ref().unwrap().pending(),copy);assert_eq!(memory.routine_jobs.as_ref().unwrap().pending(),!copy);
         drain(&mut memory);
     }
-    assert!(thread::load(&project,&t.id).unwrap().copy_receipt.is_none());assert!(herdr_projects::runtime::snapshot(&path).unwrap().routine_receipts.is_empty());
+    assert!(thread::load(&project,&t.id).unwrap().copy_receipt.is_none());assert!(herdr_farm::runtime::snapshot(&path).unwrap().routine_receipts.is_empty());
     assert!(pool.stop(Duration::from_secs(1)));
 }
 
 #[cfg(feature="state-store")]
 #[test]
 fn canonical_effects_get_their_turn_before_copy_admission() {
-    use herdr_projects::{runtime,operations::DeliveryState};
+    use herdr_farm::{runtime,operations::DeliveryState};
     let(world,path,task)=crate::notification_delivery::tests::fixture();
     world.runner.on("--version",crate::runner::fake::ok("herdr 0.9.1"));
     let operation=crate::notification_delivery::enqueue(&world.ctx(),&path,&task,runtime::snapshot(&path).unwrap().head).unwrap();
@@ -81,8 +81,8 @@ fn retained_merged_projection_blocks_brief_prompts_and_agent_starts() {
     std::fs::create_dir_all(&t.thread_dir).unwrap();let report=format!("PR: {url}\ncomplete\n");
     std::fs::write(Path::new(&t.thread_dir).join("report.md"),&report).unwrap();std::fs::write(thread::home_report_path(&project,&t.id),&report).unwrap();
     let archive=world.home.path().join("final-stream");let mut bytes=Vec::new();crate::artifacts::live::export(Path::new(&t.thread_dir),&mut bytes).unwrap();std::fs::write(&archive,bytes).unwrap();
-    let guard=herdr_projects::execution_guard::ProjectGuard::acquire(&project.dir()).unwrap();
-    crate::artifacts::live::receive(&project,&archive).unwrap().begin_final_controlled(&project,&guard,&t,&"a".repeat(64),"merged-fixture",herdr_projects::final_copy_intent::Purpose::Merged{pr:url.into()},&crate::source_tree::Control::default(),||Ok(true)).unwrap();drop(guard);
+    let guard=herdr_farm::execution_guard::ProjectGuard::acquire(&project.dir()).unwrap();
+    crate::artifacts::live::receive(&project,&archive).unwrap().begin_final_controlled(&project,&guard,&t,&"a".repeat(64),"merged-fixture",herdr_farm::final_copy_intent::Purpose::Merged{pr:url.into()},&crate::source_tree::Control::default(),||Ok(true)).unwrap();drop(guard);
     let ctx=world.ctx();let herdr=Herdr::new(ctx.env.herdr_bin(),"session.sock",ctx.runner);let current=thread::load(&project,&t.id).unwrap();
     let agent=Agent{pane_id:t.pane_id.clone(),workspace_id:t.workspace_id.clone(),tab_id:t.tab_id.clone(),cwd:t.cwd.clone(),name:t.agent_name.clone(),agent_status:"idle".into(),..Default::default()};
     let pane=Pane{pane_id:t.pane_id.clone(),workspace_id:t.workspace_id.clone(),tab_id:t.tab_id.clone(),cwd:t.cwd.clone()};

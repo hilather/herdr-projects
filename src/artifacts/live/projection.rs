@@ -1,7 +1,9 @@
 //! Additive per-file publication with an exact durable recovery stage.
 use super::*;
 use crate::{project,thread};
-use herdr_projects::{execution_guard::{ProjectEffect,ProjectGuard},live_copy_intent::LiveCopyIntent};
+use herdr_farm::{execution_guard::ProjectEffect,live_copy_intent::LiveCopyIntent};
+#[cfg(test)]
+use herdr_farm::execution_guard::ProjectGuard;
 
 fn eligible(project:&Project,guard:&dyn ProjectEffect,t:&Thread)->Result<()> {
     thread::validate_id(&t.id)?;

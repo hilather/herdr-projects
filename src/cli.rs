@@ -11,9 +11,9 @@ use crate::threads::{self, ResolveArgs, StartArgs};
 use crate::{actions, adopt, doctor, inbox, lifecycle, overview, routine, ticker};
 
 #[derive(Parser)]
-#[command(name = "herdr-projects", version = crate::VERSION, about = "Projects for herdr")]
+#[command(name = "herdr-farm", version = crate::VERSION, about = "Coding agent farm for Herdr")]
 struct Cli {
-    /// Projects root (default: $HERDR_PROJECTS_ROOT, then config.toml, then ~/.herdr-projects)
+    /// Projects root (default: $HERDR_FARM_ROOT, then $HERDR_PROJECTS_ROOT, config.toml, existing ~/.herdr-farm or ~/.herdr-projects)
     #[arg(long, global = true, value_name = "DIR")]
     root: Option<PathBuf>,
 
@@ -303,7 +303,7 @@ enum Command {
     Telemetry { slug:String, #[command(subcommand)] command:TelemetryCommand },
     /// Replay evaluation suite (owner): versioned cases from accepted tasks, hidden checks, replay runs as ordinary tasks, M49 report
     #[cfg(all(feature="state-store", target_os="linux"))]
-    Replay { slug:String, #[command(subcommand)] command:herdr_projects::replay::Command },
+    Replay { slug:String, #[command(subcommand)] command:herdr_farm::replay::Command },
     /// Read-only factory counters. Does not launch, admit, or print environment values.
     #[cfg(feature="state-store")]
     Factory { #[command(subcommand)] command:FactoryCommand },
@@ -511,8 +511,8 @@ enum MemoryReviewCommand {
     /// Ingest home reports for Remember sections (idempotent; same hash never duplicates)
     ///
     /// Examples:
-    ///   herdr-projects memory-review demo ingest --thread t-0001
-    ///   herdr-projects memory-review demo ingest --all
+    ///   herdr-farm memory-review demo ingest --thread t-0001
+    ///   herdr-farm memory-review demo ingest --all
     Ingest {
         /// One thread id (t-0001); omit with --all
         #[arg(long, conflicts_with = "all")]
@@ -524,9 +524,9 @@ enum MemoryReviewCommand {
     /// Save a candidate and link it as the proposed disposition
     ///
     /// Legacy example (Markdown candidate):
-    ///   herdr-projects memory-review demo propose mr-t-0001-abc --file /tmp/cand.md --title "API errors" --source worker
+    ///   herdr-farm memory-review demo propose mr-t-0001-abc --file /tmp/cand.md --title "API errors" --source worker
     /// Link an already saved candidate:
-    ///   herdr-projects memory-review demo propose mr-t-0001-abc --candidate cand-id
+    ///   herdr-farm memory-review demo propose mr-t-0001-abc --candidate cand-id
     ///
     /// SQLite-memory projects save under .state/memory-review-candidates/ and
     /// still require signed `memory import` review to become authoritative.
@@ -561,7 +561,7 @@ enum MemoryReviewCommand {
     /// Record an explicit user decision into legacy Markdown memory with provenance
     ///
     /// Example:
-    ///   herdr-projects memory-review demo record --title "Use Postgres" --file /tmp/decision.md --provenance "user chat 2026-09-25: remember our DB choice"
+    ///   herdr-farm memory-review demo record --title "Use Postgres" --file /tmp/decision.md --provenance "user chat 2026-09-25: remember our DB choice"
     ///
     /// Refused on SQLite-memory projects (use signed `memory import` instead).
     Record {
@@ -897,7 +897,7 @@ enum OperationsCommand { Inspect,
 #[derive(Subcommand)]
 enum TelemetryCommand {
     /// Authenticated loopback OTLP/HTTP JSON receiver (explicit opt-in).
-    Otlp { #[command(subcommand)] command: herdr_projects::telemetry::otlp::Command },
+    Otlp { #[command(subcommand)] command: herdr_farm::telemetry::otlp::Command },
     /// One outcome record per canonical attempt (lifecycle, result, verification, integration)
     Attempts { #[arg(long)] json:bool },
     /// Read Codex rollouts under each Codex execution home into .state/telemetry.db, then print usage.
@@ -908,44 +908,44 @@ enum TelemetryCommand {
     Report { #[arg(long, conflicts_with = "text")] json:bool, #[arg(long)] text:bool, /// Activity window start, Unix ms
         #[arg(long)] since:Option<i64> },
     /// Lane A collectors (sidecar stream `ingest`).
-    Collectors { #[command(subcommand)] command:herdr_projects::telemetry::collectors::Command },
+    Collectors { #[command(subcommand)] command:herdr_farm::telemetry::collectors::Command },
     /// Lane B accounting (sidecar stream `accounting`).
-    Accounting { #[command(subcommand)] command:herdr_projects::telemetry::accounting::Command },
+    Accounting { #[command(subcommand)] command:herdr_farm::telemetry::accounting::Command },
     /// Lane C quality signals (sidecar stream `quality`).
-    Quality { #[command(subcommand)] command:herdr_projects::telemetry::quality::Command },
+    Quality { #[command(subcommand)] command:herdr_farm::telemetry::quality::Command },
     /// Lane D review capture (sidecar stream `review`).
-    Review { #[command(subcommand)] command:herdr_projects::telemetry::review::Command },
+    Review { #[command(subcommand)] command:herdr_farm::telemetry::review::Command },
     /// TM4.1 metric registry.
-    Metrics { #[command(subcommand)] command:herdr_projects::telemetry::analytics::MetricsCommand },
+    Metrics { #[command(subcommand)] command:herdr_farm::telemetry::analytics::MetricsCommand },
     /// TM4.1 query service: numerator, denominator, exclusions, coverage, projection revision and watermarks. Read-only.
-    Query(herdr_projects::telemetry::analytics::query::Args),
+    Query(herdr_farm::telemetry::analytics::query::Args),
     /// TM4.1 aggregate revisions (sidecar stream `analytics`).
-    Analytics { #[command(subcommand)] command:herdr_projects::telemetry::analytics::Command },
+    Analytics { #[command(subcommand)] command:herdr_farm::telemetry::analytics::Command },
     /// TM4.3 portable export (`export.v1`, JSON or CSV) through the query service. Read-only unless --out/--external.
-    Export(herdr_projects::telemetry::export::Args),
+    Export(herdr_farm::telemetry::export::Args),
 
     /// TM4.2 operator views (project, models, reviews, cost, health) through the query service. Read-only.
-    View(herdr_projects::telemetry::views::Args),
+    View(herdr_farm::telemetry::views::Args),
 
     /// TM4.4 configuration comparison: raw, interval, pooled and propensity estimates per task class; observational, never a universal ranking. Read-only.
-    Compare(herdr_projects::telemetry::analytics::compare::Args),
+    Compare(herdr_farm::telemetry::analytics::compare::Args),
     /// TM4.4 experiment sample-size planning and preregistered experiment reports. Read-only.
-    Experiments { #[command(subcommand)] command:herdr_projects::telemetry::analytics::experiments::Command },
+    Experiments { #[command(subcommand)] command:herdr_farm::telemetry::analytics::experiments::Command },
     /// TM4.7 assignment policies: operator switch (default off), owner-signed randomized-assignment grants, what-if simulation, suggestions and shadow disagreement.
-    Policies { #[command(subcommand)] command:herdr_projects::telemetry::policies::Command },
+    Policies { #[command(subcommand)] command:herdr_farm::telemetry::policies::Command },
 
     /// TM4.5 health rules, states and deduplicated alerts (sidecar stream `health`); `notify` writes inbox notices.
-    Health(herdr_projects::telemetry::health::Args),
+    Health(herdr_farm::telemetry::health::Args),
     /// TM4.5 advisory recommendation for a role (task class) with M50 evidence freshness. Read-only; never read by dispatch.
-    Recommend(herdr_projects::telemetry::health::recommend::Args),
+    Recommend(herdr_farm::telemetry::health::recommend::Args),
     /// TM4.8 Herdr workspace: the fleet snapshot behind the pane, popup and digest section. Read-only.
-    Workspace { #[command(subcommand)] command:herdr_projects::telemetry::workspace::Command },
+    Workspace { #[command(subcommand)] command:herdr_farm::telemetry::workspace::Command },
     /// TM4.8 fleet pane: the workspace snapshot, refreshed on an interval. Read-only.
-    Watch(herdr_projects::telemetry::workspace::WatchArgs),
+    Watch(herdr_farm::telemetry::workspace::WatchArgs),
     /// TM5.3 retention classes, holds and tombstoned deletion (`retention.v1`); `apply` is the owner's and destructive items need --confirm.
-    Maintenance { #[command(subcommand)] command:herdr_projects::telemetry::maintenance::Command },
+    Maintenance { #[command(subcommand)] command:herdr_farm::telemetry::maintenance::Command },
     /// TM5.3 sidecar backup (online, digest manifest, optional age encryption) and offline restore that reapplies tombstones. Never writes state.db.
-    Backup { #[command(subcommand)] command:herdr_projects::telemetry::maintenance::backup::Command },
+    Backup { #[command(subcommand)] command:herdr_farm::telemetry::maintenance::backup::Command },
 }
 
 #[cfg(feature="state-store")]
@@ -1003,7 +1003,7 @@ pub fn run() -> Result<()> {
     }
     if let Command::LaunchExec { spec } = &cli.command {
         #[cfg(all(feature="state-store",target_os="linux"))]
-        return herdr_projects::canonical_worker::exec_launch_spec(spec).map(|never| match never {});
+        return herdr_farm::canonical_worker::exec_launch_spec(spec).map(|never| match never {});
         #[cfg(not(all(feature="state-store",target_os="linux")))]
         bail!("launch-exec {} requires Linux and --features state-store", spec.display());
     }
@@ -1021,21 +1021,21 @@ pub fn run() -> Result<()> {
             ProfileCommand::Revalidate { slug, digest } => {
                 let root = paths::resolve_root(cli.root.as_deref(), &env, &config_dir)?;
                 project::validate_slug(slug)?;
-                let reference = herdr_projects::domain::VersionedReference {
+                let reference = herdr_farm::domain::VersionedReference {
                     id: format!("profile-{digest}"), revision: 1, digest: digest.clone(),
                 };
-                serde_json::to_value(herdr_projects::profile_preparation::revalidate(
+                serde_json::to_value(herdr_farm::profile_preparation::revalidate(
                     &root.join(slug), &reference,
-                    std::time::Instant::now()+herdr_projects::profile_preparation::BUDGET, Default::default())?)?
+                    std::time::Instant::now()+herdr_farm::profile_preparation::BUDGET, Default::default())?)?
             }
             #[cfg(all(feature="state-store", target_os="linux"))]
             ProfileCommand::Retained { slug, digest } => {
                 let root = paths::resolve_root(cli.root.as_deref(), &env, &config_dir)?;
                 project::validate_slug(slug)?;
-                let reference = herdr_projects::domain::VersionedReference {
+                let reference = herdr_farm::domain::VersionedReference {
                     id: format!("profile-{digest}"), revision: 1, digest: digest.clone(),
                 };
-                herdr_projects::store::SqliteStore::open(&root.join(slug).join(".state/state.db"))?
+                herdr_farm::store::SqliteStore::open(&root.join(slug).join(".state/state.db"))?
                     .native_profile_report(&reference)?.context("retained native profile not found")?
             }
             ProfileCommand::Inspect { name } => serde_json::to_value(crate::agents::profiles::inspect(&path, name)?)?,
@@ -1051,9 +1051,9 @@ pub fn run() -> Result<()> {
             ProfileCommand::Prepare { slug, name, herdr_executable, agent_executable, execution_home } => {
                 let root = paths::resolve_root(cli.root.as_deref(), &env, &config_dir)?;
                 project::validate_slug(slug)?;
-                serde_json::to_value(herdr_projects::profile_preparation::prepare(
+                serde_json::to_value(herdr_farm::profile_preparation::prepare(
                     &root.join(slug), name, herdr_executable, agent_executable, execution_home,
-                    std::time::Instant::now()+herdr_projects::profile_preparation::BUDGET, Default::default())?)?
+                    std::time::Instant::now()+herdr_farm::profile_preparation::BUDGET, Default::default())?)?
             }
             #[cfg(all(feature="state-store", target_os="linux"))]
             ProfileCommand::VerifyNative { slug, name, herdr_executable, agent_executable, execution_home, retain } => {
@@ -1061,10 +1061,10 @@ pub fn run() -> Result<()> {
                 project::validate_slug(slug)?;
                 let project = root.join(slug);
                 if *retain {
-                    herdr_projects::store::SqliteStore::open(&project.join(".state/state.db"))?
+                    herdr_farm::store::SqliteStore::open(&project.join(".state/state.db"))?
                         .check_native_profile_retention()?;
                 }
-                let verified = herdr_projects::profile_preparation::verify_native(
+                let verified = herdr_farm::profile_preparation::verify_native(
                     &project, name, herdr_executable, agent_executable, execution_home,
                     std::time::Instant::now()+std::time::Duration::from_secs(120), Default::default())?;
                 if *retain { verified.retain(&project)?; }
@@ -1076,10 +1076,10 @@ pub fn run() -> Result<()> {
                 project::validate_slug(slug)?;
                 let project = root.join(slug);
                 if *retain {
-                    herdr_projects::store::SqliteStore::open(&project.join(".state/state.db"))?
+                    herdr_farm::store::SqliteStore::open(&project.join(".state/state.db"))?
                         .check_native_profile_retention()?;
                 }
-                let verified = herdr_projects::profile_preparation::verify_interaction(
+                let verified = herdr_farm::profile_preparation::verify_interaction(
                     &project, name, herdr_executable, agent_executable, execution_home,
                     std::time::Instant::now()+std::time::Duration::from_secs(120), Default::default())?;
                 if *retain { verified.retain(&project)?; }
@@ -1118,88 +1118,88 @@ pub fn run() -> Result<()> {
             }
             let value=match command {
                 MemoryCommand::Inspect=>{
-                    let s=herdr_projects::runtime::snapshot(&dir)?;
-                    let mut db=herdr_projects::migration::open_active(&dir)?;
+                    let s=herdr_farm::runtime::snapshot(&dir)?;
+                    let mut db=herdr_farm::migration::open_active(&dir)?;
                     let records=db.memory_records().unwrap_or_default();
                     let facts=db.active_facts(jiff::Timestamp::now().as_millisecond()).unwrap_or_default();
-                    let authority=herdr_projects::migration::read_format(&dir).map(|f|f.memory).unwrap_or_else(|_| "legacy-markdown".into());
+                    let authority=herdr_farm::migration::read_format(&dir).map(|f|f.memory).unwrap_or_else(|_| "legacy-markdown".into());
                     serde_json::json!({"head":s.head,"authority":authority,"policies":s.memory_policies,"records":records,"active_facts":facts})
                 },
                 MemoryCommand::Import{document,signature,expected_head,file,expected_revision}=>{
                     if let Some(file)=file {
-                        serde_json::to_value(herdr_projects::memory::import_file(&dir,&file,expected_revision)?)?
+                        serde_json::to_value(herdr_farm::memory::import_file(&dir,&file,expected_revision)?)?
                     } else if document.is_none() && signature.is_none() {
-                        let plan=herdr_projects::memory::plan(&dir)?;
-                        serde_json::to_value(herdr_projects::memory::import_plan(&dir,&plan)?)?
+                        let plan=herdr_farm::memory::plan(&dir)?;
+                        serde_json::to_value(herdr_farm::memory::import_plan(&dir,&plan)?)?
                     } else {
                         let document=document.context("memory import requires a signed document, --file, or no arguments to import the current inventory")?;
                         let signature=signature.context("memory import requires a signature or --file")?;
                         let expected_head=expected_head.context("signed memory import requires --expected-head")?;
-                        serde_json::to_value(herdr_projects::authority::import_memory(&dir,&document,&signature,expected_head)?)?
+                        serde_json::to_value(herdr_farm::authority::import_memory(&dir,&document,&signature,expected_head)?)?
                     }
                 },
-                MemoryCommand::Update{delivery,attempt}=>herdr_projects::memory::read_memory_update(&dir,&delivery,&attempt)?,
+                MemoryCommand::Update{delivery,attempt}=>herdr_farm::memory::read_memory_update(&dir,&delivery,&attempt)?,
                 MemoryCommand::Package{binding,snapshot,changes}=>serde_json::to_value(match (binding,snapshot) {
-                    (Some(binding),None)=>herdr_projects::memory::read_selected_update_package(&dir,&binding,&changes)?,
-                    (None,Some(snapshot))=>herdr_projects::memory::read_selected_snapshot_update_package(&dir,&snapshot,&changes)?,
+                    (Some(binding),None)=>herdr_farm::memory::read_selected_update_package(&dir,&binding,&changes)?,
+                    (None,Some(snapshot))=>herdr_farm::memory::read_selected_snapshot_update_package(&dir,&snapshot,&changes)?,
                     _=>anyhow::bail!("specify exactly one consumer binding or snapshot"),
                 })?,
                 MemoryCommand::Ack{input}=>{
-                    let ack:herdr_projects::domain::MemoryUpdateAck=serde_json::from_slice(&herdr_projects::migration::read_plan_file(&input)?)
+                    let ack:herdr_farm::domain::MemoryUpdateAck=serde_json::from_slice(&herdr_farm::migration::read_plan_file(&input)?)
                         .map_err(|_|anyhow::anyhow!("invalid memory acknowledgment JSON (contents withheld)"))?;
-                    serde_json::to_value(herdr_projects::memory::acknowledge_memory_update(&dir,&ack)?)?
+                    serde_json::to_value(herdr_farm::memory::acknowledge_memory_update(&dir,&ack)?)?
                 },
                 MemoryCommand::PackageAck{attempt,input}=>{
-                    let ack:herdr_projects::store::UpdatePackageAck=serde_json::from_slice(&herdr_projects::migration::read_plan_file(&input)?)
+                    let ack:herdr_farm::store::UpdatePackageAck=serde_json::from_slice(&herdr_farm::migration::read_plan_file(&input)?)
                         .map_err(|_|anyhow::anyhow!("invalid package acknowledgment JSON (contents withheld)"))?;
-                    serde_json::to_value(herdr_projects::memory::acknowledge_worker_update_package(&dir,&attempt,&ack)?)?
+                    serde_json::to_value(herdr_farm::memory::acknowledge_worker_update_package(&dir,&attempt,&ack)?)?
                 },
                 MemoryCommand::SupersedeUpdate{attempt,input}=>{
-                    let request:herdr_projects::store::WorkerUpdateSupersession=serde_json::from_slice(&herdr_projects::migration::read_plan_file(&input)?)
+                    let request:herdr_farm::store::WorkerUpdateSupersession=serde_json::from_slice(&herdr_farm::migration::read_plan_file(&input)?)
                         .map_err(|_|anyhow::anyhow!("invalid memory supersession JSON (contents withheld)"))?;
-                    serde_json::to_value(herdr_projects::memory::supersede_worker_update(&dir,&attempt,&request)?)?
+                    serde_json::to_value(herdr_farm::memory::supersede_worker_update(&dir,&attempt,&request)?)?
                 },
-                MemoryCommand::Supersession{binding,change}=>serde_json::to_value(herdr_projects::migration::open_active(&dir)?.worker_update_supersession(&binding,&change)?)?,
-                MemoryCommand::Receipts{attempt}=>serde_json::to_value(herdr_projects::migration::open_active(&dir)?.memory_update_receipts(&attempt)?)?,
-                MemoryCommand::Invalidations{task}=>serde_json::to_value(herdr_projects::migration::open_active(&dir)?.memory_invalidations(&task)?)?,
-                MemoryCommand::Reconcile{document,signature,expected_head}=>serde_json::to_value(herdr_projects::authority::reconcile_memory(&dir,&document,&signature,expected_head)?)?,
-                MemoryCommand::BarrierFreeze{input,expected_head}=>serde_json::to_value(herdr_projects::memory::freeze_memory_barrier_file(&dir,&input,expected_head)?)?,
-                MemoryCommand::Barrier{id}=>serde_json::to_value(herdr_projects::memory::inspect_memory_barrier(&dir,&id)?)?,
-                MemoryCommand::BarrierReleaseDraft{id,expires_unix_ms}=>serde_json::to_value(herdr_projects::authority::draft_barrier_release(&dir,&id,expires_unix_ms)?)?,
-                MemoryCommand::BarrierRelease{document,signature,expected_head}=>serde_json::to_value(herdr_projects::authority::release_memory_barrier(&dir,&document,&signature,expected_head)?)?,
-                MemoryCommand::BarrierRevoke{id,expected_head,reason}=>serde_json::to_value(herdr_projects::authority::revoke_memory_barrier(&dir,&id,expected_head,&reason)?)?,
-                MemoryCommand::Readiness{task}=>serde_json::to_value(herdr_projects::migration::open_active(&dir)?.memory_readiness(&task,jiff::Timestamp::now().as_millisecond())?)?,
-                MemoryCommand::Deliveries=>serde_json::to_value(herdr_projects::migration::open_active(&dir)?.memory_delivery_intents()?)?,
-                MemoryCommand::Candidate{id}=>herdr_projects::memory::import_candidate_preview(&dir,&id)?,
-                MemoryCommand::ReviewImport{document,signature,expected_head}=>serde_json::to_value(herdr_projects::authority::review_memory_import(&dir,&document,&signature,expected_head)?)?,
-                MemoryCommand::AttemptInput{attempt}=>herdr_projects::memory::render_attempt_knowledge(&dir,&attempt)?,
-                MemoryCommand::AttemptBrief{attempt}=>serde_json::to_value(herdr_projects::memory::render_attempt_brief(&dir,&attempt)?)?,
-                MemoryCommand::SnapshotInput{id}=>herdr_projects::memory::render_knowledge_snapshot(&dir,&id)?,
-                MemoryCommand::Preview{file}=>serde_json::to_value(herdr_projects::memory::preview(&dir,&file)?)?,
+                MemoryCommand::Supersession{binding,change}=>serde_json::to_value(herdr_farm::migration::open_active(&dir)?.worker_update_supersession(&binding,&change)?)?,
+                MemoryCommand::Receipts{attempt}=>serde_json::to_value(herdr_farm::migration::open_active(&dir)?.memory_update_receipts(&attempt)?)?,
+                MemoryCommand::Invalidations{task}=>serde_json::to_value(herdr_farm::migration::open_active(&dir)?.memory_invalidations(&task)?)?,
+                MemoryCommand::Reconcile{document,signature,expected_head}=>serde_json::to_value(herdr_farm::authority::reconcile_memory(&dir,&document,&signature,expected_head)?)?,
+                MemoryCommand::BarrierFreeze{input,expected_head}=>serde_json::to_value(herdr_farm::memory::freeze_memory_barrier_file(&dir,&input,expected_head)?)?,
+                MemoryCommand::Barrier{id}=>serde_json::to_value(herdr_farm::memory::inspect_memory_barrier(&dir,&id)?)?,
+                MemoryCommand::BarrierReleaseDraft{id,expires_unix_ms}=>serde_json::to_value(herdr_farm::authority::draft_barrier_release(&dir,&id,expires_unix_ms)?)?,
+                MemoryCommand::BarrierRelease{document,signature,expected_head}=>serde_json::to_value(herdr_farm::authority::release_memory_barrier(&dir,&document,&signature,expected_head)?)?,
+                MemoryCommand::BarrierRevoke{id,expected_head,reason}=>serde_json::to_value(herdr_farm::authority::revoke_memory_barrier(&dir,&id,expected_head,&reason)?)?,
+                MemoryCommand::Readiness{task}=>serde_json::to_value(herdr_farm::migration::open_active(&dir)?.memory_readiness(&task,jiff::Timestamp::now().as_millisecond())?)?,
+                MemoryCommand::Deliveries=>serde_json::to_value(herdr_farm::migration::open_active(&dir)?.memory_delivery_intents()?)?,
+                MemoryCommand::Candidate{id}=>herdr_farm::memory::import_candidate_preview(&dir,&id)?,
+                MemoryCommand::ReviewImport{document,signature,expected_head}=>serde_json::to_value(herdr_farm::authority::review_memory_import(&dir,&document,&signature,expected_head)?)?,
+                MemoryCommand::AttemptInput{attempt}=>herdr_farm::memory::render_attempt_knowledge(&dir,&attempt)?,
+                MemoryCommand::AttemptBrief{attempt}=>serde_json::to_value(herdr_farm::memory::render_attempt_brief(&dir,&attempt)?)?,
+                MemoryCommand::SnapshotInput{id}=>herdr_farm::memory::render_knowledge_snapshot(&dir,&id)?,
+                MemoryCommand::Preview{file}=>serde_json::to_value(herdr_farm::memory::preview(&dir,&file)?)?,
                 MemoryCommand::Plan{output}=>{
-                    let plan=herdr_projects::memory::plan(&dir)?;
+                    let plan=herdr_farm::memory::plan(&dir)?;
                     std::fs::write(&output,serde_json::to_vec_pretty(&plan)?)?;
                     serde_json::to_value(plan)?
                 },
                 MemoryCommand::Cutover{plan,document,signature,expected_head,writers_stopped}=>
-                    serde_json::to_value(herdr_projects::authority::cutover_memory(&dir,&plan,&document,&signature,expected_head,writers_stopped)?)?,
+                    serde_json::to_value(herdr_farm::authority::cutover_memory(&dir,&plan,&document,&signature,expected_head,writers_stopped)?)?,
                 MemoryCommand::AbortCutover{plan,writers_stopped}=>{
-                    let plan:herdr_projects::memory::MemoryPlan=serde_json::from_slice(&herdr_projects::migration::read_plan_file(&plan)?)?;
-                    serde_json::to_value(herdr_projects::memory::abort_cutover(&dir,&plan,writers_stopped)?)?
+                    let plan:herdr_farm::memory::MemoryPlan=serde_json::from_slice(&herdr_farm::migration::read_plan_file(&plan)?)?;
+                    serde_json::to_value(herdr_farm::memory::abort_cutover(&dir,&plan,writers_stopped)?)?
                 },
                 MemoryCommand::Snapshot{task,profile,input_file,worker,review_opportunity}=>{
-                    let _guard=herdr_projects::memory::mutation_guard(&dir)?;
+                    let _guard=herdr_farm::memory::mutation_guard(&dir)?;
                     anyhow::ensure!(task!="coordinator","--task coordinator is reserved for the coordinator constructor");
                     let resolved=crate::agents::resolve::resolve(&profile,&ctx.config_dir.join("config.toml"),None)?;
-                    let request:herdr_projects::domain::SnapshotRequest=serde_json::from_slice(&herdr_projects::migration::read_plan_file(&input_file)?).map_err(|_|anyhow::anyhow!("invalid snapshot scope JSON (contents withheld)"))?;
+                    let request:herdr_farm::domain::SnapshotRequest=serde_json::from_slice(&herdr_farm::migration::read_plan_file(&input_file)?).map_err(|_|anyhow::anyhow!("invalid snapshot scope JSON (contents withheld)"))?;
                     anyhow::ensure!(request.task_id==task,"scope task_id must match --task");
                     // A review task's instructions are its blind brief, never PROJECT.md (contracts-review.md §11).
                     let instructions=match &review_opportunity {
-                        Some(opportunity)=>herdr_projects::telemetry::review::review_brief_instructions(&dir,opportunity)?,
-                        None=>String::from_utf8(herdr_projects::migration::read_plan_file(&dir.join("PROJECT.md"))?)
+                        Some(opportunity)=>herdr_farm::telemetry::review::review_brief_instructions(&dir,opportunity)?,
+                        None=>String::from_utf8(herdr_farm::migration::read_plan_file(&dir.join("PROJECT.md"))?)
                             .map_err(|_|anyhow::anyhow!("project instructions are not UTF-8"))?,
                     };
-                    let mut memory=herdr_projects::memory::MemoryStore::from_sqlite(herdr_projects::migration::open_active(&dir)?,dir.join(".state/objects"));
+                    let mut memory=herdr_farm::memory::MemoryStore::from_sqlite(herdr_farm::migration::open_active(&dir)?,dir.join(".state/objects"));
                     let now=jiff::Timestamp::now().as_millisecond();
                     let snapshot=if worker {
                         memory.create_worker_snapshot(request,&resolved.name,&resolved.definition_digest,Some(&resolved.config_digest),resolved.budget.soft_input_chars,&instructions,now,None)?
@@ -1209,30 +1209,30 @@ pub fn run() -> Result<()> {
                     drop(memory);
                     let mut value=serde_json::to_value(&snapshot)?;
                     if let Some(opportunity)=review_opportunity {
-                        value["review_brief"]=herdr_projects::telemetry::review::bind_review_brief(&dir,&opportunity,&task,snapshot.id.as_str())?;
+                        value["review_brief"]=herdr_farm::telemetry::review::bind_review_brief(&dir,&opportunity,&task,snapshot.id.as_str())?;
                     }
                     value
                 },
                 MemoryCommand::Propose{input}=>{
-                    let _guard=herdr_projects::memory::mutation_guard(&dir)?;
-                    let bytes=herdr_projects::migration::read_plan_file(&input)?;
-                    let mut memory=herdr_projects::memory::MemoryStore::from_sqlite(herdr_projects::migration::open_active(&dir)?,dir.join(".state/objects"));
+                    let _guard=herdr_farm::memory::mutation_guard(&dir)?;
+                    let bytes=herdr_farm::migration::read_plan_file(&input)?;
+                    let mut memory=herdr_farm::memory::MemoryStore::from_sqlite(herdr_farm::migration::open_active(&dir)?,dir.join(".state/objects"));
                     serde_json::to_value(memory.propose(&bytes,jiff::Timestamp::now().as_millisecond())?)?
                 },
                 MemoryCommand::Review{proposal,decision_file,signature,expected_head}=>
-                    serde_json::to_value(herdr_projects::authority::review_memory_proposal(&dir,&proposal,&decision_file,&signature,expected_head)?)?,
+                    serde_json::to_value(herdr_farm::authority::review_memory_proposal(&dir,&proposal,&decision_file,&signature,expected_head)?)?,
                 MemoryCommand::Promote{proposal,decision}=>
-                    serde_json::to_value(herdr_projects::authority::promote_memory_proposal(&dir,&proposal,&decision)?)?,
+                    serde_json::to_value(herdr_farm::authority::promote_memory_proposal(&dir,&proposal,&decision)?)?,
             };println!("{}",serde_json::to_string_pretty(&value)?);Ok(())
         },
         #[cfg(feature="state-store")]
         Command::RoutineStore{slug,command}=>{
             project::validate_slug(&slug)?;let dir=ctx.root.join(slug);
             let value=match command {
-                RoutineStoreCommand::Inspect=>{let s=herdr_projects::runtime::snapshot(&dir)?;serde_json::json!({"head":s.head,"revisions":s.routine_revisions,"occurrences":s.routine_occurrences,"receipts":s.routine_receipts,"execution_enabled":cfg!(target_os="linux"),"automatic_dispatch":cfg!(target_os="linux")})},
-                RoutineStoreCommand::Import{document,signature,expected_head}=>serde_json::to_value(herdr_projects::authority::import_routine(&dir,&document,&signature,expected_head)?)?,
-                RoutineStoreCommand::Schedule{name,expected_head}=>serde_json::to_value(herdr_projects::routines::schedule(&dir,&name,expected_head)?)?,
-                RoutineStoreCommand::Execute{operation,expected_head}=>serde_json::to_value(herdr_projects::routines::execute(&dir,&herdr_projects::domain::OperationId::new(operation).map_err(anyhow::Error::msg)?,expected_head)?)?,
+                RoutineStoreCommand::Inspect=>{let s=herdr_farm::runtime::snapshot(&dir)?;serde_json::json!({"head":s.head,"revisions":s.routine_revisions,"occurrences":s.routine_occurrences,"receipts":s.routine_receipts,"execution_enabled":cfg!(target_os="linux"),"automatic_dispatch":cfg!(target_os="linux")})},
+                RoutineStoreCommand::Import{document,signature,expected_head}=>serde_json::to_value(herdr_farm::authority::import_routine(&dir,&document,&signature,expected_head)?)?,
+                RoutineStoreCommand::Schedule{name,expected_head}=>serde_json::to_value(herdr_farm::routines::schedule(&dir,&name,expected_head)?)?,
+                RoutineStoreCommand::Execute{operation,expected_head}=>serde_json::to_value(herdr_farm::routines::execute(&dir,&herdr_farm::domain::OperationId::new(operation).map_err(anyhow::Error::msg)?,expected_head)?)?,
             };println!("{}",serde_json::to_string_pretty(&value)?);Ok(())
         },
         #[cfg(feature="state-store")]
@@ -1240,11 +1240,11 @@ pub fn run() -> Result<()> {
             project::validate_slug(&slug)?;
             let dir=ctx.root.join(slug);
             let value=match command {
-                ApprovalCommand::Policy=>serde_json::to_value(herdr_projects::authority::policy_reference(&dir)?)?,
-                ApprovalCommand::Inspect=>serde_json::to_value(herdr_projects::runtime::snapshot(&dir)?.approvals)?,
-                ApprovalCommand::Import { document,signature,expected_head }=>serde_json::to_value(herdr_projects::authority::import_signed(&dir,&document,&signature,expected_head)?)?,
-                ApprovalCommand::Revoke { id,expected_head,reason }=>serde_json::json!({"head":herdr_projects::authority::revoke(&dir,&id,expected_head,&reason)?}),
-                ApprovalCommand::Denials=>serde_json::to_value(herdr_projects::authority::denials(&dir)?)?,
+                ApprovalCommand::Policy=>serde_json::to_value(herdr_farm::authority::policy_reference(&dir)?)?,
+                ApprovalCommand::Inspect=>serde_json::to_value(herdr_farm::runtime::snapshot(&dir)?.approvals)?,
+                ApprovalCommand::Import { document,signature,expected_head }=>serde_json::to_value(herdr_farm::authority::import_signed(&dir,&document,&signature,expected_head)?)?,
+                ApprovalCommand::Revoke { id,expected_head,reason }=>serde_json::json!({"head":herdr_farm::authority::revoke(&dir,&id,expected_head,&reason)?}),
+                ApprovalCommand::Denials=>serde_json::to_value(herdr_farm::authority::denials(&dir)?)?,
             };
             println!("{}",serde_json::to_string_pretty(&value)?);
             Ok(())
@@ -1254,10 +1254,10 @@ pub fn run() -> Result<()> {
             project::validate_slug(&slug)?;
             let dir=ctx.root.join(slug);
             let value=match command {
-                DelegationCommand::Import { document,signature }=>serde_json::json!({"grant_id":herdr_projects::authority::import_delegation(&dir,&document,&signature)?}),
-                DelegationCommand::Draft { grant_id,idempotency_key }=>serde_json::to_value(herdr_projects::authority::draft_delegated_reservation(&dir,&grant_id,&idempotency_key)?)?,
-                DelegationCommand::Reserve { document,signature }=>serde_json::to_value(herdr_projects::authority::reserve_delegated(&dir,&document,&signature)?)?,
-                DelegationCommand::Revoke { grant_id,expected_head,reason }=>serde_json::json!({"head":herdr_projects::authority::revoke_delegation(&dir,&grant_id,expected_head,&reason)?}),
+                DelegationCommand::Import { document,signature }=>serde_json::json!({"grant_id":herdr_farm::authority::import_delegation(&dir,&document,&signature)?}),
+                DelegationCommand::Draft { grant_id,idempotency_key }=>serde_json::to_value(herdr_farm::authority::draft_delegated_reservation(&dir,&grant_id,&idempotency_key)?)?,
+                DelegationCommand::Reserve { document,signature }=>serde_json::to_value(herdr_farm::authority::reserve_delegated(&dir,&document,&signature)?)?,
+                DelegationCommand::Revoke { grant_id,expected_head,reason }=>serde_json::json!({"head":herdr_farm::authority::revoke_delegation(&dir,&grant_id,expected_head,&reason)?}),
             };
             println!("{}",serde_json::to_string_pretty(&value)?);
             Ok(())
@@ -1267,21 +1267,21 @@ pub fn run() -> Result<()> {
         Command::Launch { slug, command } => {
             project::validate_slug(&slug)?;
             let project=ctx.root.join(&slug);
-            let load=|path:&std::path::Path|->Result<herdr_projects::launch_preparation::LaunchSelection> {
-                let bytes=herdr_projects::migration::read_plan_file(path)?;
+            let load=|path:&std::path::Path|->Result<herdr_farm::launch_preparation::LaunchSelection> {
+                let bytes=herdr_farm::migration::read_plan_file(path)?;
                 anyhow::ensure!(bytes.len()<=1024*1024,"launch selection exceeds bounds");
                 serde_json::from_slice(&bytes).map_err(|_|anyhow::anyhow!("invalid launch selection (contents withheld)"))
             };
-            let deadline=std::time::Instant::now()+herdr_projects::profile_preparation::BUDGET;
+            let deadline=std::time::Instant::now()+herdr_farm::profile_preparation::BUDGET;
             let value=match command {
                 LaunchCommand::Draft { selection, expected_head, validity_seconds } =>
-                    serde_json::to_value(herdr_projects::launch_preparation::draft(&project,&load(&selection)?,expected_head,std::time::Duration::from_secs(validity_seconds),deadline,Default::default())?)?,
+                    serde_json::to_value(herdr_farm::launch_preparation::draft(&project,&load(&selection)?,expected_head,std::time::Duration::from_secs(validity_seconds),deadline,Default::default())?)?,
                 LaunchCommand::Run { task, profile, repository, sign_with, validity_seconds, title, plan_output, prompt_file, contract_file, integration_ref, base, max_active_workers, herdr_socket, prepare_only } =>
                     crate::launch_run::run(&ctx, &slug, crate::launch_run::Args { task, profile, repository, sign_with, validity_seconds, title, plan_output, prompt_file, contract_file, integration_ref, base, max_active_workers, herdr_socket, prepare_only })?,
                 LaunchCommand::Stop { task, force } => crate::launch_run::stop(&ctx, &slug, &task, force)?,
                 LaunchCommand::Reserve { selection, approval_digest, expected_head } => {
-                    let approval=herdr_projects::domain::VersionedReference{id:format!("approval-{approval_digest}"),revision:1,digest:approval_digest};
-                    serde_json::to_value(herdr_projects::launch_preparation::reserve(&project,&load(&selection)?,&approval,expected_head,deadline,Default::default())?)?
+                    let approval=herdr_farm::domain::VersionedReference{id:format!("approval-{approval_digest}"),revision:1,digest:approval_digest};
+                    serde_json::to_value(herdr_farm::launch_preparation::reserve(&project,&load(&selection)?,&approval,expected_head,deadline,Default::default())?)?
                 }
             };
             println!("{}",serde_json::to_string_pretty(&value)?);
@@ -1291,25 +1291,25 @@ pub fn run() -> Result<()> {
         Command::Runtime{slug,command}=>{
             project::validate_slug(&slug)?;let dir=ctx.root.join(slug);
             match command {
-                RuntimeCommand::Inspect=>{let snapshot=herdr_projects::runtime::snapshot(&dir)?;anyhow::ensure!(snapshot.schema_version>=5,"upgrade-store is required for runtime bindings");println!("{}",serde_json::to_string_pretty(&serde_json::json!({"head":snapshot.head,"bindings":snapshot.runtime_bindings,"observations":snapshot.observations,"ownership":snapshot.ownership,"control":snapshot.control}))?);},
-                RuntimeCommand::Relinquish{id,expected_revision,expected_head,reason}=>println!("{}",herdr_projects::runtime::relinquish(&dir,&id,expected_revision,expected_head,&reason)?),
+                RuntimeCommand::Inspect=>{let snapshot=herdr_farm::runtime::snapshot(&dir)?;anyhow::ensure!(snapshot.schema_version>=5,"upgrade-store is required for runtime bindings");println!("{}",serde_json::to_string_pretty(&serde_json::json!({"head":snapshot.head,"bindings":snapshot.runtime_bindings,"observations":snapshot.observations,"ownership":snapshot.ownership,"control":snapshot.control}))?);},
+                RuntimeCommand::Relinquish{id,expected_revision,expected_head,reason}=>println!("{}",herdr_farm::runtime::relinquish(&dir,&id,expected_revision,expected_head,&reason)?),
                 RuntimeCommand::Adopt{id,expected_revision,expected_head}=>println!("{}",serde_json::to_string_pretty(&crate::runtime_ownership::adopt(&ctx,&dir,&id,expected_revision,expected_head)?)?),
                 RuntimeCommand::Create{task,task_revision,route,expected_head}=>{
-                    let task=task.map(herdr_projects::domain::TaskId::new).transpose().map_err(anyhow::Error::msg)?;
-                    let bytes=herdr_projects::migration::read_plan_file(&route)?;
+                    let task=task.map(herdr_farm::domain::TaskId::new).transpose().map_err(anyhow::Error::msg)?;
+                    let bytes=herdr_farm::migration::read_plan_file(&route)?;
                     let route=serde_json::from_slice(&bytes).map_err(|_|anyhow::anyhow!("invalid runtime route JSON (contents withheld)"))?;
-                    println!("{}",serde_json::to_string_pretty(&herdr_projects::runtime::create_binding(&dir,task.as_ref(),task_revision,expected_head,&route)?)?);
+                    println!("{}",serde_json::to_string_pretty(&herdr_farm::runtime::create_binding(&dir,task.as_ref(),task_revision,expected_head,&route)?)?);
                 },
-                RuntimeCommand::Admission=>println!("{}",serde_json::to_string_pretty(&herdr_projects::runtime::admission(&dir,&std::path::absolute(ctx.config_dir.join("config.toml"))?)?)?),
+                RuntimeCommand::Admission=>println!("{}",serde_json::to_string_pretty(&herdr_farm::runtime::admission(&dir,&std::path::absolute(ctx.config_dir.join("config.toml"))?)?)?),
                 RuntimeCommand::State{state,expected_revision,expected_head}=>{
-                    use herdr_projects::domain::ProjectState;
+                    use herdr_farm::domain::ProjectState;
                     let state=match state.as_str(){"active"=>ProjectState::Active,"archived"=>ProjectState::Archived,_=>ProjectState::Paused};
-                    println!("{}",serde_json::to_string_pretty(&herdr_projects::runtime::set_state(&dir,expected_head,expected_revision,state,&std::path::absolute(ctx.config_dir.join("config.toml"))?)?)?);
+                    println!("{}",serde_json::to_string_pretty(&herdr_farm::runtime::set_state(&dir,expected_head,expected_revision,state,&std::path::absolute(ctx.config_dir.join("config.toml"))?)?)?);
                 },
                 RuntimeCommand::Rebind{id,route,expected_revision,expected_head}=>{
-                    let bytes=herdr_projects::migration::read_plan_file(&route)?;
+                    let bytes=herdr_farm::migration::read_plan_file(&route)?;
                     let route=serde_json::from_slice(&bytes).map_err(|_|anyhow::anyhow!("invalid runtime route JSON (contents withheld)"))?;
-                    println!("{}",serde_json::to_string_pretty(&herdr_projects::runtime::rebind(&dir,&id,expected_revision,expected_head,&route)?)?);
+                    println!("{}",serde_json::to_string_pretty(&herdr_farm::runtime::rebind(&dir,&id,expected_revision,expected_head,&route)?)?);
                 },
             }
             Ok(())
@@ -1324,108 +1324,108 @@ pub fn run() -> Result<()> {
         Command::Scheduler{slug,command}=>{
             project::validate_slug(&slug)?;let dir=ctx.root.join(&slug);
             match command {
-                SchedulerCommand::Inspect=>println!("{}",serde_json::to_string_pretty(&herdr_projects::runtime::queue_report(&dir)?)?),
-                SchedulerCommand::Policy{max_active_workers,max_attempts_per_task,expected_revision,expected_head}=>println!("{}",herdr_projects::runtime::scheduler_policy(&dir,expected_head,expected_revision,max_active_workers,max_attempts_per_task)?),
+                SchedulerCommand::Inspect=>println!("{}",serde_json::to_string_pretty(&herdr_farm::runtime::queue_report(&dir)?)?),
+                SchedulerCommand::Policy{max_active_workers,max_attempts_per_task,expected_revision,expected_head}=>println!("{}",herdr_farm::runtime::scheduler_policy(&dir,expected_head,expected_revision,max_active_workers,max_attempts_per_task)?),
             }Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:TelemetryCommand::Attempts{json}}=>{
             project::validate_slug(&slug)?;
-            let report=herdr_projects::telemetry::outcome::attempts(&ctx.root.join(slug))?;
-            if json {println!("{}",serde_json::to_string_pretty(&report)?);} else {print!("{}",herdr_projects::telemetry::outcome::text(&report));}
+            let report=herdr_farm::telemetry::outcome::attempts(&ctx.root.join(slug))?;
+            if json {println!("{}",serde_json::to_string_pretty(&report)?);} else {print!("{}",herdr_farm::telemetry::outcome::text(&report));}
             Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:TelemetryCommand::Report{json,text:_,since}}=>{
             project::validate_slug(&slug)?;
-            let report=herdr_projects::telemetry::analytics::query::report(&ctx.root.join(slug),since)?;
-            if json {println!("{}",serde_json::to_string_pretty(&report)?);} else {print!("{}",herdr_projects::telemetry::metrics::text(&report));}
+            let report=herdr_farm::telemetry::analytics::query::report(&ctx.root.join(slug),since)?;
+            if json {println!("{}",serde_json::to_string_pretty(&report)?);} else {print!("{}",herdr_farm::telemetry::metrics::text(&report));}
             Ok(())
         },
         #[cfg(all(feature="state-store", target_os="linux"))]
         Command::Replay{slug,command}=>{
             project::validate_slug(&slug)?;
-            println!("{}",serde_json::to_string_pretty(&herdr_projects::replay::run(&ctx.root.join(slug),command)?)?);Ok(())
+            println!("{}",serde_json::to_string_pretty(&herdr_farm::replay::run(&ctx.root.join(slug),command)?)?);Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:TelemetryCommand::Metrics{command}}=>{
             project::validate_slug(&slug)?;
-            print!("{}",herdr_projects::telemetry::analytics::run_metrics(command)?);Ok(())
+            print!("{}",herdr_farm::telemetry::analytics::run_metrics(command)?);Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:TelemetryCommand::Query(args)}=>{
             project::validate_slug(&slug)?;
-            print!("{}",herdr_projects::telemetry::analytics::run_query(&ctx.root.join(slug),&ctx.config_dir,&args)?);Ok(())
+            print!("{}",herdr_farm::telemetry::analytics::run_query(&ctx.root.join(slug),&ctx.config_dir,&args)?);Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:TelemetryCommand::Export(args)}=>{
             project::validate_slug(&slug)?;
-            print!("{}",herdr_projects::telemetry::export::run(&ctx.root.join(&slug),&ctx.config_dir,&slug,&args)?);Ok(())
+            print!("{}",herdr_farm::telemetry::export::run(&ctx.root.join(&slug),&ctx.config_dir,&slug,&args)?);Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:TelemetryCommand::View(args)}=>{
             project::validate_slug(&slug)?;
-            print!("{}",herdr_projects::telemetry::views::run(&ctx.root,&slug,&ctx.config_dir,&args)?);Ok(())
+            print!("{}",herdr_farm::telemetry::views::run(&ctx.root,&slug,&ctx.config_dir,&args)?);Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:TelemetryCommand::Analytics{command}}=>{
             project::validate_slug(&slug)?;
-            print!("{}",herdr_projects::telemetry::analytics::run(&ctx.root.join(slug),command)?);Ok(())
+            print!("{}",herdr_farm::telemetry::analytics::run(&ctx.root.join(slug),command)?);Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:TelemetryCommand::Compare(args)}=>{
             project::validate_slug(&slug)?;
-            print!("{}",herdr_projects::telemetry::analytics::run_compare(&ctx.root.join(slug),&args)?);Ok(())
+            print!("{}",herdr_farm::telemetry::analytics::run_compare(&ctx.root.join(slug),&args)?);Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:TelemetryCommand::Policies{command}}=>{
             project::validate_slug(&slug)?;
-            print!("{}",herdr_projects::telemetry::policies::run(&ctx.root.join(slug),command)?);Ok(())
+            print!("{}",herdr_farm::telemetry::policies::run(&ctx.root.join(slug),command)?);Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:TelemetryCommand::Workspace{command}}=>{
             project::validate_slug(&slug)?;
-            print!("{}",herdr_projects::telemetry::workspace::run(&ctx.root,&slug,&ctx.config_dir,&command)?);Ok(())
+            print!("{}",herdr_farm::telemetry::workspace::run(&ctx.root,&slug,&ctx.config_dir,&command)?);Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:TelemetryCommand::Watch(args)}=>{
             project::validate_slug(&slug)?;
-            herdr_projects::telemetry::workspace::watch(&ctx.root,&slug,&ctx.config_dir,&args)
+            herdr_farm::telemetry::workspace::watch(&ctx.root,&slug,&ctx.config_dir,&args)
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:TelemetryCommand::Experiments{command}}=>{
             project::validate_slug(&slug)?;
-            print!("{}",herdr_projects::telemetry::analytics::run_experiments(&ctx.root.join(slug),command)?);Ok(())
+            print!("{}",herdr_farm::telemetry::analytics::run_experiments(&ctx.root.join(slug),command)?);Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:TelemetryCommand::Health(args)}=>{
             project::validate_slug(&slug)?;
-            print!("{}",herdr_projects::telemetry::health::run(&ctx.root.join(slug),&ctx.config_dir,args)?);Ok(())
+            print!("{}",herdr_farm::telemetry::health::run(&ctx.root.join(slug),&ctx.config_dir,args)?);Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:TelemetryCommand::Recommend(args)}=>{
             project::validate_slug(&slug)?;
-            print!("{}",herdr_projects::telemetry::health::run_recommend(&ctx.root.join(slug),&args)?);Ok(())
+            print!("{}",herdr_farm::telemetry::health::run_recommend(&ctx.root.join(slug),&args)?);Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:TelemetryCommand::Maintenance{command}}=>{
             project::validate_slug(&slug)?;
-            print!("{}",herdr_projects::telemetry::maintenance::run(&ctx.root.join(slug),&ctx.config_dir,command)?);Ok(())
+            print!("{}",herdr_farm::telemetry::maintenance::run(&ctx.root.join(slug),&ctx.config_dir,command)?);Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:TelemetryCommand::Otlp{command}}=>{
             project::validate_slug(&slug)?;
-            herdr_projects::telemetry::otlp::run(&ctx.root.join(&slug),&ctx.config_dir,command)?;Ok(())
+            herdr_farm::telemetry::otlp::run(&ctx.root.join(&slug),&ctx.config_dir,command)?;Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:TelemetryCommand::Backup{command}}=>{
             project::validate_slug(&slug)?;
-            print!("{}",herdr_projects::telemetry::maintenance::backup::run(&ctx.root.join(slug),command)?);Ok(())
+            print!("{}",herdr_farm::telemetry::maintenance::backup::run(&ctx.root.join(slug),command)?);Ok(())
         },
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command:lane@(TelemetryCommand::Collectors{..}|TelemetryCommand::Accounting{..}|TelemetryCommand::Quality{..}|TelemetryCommand::Review{..})}=>{
             project::validate_slug(&slug)?;let dir=ctx.root.join(&slug);
-            use herdr_projects::telemetry::{accounting,collectors,quality,review};
+            use herdr_farm::telemetry::{accounting,collectors,quality,review};
             print!("{}",match lane {
                 TelemetryCommand::Collectors{command}=>collectors::run(&dir,command)?,
                 TelemetryCommand::Accounting{command}=>accounting::run(&dir,command)?,
@@ -1437,7 +1437,7 @@ pub fn run() -> Result<()> {
         #[cfg(feature="state-store")]
         Command::Telemetry{slug,command}=>{
             project::validate_slug(&slug)?;let dir=ctx.root.join(&slug);
-            use herdr_projects::telemetry::{codex,sidecar};
+            use herdr_farm::telemetry::{codex,sidecar};
             let mut report=serde_json::json!({});
             if let TelemetryCommand::Collect=command {
                 let collected=codex::collect(&dir,codex::Budget::CLI,true)?;
@@ -1454,23 +1454,23 @@ pub fn run() -> Result<()> {
             FactoryCommand::Admission { slug, enable, disable: _, policy, signature, evidence } => {
                 project::validate_slug(&slug)?;
                 let dir = ctx.root.join(&slug);
-                println!("{}", serde_json::to_string_pretty(&herdr_projects::authority::import_admission(&dir, enable, &policy, &signature, evidence.as_deref())?)?);
+                println!("{}", serde_json::to_string_pretty(&herdr_farm::authority::import_admission(&dir, enable, &policy, &signature, evidence.as_deref())?)?);
                 Ok(())
             }
             FactoryCommand::Status{slug}=>{
                 project::validate_slug(&slug)?;
                 let dir=ctx.root.join(slug);
-                match herdr_projects::factory_status::report(&dir,crate::canonical_controller::launch_dispatch_enabled()) {
+                match herdr_farm::factory_status::report(&dir,crate::canonical_controller::launch_dispatch_enabled()) {
                     Ok(status)=>println!("{}",serde_json::to_string_pretty(&status)?),
-                    Err(herdr_projects::factory_status::ReportError::Newer(value))=>{
+                    Err(herdr_farm::factory_status::ReportError::Newer(value))=>{
                         println!("{}",serde_json::to_string_pretty(&value)?);
                         bail!("store schema is newer than this binary");
                     }
-                    Err(herdr_projects::factory_status::ReportError::Unsupported(value))=>{
+                    Err(herdr_farm::factory_status::ReportError::Unsupported(value))=>{
                         println!("{}",serde_json::to_string_pretty(&value)?);
                         bail!("unsupported_schema");
                     }
-                    Err(herdr_projects::factory_status::ReportError::Corrupt(value))=>{
+                    Err(herdr_farm::factory_status::ReportError::Corrupt(value))=>{
                         println!("{}",serde_json::to_string_pretty(&value)?);
                         bail!("store_corrupt: the whole-store check failed; preserve the store and restore it");
                     }
@@ -1481,23 +1481,23 @@ pub fn run() -> Result<()> {
         },
         #[cfg(feature="state-store")]
         Command::Task { slug,command } => {
-            use herdr_projects::{domain::TaskId,runtime};
+            use herdr_farm::{domain::TaskId,runtime};
             project::validate_slug(&slug)?; let dir=ctx.root.join(&slug);
             match command {
                 #[cfg(target_os="linux")]
                 TaskCommand::Contract{command}=>match command {
-                    ContractCommand::Put{input_file,signature}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::authority::import_contract(&dir,&input_file,&signature)?)?),
+                    ContractCommand::Put{input_file,signature}=>println!("{}",serde_json::to_string_pretty(&herdr_farm::authority::import_contract(&dir,&input_file,&signature)?)?),
                 },
                 TaskCommand::Queue{id,input_file,expected_revision,expected_head}=>{
-                    let bytes=herdr_projects::migration::read_plan_file(&input_file)?;
+                    let bytes=herdr_farm::migration::read_plan_file(&input_file)?;
                     let request=serde_json::from_slice(&bytes).map_err(|_|anyhow::anyhow!("invalid queue request JSON"))?;
                     println!("{}",runtime::queue_task(&dir,&TaskId::new(id).map_err(anyhow::Error::msg)?,expected_revision,expected_head,&request)?);
                 },
-                TaskCommand::CancelAttempt{attempt,expected_revision,expected_head,reason}=>println!("{}",serde_json::to_string_pretty(&runtime::cancel_attempt(&dir,&herdr_projects::domain::AttemptId::new(attempt).map_err(anyhow::Error::msg)?,expected_revision,expected_head,&reason)?)?),
+                TaskCommand::CancelAttempt{attempt,expected_revision,expected_head,reason}=>println!("{}",serde_json::to_string_pretty(&runtime::cancel_attempt(&dir,&herdr_farm::domain::AttemptId::new(attempt).map_err(anyhow::Error::msg)?,expected_revision,expected_head,&reason)?)?),
                 TaskCommand::Complete{id,expected_revision}=>println!("{}",serde_json::to_string_pretty(&runtime::request_completion(&dir,&TaskId::new(id).map_err(anyhow::Error::msg)?,expected_revision)?)?),
                 TaskCommand::List=>{
                     let mut listed=serde_json::to_value(runtime::snapshot(&dir)?)?;
-                    let automation=herdr_projects::migration::open_active(&dir)?.result_automation()?;
+                    let automation=herdr_farm::migration::open_active(&dir)?.result_automation()?;
                     listed["result_automation"]=serde_json::to_value(&automation)?;
                     listed["completion_guidance"]=serde_json::json!(if !automation.verify {
                         "Automatic completion is off: verify results and run task PROJECT complete TASK --expected-revision R."
@@ -1524,46 +1524,46 @@ pub fn run() -> Result<()> {
             let dir=ctx.root.join(&slug);
             match command {
                 #[cfg(target_os="linux")]
-                ResultCommand::Capture{attempt,message}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::result_capture::capture_project(&dir,&attempt,message.as_deref())?)?),
+                ResultCommand::Capture{attempt,message}=>println!("{}",serde_json::to_string_pretty(&herdr_farm::result_capture::capture_project(&dir,&attempt,message.as_deref())?)?),
                 #[cfg(target_os="linux")]
-                ResultCommand::SubmitCaptured{attempt,message}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::result_capture::submit_captured(&dir,&attempt,message.as_deref())?)?),
+                ResultCommand::SubmitCaptured{attempt,message}=>println!("{}",serde_json::to_string_pretty(&herdr_farm::result_capture::submit_captured(&dir,&attempt,message.as_deref())?)?),
                 #[cfg(target_os="linux")]
                 // Inside the worker sandbox the store is read-only: the ticker
                 // ingests the request from the attempt's submission spool.
-                ResultCommand::Submit{input_file}=>match herdr_projects::submission_spool::worker_spool() {
-                    Some(spool)=>print!("{}",herdr_projects::submission_spool::submit_result(&spool,&input_file)?),
-                    None=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::submit_untrusted_result(&dir,&input_file)?)?),
+                ResultCommand::Submit{input_file}=>match herdr_farm::submission_spool::worker_spool() {
+                    Some(spool)=>print!("{}",herdr_farm::submission_spool::submit_result(&spool,&input_file)?),
+                    None=>println!("{}",serde_json::to_string_pretty(&herdr_farm::store::submit_untrusted_result(&dir,&input_file)?)?),
                 },
                 #[cfg(target_os="linux")]
                 ResultCommand::Verify{submission,policy_id,policy_file,idempotency_key,work_dir,timeout_seconds}=> {
-                    let request=herdr_projects::verification::VerifyRequest::new(submission,policy_id,policy_file,idempotency_key,std::time::Duration::from_secs(timeout_seconds),work_dir);
-                    let outcome=herdr_projects::verification::verify_project(&dir,&request)?;
+                    let request=herdr_farm::verification::VerifyRequest::new(submission,policy_id,policy_file,idempotency_key,std::time::Duration::from_secs(timeout_seconds),work_dir);
+                    let outcome=herdr_farm::verification::verify_project(&dir,&request)?;
                     println!("{}",serde_json::to_string_pretty(&outcome)?);
                     if outcome.state != "accepted" { anyhow::bail!("verification rejected: {}",outcome.reason.as_deref().unwrap_or("rejected")); }
                 },
                 #[cfg(target_os="linux")]
                 ResultCommand::ConfigureIntegration{repository,reference}=> {
-                    herdr_projects::integration::configure_project(&dir,&repository,&reference)?;
+                    herdr_farm::integration::configure_project(&dir,&repository,&reference)?;
                     println!("{}",serde_json::json!({"repository":repository.canonicalize()?,"reference":reference,"configured":true}));
                 },
                 #[cfg(target_os="linux")]
                 ResultCommand::Integrate{result,repository,idempotency_key,work_dir}=> {
-                    let request=herdr_projects::integration::IntegrateRequest{result_id:result,idempotency_key,repository,work_dir,fault:Default::default()};
-                    let outcome=herdr_projects::integration::integrate_project(&dir,&request)?;
+                    let request=herdr_farm::integration::IntegrateRequest{result_id:result,idempotency_key,repository,work_dir,fault:Default::default()};
+                    let outcome=herdr_farm::integration::integrate_project(&dir,&request)?;
                     println!("{}",serde_json::to_string_pretty(&outcome)?);
                     if outcome.state != "integrated" { anyhow::bail!("integration {}: {}",outcome.state,outcome.reason.as_deref().unwrap_or("not integrated")); }
                 },
                 #[cfg(target_os="linux")]
                 ResultCommand::ReconcileIntegration{repository,idempotency_key}=> {
-                    let outcome=herdr_projects::integration::reconcile_project(&dir,&repository,&idempotency_key)?;
+                    let outcome=herdr_farm::integration::reconcile_project(&dir,&repository,&idempotency_key)?;
                     println!("{}",serde_json::to_string_pretty(&outcome)?);
                     if outcome.state != "integrated" { anyhow::bail!("integration {}: {}",outcome.state,outcome.reason.as_deref().unwrap_or("not integrated")); }
                 },
-                ResultCommand::Show{id}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::show_results(&dir,id.as_deref())?)?),
-                ResultCommand::Auto{verify,integrate,expected_head}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::set_project_result_automation(&dir,expected_head,verify.map(|v|v=="on"),integrate.map(|v|v=="on"))?)?),
-                ResultCommand::Jobs=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::project_verification_jobs(&dir)?)?),
-                ResultCommand::RetryVerification{operation,expected_revision}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::reset_project_verification_job(&dir,&operation,expected_revision)?)?),
-                ResultCommand::RetryIntegration{operation,expected_revision}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::reset_project_integration_job(&dir,&operation,expected_revision)?)?),
+                ResultCommand::Show{id}=>println!("{}",serde_json::to_string_pretty(&herdr_farm::store::show_results(&dir,id.as_deref())?)?),
+                ResultCommand::Auto{verify,integrate,expected_head}=>println!("{}",serde_json::to_string_pretty(&herdr_farm::store::set_project_result_automation(&dir,expected_head,verify.map(|v|v=="on"),integrate.map(|v|v=="on"))?)?),
+                ResultCommand::Jobs=>println!("{}",serde_json::to_string_pretty(&herdr_farm::store::project_verification_jobs(&dir)?)?),
+                ResultCommand::RetryVerification{operation,expected_revision}=>println!("{}",serde_json::to_string_pretty(&herdr_farm::store::reset_project_verification_job(&dir,&operation,expected_revision)?)?),
+                ResultCommand::RetryIntegration{operation,expected_revision}=>println!("{}",serde_json::to_string_pretty(&herdr_farm::store::reset_project_integration_job(&dir,&operation,expected_revision)?)?),
             }
             Ok(())
         },
@@ -1572,9 +1572,9 @@ pub fn run() -> Result<()> {
             project::validate_slug(&slug)?;
             let dir=ctx.root.join(&slug);
             match command {
-                FeedbackCommand::Replan{id}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::request_project_replan(&dir,&id)?)?),
-                FeedbackCommand::Show{id}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::show_feedback(&dir,id.as_deref())?)?),
-                FeedbackCommand::Claim{id,owner,lease_ms}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::store::claim_feedback(&dir,&id,&owner,lease_ms)?)?),
+                FeedbackCommand::Replan{id}=>println!("{}",serde_json::to_string_pretty(&herdr_farm::store::request_project_replan(&dir,&id)?)?),
+                FeedbackCommand::Show{id}=>println!("{}",serde_json::to_string_pretty(&herdr_farm::store::show_feedback(&dir,id.as_deref())?)?),
+                FeedbackCommand::Claim{id,owner,lease_ms}=>println!("{}",serde_json::to_string_pretty(&herdr_farm::store::claim_feedback(&dir,&id,&owner,lease_ms)?)?),
             }
             Ok(())
         },
@@ -1583,42 +1583,42 @@ pub fn run() -> Result<()> {
             match command {
                 PlanCommand::Inspect{slug,expected_plan_revision,after,limit}=>{
                     project::validate_slug(&slug)?;
-                    println!("{}",serde_json::to_string_pretty(&herdr_projects::store::inspect_project_plan(&ctx.root.join(&slug),expected_plan_revision,after.as_deref(),limit)?)?);
+                    println!("{}",serde_json::to_string_pretty(&herdr_farm::store::inspect_project_plan(&ctx.root.join(&slug),expected_plan_revision,after.as_deref(),limit)?)?);
                 }
                 PlanCommand::Session{slug,command}=>{
                     project::validate_slug(&slug)?;let dir=ctx.root.join(&slug);
                     let session=match command {
                         PlannerSessionCommand::Create{id,intent_file,expected_head,expected_plan_revision,evidence_event}=>
-                            herdr_projects::store::create_project_planner_session(&dir,&id,&intent_file,&evidence_event,expected_plan_revision,expected_head)?,
-                        PlannerSessionCommand::Show{id}=>herdr_projects::store::show_project_planner_session(&dir,&id)?,
+                            herdr_farm::store::create_project_planner_session(&dir,&id,&intent_file,&evidence_event,expected_plan_revision,expected_head)?,
+                        PlannerSessionCommand::Show{id}=>herdr_farm::store::show_project_planner_session(&dir,&id)?,
                     };
                     println!("{}",serde_json::to_string_pretty(&session)?);
                 }
                 PlanCommand::AutoReplan{slug,mode,expected_head}=>{
                     project::validate_slug(&slug)?;
-                    println!("{}",serde_json::to_string_pretty(&herdr_projects::store::set_project_auto_replans(&ctx.root.join(&slug),expected_head,mode=="on")?)?);
+                    println!("{}",serde_json::to_string_pretty(&herdr_farm::store::set_project_auto_replans(&ctx.root.join(&slug),expected_head,mode=="on")?)?);
                 }
                 PlanCommand::Wait{slug,command}=>{
                     project::validate_slug(&slug)?;let dir=ctx.root.join(&slug);
                     let value=match command {
                         WaitCommand::Register{task,attempt,condition,deadline,approval_id,approval_task_revision,capacity_attempt,capacity_after_revision,recovery_binding,recovery_binding_revision,recovery_ownership_revision}=>{
                             let trigger=if let Some(((binding_id,binding_revision),ownership_revision))=recovery_binding.zip(recovery_binding_revision).zip(recovery_ownership_revision) {
-                                Some(herdr_projects::domain::WaitTrigger::OwnedRuntimeRecovered{binding_id,binding_revision,ownership_revision})
+                                Some(herdr_farm::domain::WaitTrigger::OwnedRuntimeRecovered{binding_id,binding_revision,ownership_revision})
                             }else if let Some((attempt_id,after_revision))=capacity_attempt.zip(capacity_after_revision) {
-                                Some(herdr_projects::domain::WaitTrigger::AttemptCapacityReleased{attempt_id:herdr_projects::domain::AttemptId::new(attempt_id).map_err(anyhow::Error::msg)?,after_revision})
-                            }else {approval_id.zip(approval_task_revision).map(|(approval_id,task_revision)|herdr_projects::domain::WaitTrigger::ApprovalDecision{approval_id,task_revision})};
-                            serde_json::to_value(herdr_projects::store::register_project_wait_with_trigger(&dir,&task,attempt.as_deref(),&condition,deadline.map(|value|value.as_millisecond()),trigger.as_ref())?)?
+                                Some(herdr_farm::domain::WaitTrigger::AttemptCapacityReleased{attempt_id:herdr_farm::domain::AttemptId::new(attempt_id).map_err(anyhow::Error::msg)?,after_revision})
+                            }else {approval_id.zip(approval_task_revision).map(|(approval_id,task_revision)|herdr_farm::domain::WaitTrigger::ApprovalDecision{approval_id,task_revision})};
+                            serde_json::to_value(herdr_farm::store::register_project_wait_with_trigger(&dir,&task,attempt.as_deref(),&condition,deadline.map(|value|value.as_millisecond()),trigger.as_ref())?)?
                         },
-                        WaitCommand::Rearm{id,deadline}=>serde_json::to_value(herdr_projects::store::rearm_project_wait(&dir,&id,deadline.map(|value|value.as_millisecond()))?)?,
-                        WaitCommand::Replay{id}=>serde_json::to_value(herdr_projects::store::replay_project_wait(&dir,&id)?)?,
+                        WaitCommand::Rearm{id,deadline}=>serde_json::to_value(herdr_farm::store::rearm_project_wait(&dir,&id,deadline.map(|value|value.as_millisecond()))?)?,
+                        WaitCommand::Replay{id}=>serde_json::to_value(herdr_farm::store::replay_project_wait(&dir,&id)?)?,
                     };println!("{}",serde_json::to_string_pretty(&value)?);
                 }
                 PlanCommand::Propose{slug,input_file,expected_plan_revision,idempotency_key}=>{
                     project::validate_slug(&slug)?;
                     let dir=ctx.root.join(&slug);
-                    match herdr_projects::store::propose_plan(&dir,&input_file,expected_plan_revision,&idempotency_key) {
+                    match herdr_farm::store::propose_plan(&dir,&input_file,expected_plan_revision,&idempotency_key) {
                         Ok(receipt)=>println!("{}",serde_json::to_string_pretty(&receipt)?),
-                        Err(herdr_projects::store::StoreError::StalePlanParent(current))=>anyhow::bail!("stale plan parent conflicts with current revision {current}"),
+                        Err(herdr_farm::store::StoreError::StalePlanParent(current))=>anyhow::bail!("stale plan parent conflicts with current revision {current}"),
                         Err(error)=>return Err(error.into()),
                     }
                 }
@@ -1632,41 +1632,41 @@ pub fn run() -> Result<()> {
             match command {
                 OperationsCommand::Finalize{binding,reason,expected_head}=>println!("{}",serde_json::to_string_pretty(&crate::finalization_delivery::enqueue(&ctx,&dir,&binding,expected_head,reason)?)?),
                 OperationsCommand::DeliverFinalization{id,expected_revision}=>{
-                    let id=herdr_projects::domain::OperationId::new(id).map_err(anyhow::Error::msg)?;
+                    let id=herdr_farm::domain::OperationId::new(id).map_err(anyhow::Error::msg)?;
                     match crate::finalization_delivery::deliver(&ctx,&dir,&id,expected_revision)? {
-                        herdr_projects::operations::dispatch::DispatchResult::Recorded(delivery)=>println!("{}",serde_json::to_string_pretty(&delivery)?),
-                        herdr_projects::operations::dispatch::DispatchResult::Unrecorded{claim,..}=>anyhow::bail!("finalization outcome was not recorded; operation {} claim epoch {} requires receipt observation",claim.operation.as_str(),claim.epoch),
+                        herdr_farm::operations::dispatch::DispatchResult::Recorded(delivery)=>println!("{}",serde_json::to_string_pretty(&delivery)?),
+                        herdr_farm::operations::dispatch::DispatchResult::Unrecorded{claim,..}=>anyhow::bail!("finalization outcome was not recorded; operation {} claim epoch {} requires receipt observation",claim.operation.as_str(),claim.epoch),
                     }
                 },
-                OperationsCommand::ObserveFinalization{id,expected_revision,expected_head}=>println!("{}",serde_json::to_string_pretty(&crate::finalization_delivery::observe(&ctx,&dir,&herdr_projects::domain::OperationId::new(id).map_err(anyhow::Error::msg)?,expected_revision,expected_head)?)?),
+                OperationsCommand::ObserveFinalization{id,expected_revision,expected_head}=>println!("{}",serde_json::to_string_pretty(&crate::finalization_delivery::observe(&ctx,&dir,&herdr_farm::domain::OperationId::new(id).map_err(anyhow::Error::msg)?,expected_revision,expected_head)?)?),
                 OperationsCommand::Notify{task,expected_head}=>{
-                    let task=herdr_projects::domain::TaskId::new(task).map_err(anyhow::Error::msg)?;
+                    let task=herdr_farm::domain::TaskId::new(task).map_err(anyhow::Error::msg)?;
                     println!("{}",serde_json::to_string_pretty(&crate::notification_delivery::enqueue(&ctx,&dir,&task,expected_head)?)?);
                 },
                 OperationsCommand::DeliverNotification{id,expected_revision}=>{
-                    let id=herdr_projects::domain::OperationId::new(id).map_err(anyhow::Error::msg)?;
+                    let id=herdr_farm::domain::OperationId::new(id).map_err(anyhow::Error::msg)?;
                     match crate::notification_delivery::deliver(&ctx,&dir,&id,expected_revision)? {
-                        herdr_projects::operations::dispatch::DispatchResult::Recorded(delivery)=>println!("{}",serde_json::to_string_pretty(&delivery)?),
-                        herdr_projects::operations::dispatch::DispatchResult::Unrecorded{claim,..}=>anyhow::bail!("notification outcome was not recorded; operation {} claim epoch {} requires observation; do not retry",claim.operation.as_str(),claim.epoch),
+                        herdr_farm::operations::dispatch::DispatchResult::Recorded(delivery)=>println!("{}",serde_json::to_string_pretty(&delivery)?),
+                        herdr_farm::operations::dispatch::DispatchResult::Unrecorded{claim,..}=>anyhow::bail!("notification outcome was not recorded; operation {} claim epoch {} requires observation; do not retry",claim.operation.as_str(),claim.epoch),
                     }
                 },
-                OperationsCommand::Retire{id,reason,expected_revision,expected_head}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::runtime::retire_operation(&dir,&herdr_projects::domain::OperationId::new(id).map_err(anyhow::Error::msg)?,expected_revision,expected_head,&reason)?)?),
-                OperationsCommand::Inspect=>println!("{}",serde_json::to_string_pretty(&herdr_projects::migration::open_active(&dir)?.deliveries()?)?),
-                OperationsCommand::ReceiptPlan=>println!("{}",serde_json::to_string_pretty(&herdr_projects::runtime::observe_imported_receipts(&dir,None)?)?),
-                OperationsCommand::ObserveImported{expected_head}=>println!("{}",serde_json::to_string_pretty(&herdr_projects::runtime::observe_imported_receipts(&dir,Some(expected_head))?)?),
-                OperationsCommand::Expire=>println!("{} expired claim(s) require observation",herdr_projects::runtime::expire_operations(&dir)?),
-                OperationsCommand::DrainInbox{expected_head}=>println!("{} inbox obligation(s) delivered",herdr_projects::runtime::drain_inbox(&dir,expected_head)?),
+                OperationsCommand::Retire{id,reason,expected_revision,expected_head}=>println!("{}",serde_json::to_string_pretty(&herdr_farm::runtime::retire_operation(&dir,&herdr_farm::domain::OperationId::new(id).map_err(anyhow::Error::msg)?,expected_revision,expected_head,&reason)?)?),
+                OperationsCommand::Inspect=>println!("{}",serde_json::to_string_pretty(&herdr_farm::migration::open_active(&dir)?.deliveries()?)?),
+                OperationsCommand::ReceiptPlan=>println!("{}",serde_json::to_string_pretty(&herdr_farm::runtime::observe_imported_receipts(&dir,None)?)?),
+                OperationsCommand::ObserveImported{expected_head}=>println!("{}",serde_json::to_string_pretty(&herdr_farm::runtime::observe_imported_receipts(&dir,Some(expected_head))?)?),
+                OperationsCommand::Expire=>println!("{} expired claim(s) require observation",herdr_farm::runtime::expire_operations(&dir)?),
+                OperationsCommand::DrainInbox{expected_head}=>println!("{} inbox obligation(s) delivered",herdr_farm::runtime::drain_inbox(&dir,expected_head)?),
             }
             Ok(())
         },
         #[cfg(feature = "state-store")]
         Command::Migration { slug, command } => {
-            use herdr_projects::{migration, projections};
+            use herdr_farm::{migration, projections};
             project::validate_slug(&slug)?;
             let dir = ctx.root.join(&slug);
             match command {
                 MigrationCommand::Bindings=>{
-                    let snapshot=herdr_projects::runtime::snapshot(&dir)?;
+                    let snapshot=herdr_farm::runtime::snapshot(&dir)?;
                     anyhow::ensure!(snapshot.schema_version>=5,"upgrade-store is required for runtime bindings");
                     println!("{}",serde_json::to_string_pretty(&serde_json::json!({"head":snapshot.head,"bindings":snapshot.runtime_bindings}))?);
                 },
@@ -1723,8 +1723,8 @@ pub fn run() -> Result<()> {
             project::validate_slug(&slug)?;
             let dir=ctx.root.join(&slug);
             let value=match command {
-                BudgetCommand::Inspect=>serde_json::to_value(herdr_projects::migration::open_active(&dir)?.budget_report()?)?,
-                BudgetCommand::Import{document,signature,expected_head}=>serde_json::to_value(herdr_projects::authority::import_budget(&dir,&document,&signature,expected_head)?)?,
+                BudgetCommand::Inspect=>serde_json::to_value(herdr_farm::migration::open_active(&dir)?.budget_report()?)?,
+                BudgetCommand::Import{document,signature,expected_head}=>serde_json::to_value(herdr_farm::authority::import_budget(&dir,&document,&signature,expected_head)?)?,
             };
             println!("{}",serde_json::to_string_pretty(&value)?);
             Ok(())
@@ -1772,10 +1772,10 @@ pub fn run() -> Result<()> {
                 project::validate_slug(&slug)?;
                 if project::ensure_legacy(&ctx.root.join(&slug)).is_err() {
                     let dir=ctx.root.join(&slug);
-                    herdr_projects::migration::open_active(&dir)
+                    herdr_farm::migration::open_active(&dir)
                         .context("legacy runtime is disabled; migrated context could not be read")?;
                     if let Some(checkpoint)=ack {
-                        let acked=herdr_projects::runtime::ack_checkpoint(&dir,&checkpoint,session.as_deref().ok_or_else(||anyhow::anyhow!("--ack requires --session"))?)?;
+                        let acked=herdr_farm::runtime::ack_checkpoint(&dir,&checkpoint,session.as_deref().ok_or_else(||anyhow::anyhow!("--ack requires --session"))?)?;
                         println!("Checkpoint {} acknowledged (cursor_seq={}).",acked.id,acked.through_seq);
                         return Ok(());
                     }
@@ -1788,19 +1788,19 @@ pub fn run() -> Result<()> {
                     };
                     let herdr_session=match session {
                         Some(token)=>token,
-                        None=>herdr_projects::memory::new_coordinator_session()?,
+                        None=>herdr_farm::memory::new_coordinator_session()?,
                     };
                     let instructions=std::fs::read_to_string(dir.join("PROJECT.md")).unwrap_or_default();
-                    let profile=herdr_projects::domain::CheckpointProfile{
+                    let profile=herdr_farm::domain::CheckpointProfile{
                         name:resolved.name,digest:resolved.definition_digest,config_digest:Some(resolved.config_digest),
                         budget_chars:resolved.budget.soft_input_chars,
                     };
-                    let result=herdr_projects::runtime::coordinator_context(&dir,&herdr_session,&profile,&instructions)
+                    let result=herdr_farm::runtime::coordinator_context(&dir,&herdr_session,&profile,&instructions)
                         .context("legacy runtime is disabled; migrated context could not be read")?;
                     println!("{}",result.text);
                     // TM4.8 (doc 15 §5): the bounded, advisory fleet section after the checkpointed context.
-                    if let Some(section)=herdr_projects::telemetry::workspace::context_section(&dir,&slug,&ctx.config_dir) {print!("\n{section}");}
-                    if !peek&&!result.unseen.is_empty(){herdr_projects::runtime::update_inbox(&dir,result.head,&result.unseen,false)?;}
+                    if let Some(section)=herdr_farm::telemetry::workspace::context_section(&dir,&slug,&ctx.config_dir) {print!("\n{section}");}
+                    if !peek&&!result.unseen.is_empty(){herdr_farm::runtime::update_inbox(&dir,result.head,&result.unseen,false)?;}
                     return Ok(());
                 }
             }
@@ -1815,16 +1815,16 @@ pub fn run() -> Result<()> {
             #[cfg(feature="state-store")]
             InboxCommand::List{slug}=>{
                 project::validate_slug(&slug)?;
-                println!("{}",serde_json::to_string_pretty(&herdr_projects::runtime::snapshot(&ctx.root.join(&slug))?.inbox)?);Ok(())
+                println!("{}",serde_json::to_string_pretty(&herdr_farm::runtime::snapshot(&ctx.root.join(&slug))?.inbox)?);Ok(())
             },
             InboxCommand::Done { slug, ids, all } => {
                 #[cfg(feature="state-store")]
                 {
                     project::validate_slug(&slug)?;let dir=ctx.root.join(&slug);
                     if project::ensure_legacy(&dir).is_err() {
-                        let snapshot=herdr_projects::runtime::snapshot(&dir)?;
+                        let snapshot=herdr_farm::runtime::snapshot(&dir)?;
                         let ids=if all {snapshot.inbox.iter().filter(|i|!i.done).map(|i|i.content.id.clone()).collect()}else{ids};
-                        println!("{} inbox item(s) marked done",herdr_projects::runtime::update_inbox(&dir,snapshot.head,&ids,true)?);
+                        println!("{} inbox item(s) marked done",herdr_farm::runtime::update_inbox(&dir,snapshot.head,&ids,true)?);
                         return Ok(());
                     }
                 }

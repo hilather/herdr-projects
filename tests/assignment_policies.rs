@@ -5,12 +5,12 @@
 #![cfg(all(feature = "state-store", target_os = "linux"))]
 #![allow(clippy::disallowed_methods)] // Test-only spawns.
 
-use herdr_projects::{domain::*, store::SqliteStore};
+use herdr_farm::{domain::*, store::SqliteStore};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{fs, path::{Path, PathBuf}, process::Command};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 const GRANT_NS: &str = "randomized-assignment@herdr-projects";
 const REVOKE_NS: &str = "randomized-assignment-revocation@herdr-projects";
 const PROHIBITED: [&str; 5] = ["alter_review_policy", "alter_verification_policy", "choose_outside_eligible_set", "exceed_budget", "increase_permissions"];
@@ -36,7 +36,7 @@ fn sim_configuration(version: &str) -> String {
         a = "a".repeat(64), b = "b".repeat(64), c = "c".repeat(64), d = "d".repeat(64), e = "e".repeat(64), version = version)
 }
 
-fn sim_profile(config: &herdr_projects::migration::ConfigReference, name: &str, version: &str) -> FrozenProfile {
+fn sim_profile(config: &herdr_farm::migration::ConfigReference, name: &str, version: &str) -> FrozenProfile {
     let evidence = VersionedReference { id: "sim-evidence".into(), revision: 1, digest: "a".repeat(64) };
     let supported = CapabilityEvidence::Supported { evidence: evidence.clone() };
     FrozenProfile {
@@ -77,7 +77,7 @@ struct World { home: tempfile::TempDir, root: PathBuf, project: PathBuf, key: Pa
 impl World {
     /// `tasks` are queued up front (in rank order) with runtime bindings, fresh observations and contracts.
     fn new(tasks: &[&str]) -> Self {
-        use herdr_projects::{migration, runtime};
+        use herdr_farm::{migration, runtime};
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
         let world_cmd = |args: &[&str]| Command::new(BIN).env_clear().env("HOME", home.path()).args(args).output().unwrap();
@@ -86,7 +86,7 @@ impl World {
         assert!(Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).output().unwrap().status.success());
         let public = fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
         let project = root.join("demo");
-        let config = home.path().join(".config/herdr-projects/config.toml");
+        let config = home.path().join(".config/herdr-farm/config.toml");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         fs::write(&config, format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n")).unwrap();
         let plan = migration::inspect_with_config(&project, &config).unwrap();
@@ -116,10 +116,10 @@ impl World {
         let snapshot = runtime::snapshot(&project).unwrap();
         runtime::scheduler_policy(&project, snapshot.head, snapshot.scheduler.as_ref().unwrap().policy.revision, 1, 2).unwrap();
         let snapshot = runtime::snapshot(&project).unwrap();
-        let observations: Vec<_> = snapshot.runtime_bindings.iter().map(|binding| herdr_projects::reconcile::RuntimeObservation { binding: binding.id.clone(),
+        let observations: Vec<_> = snapshot.runtime_bindings.iter().map(|binding| herdr_farm::reconcile::RuntimeObservation { binding: binding.id.clone(),
             binding_revision: binding.revision, task_revision: binding.task.as_ref().and_then(|id| snapshot.tasks.iter().find(|t| &t.id == id)).map(|t| t.revision),
-            observed_unix_ms: unix_ms(), collector: "herdr-git-v1".into(), config_digest: Some(digest.clone()), ..herdr_projects::reconcile::RuntimeObservation::default() }).collect();
-        runtime::record_observations(&project, &herdr_projects::reconcile::ObservationBatch { expected_head: snapshot.head, observations, dispatch_allowed: false, recorded_head: None }).unwrap();
+            observed_unix_ms: unix_ms(), collector: "herdr-git-v1".into(), config_digest: Some(digest.clone()), ..herdr_farm::reconcile::RuntimeObservation::default() }).collect();
+        runtime::record_observations(&project, &herdr_farm::reconcile::ObservationBatch { expected_head: snapshot.head, observations, dispatch_allowed: false, recorded_head: None }).unwrap();
         let s = runtime::snapshot(&project).unwrap();
         runtime::set_state(&project, s.head, s.control.unwrap().revision, ProjectState::Active, &config).unwrap();
         let mut arms = Vec::new();
@@ -188,7 +188,7 @@ impl World {
         let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM memory_snapshots WHERE task_id=?1 AND task_revision=?2 AND profile_name=?3)",
             rusqlite::params![task, revision, profile.name], |r| r.get(0)).unwrap();
         if exists { return; }
-        let mut memory = herdr_projects::memory::MemoryStore::from_sqlite(SqliteStore::open(&self.db_path).unwrap(), self.project.join(".state/objects"));
+        let mut memory = herdr_farm::memory::MemoryStore::from_sqlite(SqliteStore::open(&self.db_path).unwrap(), self.project.join(".state/objects"));
         memory.create_worker_snapshot(SnapshotRequest { schema_version: 1, task_id: task, profile: profile.name.clone(), domains: vec![], paths: vec![], pinned_keys: vec![],
             sensitivity: "default".into() }, &profile.name, &profile.definition_digest, profile.config.digest.as_deref(), 32000, "Fixture instructions", unix_ms(), None).unwrap();
     }
@@ -198,7 +198,7 @@ impl World {
     fn approve_all(&self, task: &str) {
         for (name, _) in self.arms.iter().rev() {
             self.knowledge(task, name);
-            let inputs = herdr_projects::admission::prepared_admission_inputs(&self.project).unwrap().unwrap_or_else(|| panic!("a ready candidate: {}", {let o=self.hp(&["scheduler", "demo", "inspect"]); format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))}));
+            let inputs = herdr_farm::admission::prepared_admission_inputs(&self.project).unwrap().unwrap_or_else(|| panic!("a ready candidate: {}", {let o=self.hp(&["scheduler", "demo", "inspect"]); format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr))}));
             assert_eq!((&inputs.effective_profile.as_ref().unwrap().name, inputs.task.as_str()), (name, task));
             let profile = inputs.effective_profile.as_ref().unwrap();
             let grant = ApprovalGrant { version: 1, scope: ApprovalScope::for_launch(&inputs).unwrap(), policy: profile.permission_policy.clone(), issued_unix_ms: 0,
@@ -210,7 +210,7 @@ impl World {
     }
 
     /// One admission wake; returns its reason.
-    fn admit(&self) -> &'static str { herdr_projects::admission::admit_decision(&self.project).unwrap().reason }
+    fn admit(&self) -> &'static str { herdr_farm::admission::admit_decision(&self.project).unwrap().reason }
 
     /// Add, approve and admit task `id`, then cancel its never-launched attempt to free the slot.
     fn run_task(&self, id: &str) -> &'static str {
@@ -245,7 +245,7 @@ impl World {
         let mut grant = json!({"schema": "randomized_assignment_authority.v1", "scope": "randomized_assignment", "issuer": "owner", "project_store": store,
             "policies": ["uniform.v1"], "max_exploration_ppm": 0, "arm_caps": {&self.arms[0].1: 100, &self.arms[1].1: 100},
             "valid_from_unix_ms": unix_ms() - 60_000, "expires_unix_ms": unix_ms() + 3_600_000, "prohibited_effects": PROHIBITED,
-            "authority": herdr_projects::authority::policy_reference(&self.project).unwrap()});
+            "authority": herdr_farm::authority::policy_reference(&self.project).unwrap()});
         for (k, v) in changes.as_object().unwrap() { grant[k] = v.clone(); }
         grant
     }
@@ -488,7 +488,7 @@ fn a_revoked_grant_stops_assignment_immediately_and_keeps_earlier_decisions() {
     assert_eq!(w.run_task("r0"), "reserved");
     let before: (String, Value) = { let d = w.decision("r0"); (d.0, d.1) };
     let revocation = json!({"schema": "randomized_assignment_revocation.v1", "grant_id": grant, "project_store": fs::canonicalize(&w.db_path).unwrap().display().to_string(),
-        "reason": "experiment_ended", "authority": herdr_projects::authority::policy_reference(&w.project).unwrap()});
+        "reason": "experiment_ended", "authority": herdr_farm::authority::policy_reference(&w.project).unwrap()});
     // Another key, or the grant's own namespace: refused, nothing recorded.
     let other = w.home.path().join("other");
     assert!(Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&other).output().unwrap().status.success());

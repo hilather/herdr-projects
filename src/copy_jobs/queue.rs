@@ -1,7 +1,7 @@
 //! Volatile admission and fairness only; worker ingress owns all durable writes.
 use super::*;
 use std::collections::{BTreeMap,BTreeSet};
-use herdr_projects::execution_guard::Resource;
+use herdr_farm::execution_guard::Resource;
 type Key=(String,String);
 const LIMIT:usize=128;
 /// Local report reads share Transfer and keep 16 slots (`local_reports::PENDING_LIMIT`).
@@ -46,12 +46,12 @@ impl Queue {
     #[cfg(all(feature="state-store",target_os="linux"))]
     pub fn with_verifier(mut self,lane:crate::canonical_verification_jobs::VerifierLane)->Self {self.verifier=Some(lane);self}
     #[cfg(all(feature="state-store",target_os="linux"))]
-    pub fn offer_canonical_verification(&mut self,path:&Path,operation:&herdr_projects::domain::Operation,revision:u64,mode:crate::canonical_verification_jobs::Mode)->Result<()> {
+    pub fn offer_canonical_verification(&mut self,path:&Path,operation:&herdr_farm::domain::Operation,revision:u64,mode:crate::canonical_verification_jobs::Mode)->Result<()> {
         let lane=self.verifier.as_mut().context("verifier lane unavailable")?;lane.offer(crate::canonical_verification_jobs::request(path,operation,revision,mode)?);Ok(())
     }
     /// Integration jobs share the verifier lane: one result job at a time.
     #[cfg(all(feature="state-store",target_os="linux"))]
-    pub fn offer_canonical_integration(&mut self,path:&Path,operation:&herdr_projects::domain::Operation,revision:u64,mode:crate::canonical_verification_jobs::Mode)->Result<()> {
+    pub fn offer_canonical_integration(&mut self,path:&Path,operation:&herdr_farm::domain::Operation,revision:u64,mode:crate::canonical_verification_jobs::Mode)->Result<()> {
         let lane=self.verifier.as_mut().context("verifier lane unavailable")?;lane.offer(crate::canonical_integration_jobs::request(path,operation,revision,mode)?);Ok(())
     }
     /// One verifier at a time, never beside an exclusive root effect.
@@ -120,19 +120,19 @@ impl Queue {
         self.offer_request(crate::coordinator_jobs::request_notification(ctx,project,c)?)
     }
     #[cfg(feature="state-store")]
-    pub fn offer_canonical_notification(&mut self,ctx:&Ctx,path:&Path,operation:&herdr_projects::domain::Operation,revision:u64,socket:&str)->Result<()> {
+    pub fn offer_canonical_notification(&mut self,ctx:&Ctx,path:&Path,operation:&herdr_farm::domain::Operation,revision:u64,socket:&str)->Result<()> {
         self.offer_request(crate::canonical_notification_jobs::request(ctx,path,operation,revision,socket)?)
     }
     #[cfg(feature="state-store")]
-    pub fn offer_canonical_finalization(&mut self,ctx:&Ctx,path:&Path,operation:&herdr_projects::domain::Operation,revision:u64,mode:crate::canonical_finalization_jobs::Mode)->Result<()> {
+    pub fn offer_canonical_finalization(&mut self,ctx:&Ctx,path:&Path,operation:&herdr_farm::domain::Operation,revision:u64,mode:crate::canonical_finalization_jobs::Mode)->Result<()> {
         self.offer_request(crate::canonical_finalization_jobs::request(ctx,path,operation,revision,mode)?)
     }
     #[cfg(feature="state-store")]
-    pub fn offer_canonical_brief(&mut self,path:&Path,operation:&herdr_projects::domain::Operation,revision:u64)->Result<()> {
+    pub fn offer_canonical_brief(&mut self,path:&Path,operation:&herdr_farm::domain::Operation,revision:u64)->Result<()> {
         self.offer_request(crate::canonical_brief_jobs::request(path,operation,revision)?)
     }
     #[cfg(feature="state-store")]
-    pub fn offer_canonical_launch(&mut self,path:&Path,operation:&herdr_projects::domain::Operation,revision:u64)->Result<()> {
+    pub fn offer_canonical_launch(&mut self,path:&Path,operation:&herdr_farm::domain::Operation,revision:u64)->Result<()> {
         self.offer_request(crate::canonical_brief_jobs::request_launch(path,operation,revision)?)
     }
     pub fn offer_coordinator_start(&mut self,ctx:&Ctx,project:&Project,c:&crate::project::Coordinator)->Result<()> {
@@ -390,7 +390,7 @@ mod tests {
     impl Runner for Gate {
         fn run(&self,cmd:&Cmd)->Result<Output> {
             if cmd.program=="cancel" {self.started.lock().unwrap().send("cancel".into()).unwrap();return Ok(Output{code:Some(0),..Output::default()});}
-            let _root=if cmd.program=="launch" {Some(herdr_projects::execution_guard::RootGuard::exclusive(std::path::Path::new(cmd.stdin.as_deref().unwrap()))?)} else {None};
+            let _root=if cmd.program=="launch" {Some(herdr_farm::execution_guard::RootGuard::exclusive(std::path::Path::new(cmd.stdin.as_deref().unwrap()))?)} else {None};
             let start=*self.clock.tick.lock().unwrap();
             self.started.lock().unwrap().send(cmd.program.clone()).unwrap();
             let mut released=self.release.lock().unwrap();
@@ -470,10 +470,10 @@ mod tests {
         assert_eq!(started.recv_timeout(Duration::from_secs(2)).unwrap(),"launch");
         assert!(started.try_recv().is_err());
         assert!(queue.pending_exclusive_root());assert!(queue.single_pending());assert!(!queue.declared_pending());
-        assert_eq!(queue.pending_sets.len(),0);assert!(herdr_projects::execution_guard::RootGuard::exclusive(root.path()).is_err());
+        assert_eq!(queue.pending_sets.len(),0);assert!(herdr_farm::execution_guard::RootGuard::exclusive(root.path()).is_err());
         assert!(queue.admit().is_empty());assert!(started.try_recv().is_err(),"a second root-exclusive ticket was admitted");
         release(&gate,1);await_idle(&mut queue);
-        assert!(herdr_projects::execution_guard::RootGuard::exclusive(root.path()).is_ok());
+        assert!(herdr_farm::execution_guard::RootGuard::exclusive(root.path()).is_ok());
         assert!(pool.stop(Duration::from_secs(1)));
     }
     #[test]

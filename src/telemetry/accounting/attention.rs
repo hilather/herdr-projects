@@ -22,7 +22,7 @@ use crate::runner::RealRunner;
 pub const SOURCE: &str = "herdr-agent-list-v1";
 /// The `agent_status` label stock Herdr gives an agent waiting on the human.
 const WAITING: &str = "blocked";
-/// The ticker's telemetry pass interval (`HERDR_PROJECTS_TELEMETRY_COLLECT_SECS`, default 300 s).
+/// The ticker's telemetry pass interval (`HERDR_FARM_TELEMETRY_COLLECT_SECS`, default 300 s).
 const DEFAULT_INTERVAL_SECS: i64 = 300;
 /// Distinct Herdr sockets queried per pass; later attempts record `budget_exhausted`.
 const MAX_SOCKETS: usize = 4;
@@ -89,7 +89,7 @@ fn bindings_filtered(project: &Path, selected: Option<&BTreeSet<String>>, open_o
 
 /// The sampling interval the ticker uses; the gap threshold is twice it.
 fn interval_ms() -> i64 {
-    let secs = std::env::var("HERDR_PROJECTS_TELEMETRY_COLLECT_SECS").ok().and_then(|v| v.parse::<i64>().ok()).filter(|s| *s > 0).unwrap_or(DEFAULT_INTERVAL_SECS);
+    let secs = crate::product_environment::product_var_os("HERDR_FARM_TELEMETRY_COLLECT_SECS").and_then(|v| v.into_string().ok()).and_then(|v| v.parse::<i64>().ok()).filter(|s| *s > 0).unwrap_or(DEFAULT_INTERVAL_SECS);
     secs.saturating_mul(1000)
 }
 

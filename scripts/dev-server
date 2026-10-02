@@ -7,4 +7,4 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 log="${TMPDIR:-/tmp}/hp-dev-server.log"
 nohup env -i HOME="$HOME" USER="$USER" SHELL="$SHELL" PATH="$PATH" LANG="${LANG:-en_US.UTF-8}" \
   TERM="${TERM:-xterm-256color}" SSH_AUTH_SOCK="${SSH_AUTH_SOCK:-}" \
-  HERDR_PROJECTS_ROOT="$repo/.dev-root" herdr --session hp-dev server >"$log" 2>&1 &
+  HERDR_FARM_ROOT="$repo/.dev-root" herdr --session hp-dev server >"$log" 2>&1 &

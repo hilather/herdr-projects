@@ -4,7 +4,7 @@ use crate::{
     source_tree::Control,
 };
 use anyhow::{Context, Result, ensure};
-use herdr_projects::{domain::*, execution_guard::ProjectGuard};
+use herdr_farm::{domain::*, execution_guard::ProjectGuard};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -25,17 +25,17 @@ struct Input {
     ownership: RuntimeOwnership,
     started: LaunchStartedReceipt,
     executable: ExecutableIdentity,
-    config: herdr_projects::migration::ConfigReference,
+    config: herdr_farm::migration::ConfigReference,
 }
 fn rows(
     path: &Path,
     binding: Option<&str>,
     control: &Control,
-) -> Result<herdr_projects::store::attempt_tokens::Rows> {
+) -> Result<herdr_farm::store::attempt_tokens::Rows> {
     control.check()?;
-    herdr_projects::migration::open_active_scoped(
+    herdr_farm::migration::open_active_scoped(
         path,
-        herdr_projects::store::controlled::ReadControl::new(
+        herdr_farm::store::controlled::ReadControl::new(
             control.deadline,
             control.cancellation.clone(),
         ),
@@ -63,17 +63,17 @@ impl Input {
             "attempt token project changed"
         );
         ensure!(
-            herdr_projects::canonical_worker::session_identity(Path::new(
+            herdr_farm::canonical_worker::session_identity(Path::new(
                 &self.binding.identity.socket
             ))? == self.started.session,
             "attempt token session changed"
         );
         ensure!(
-            herdr_projects::migration::config_reference(Path::new(&self.config.path))?
+            herdr_farm::migration::config_reference(Path::new(&self.config.path))?
                 == self.config,
             "attempt token configuration changed"
         );
-        herdr_projects::canonical_worker::check_advisory_pane_aliases(
+        herdr_farm::canonical_worker::check_advisory_pane_aliases(
             &self.project,
             &self.binding.id,
             &self.started.route,
@@ -113,7 +113,7 @@ impl Input {
         preflight: impl FnOnce() -> Result<()>,
     ) -> Result<Value> {
         control.check()?;
-        herdr_projects::canonical_worker::executable(
+        herdr_farm::canonical_worker::executable(
             &self.executable,
             control.deadline,
             &control.cancellation,
@@ -130,7 +130,7 @@ impl Input {
         cmd.capture_limit = 1024 * 1024;
         preflight()?;
         ensure!(
-            herdr_projects::canonical_worker::session_identity(Path::new(
+            herdr_farm::canonical_worker::session_identity(Path::new(
                 &self.binding.identity.socket
             ))? == self.started.session,
             "attempt token session changed before request"
@@ -142,7 +142,7 @@ impl Input {
         let out = RealRunner.run(&cmd)?;
         control.check()?;
         ensure!(
-            herdr_projects::canonical_worker::session_identity(Path::new(
+            herdr_farm::canonical_worker::session_identity(Path::new(
                 &self.binding.identity.socket
             ))? == self.started.session,
             "attempt token session changed during request"
@@ -223,8 +223,8 @@ pub fn requests(path: &Path, control: &Control, memory: &Arc<Mutex<Hints>>) -> R
         hints.published.retain(|_, at| at.elapsed() < crate::coordinator::TOKEN_TTL);
         hints.published.keys().filter(|(p, _)| p == &project).map(|(_, id)| id.clone()).collect()
     };
-    let state = herdr_projects::migration::open_active_scoped(path,
-        herdr_projects::store::controlled::ReadControl::new(control.deadline, control.cancellation.clone()))?
+    let state = herdr_farm::migration::open_active_scoped(path,
+        herdr_farm::store::controlled::ReadControl::new(control.deadline, control.cancellation.clone()))?
         .attempt_tokens(&selected)?;
     let project = path.canonicalize()?;
     let m = std::fs::metadata(&project)?;
@@ -316,7 +316,7 @@ fn execute(input: &Input, control: &Control, memory: &Arc<Mutex<Hints>>) -> Resu
         .file_name()
         .and_then(|s| s.to_str())
         .context("attempt token slug missing")?;
-    let fleet = herdr_projects::telemetry::workspace::snapshot(&input.project, slug);
+    let fleet = herdr_farm::telemetry::workspace::snapshot(&input.project, slug);
     let active = fleet["active"]["attempts"].as_array().and_then(|a| {
         a.iter()
             .find(|a| a["attempt_id"] == input.started.attempt.as_str())

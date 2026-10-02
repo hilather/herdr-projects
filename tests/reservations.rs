@@ -7,12 +7,12 @@
 //! (the ticker's launch job is its only other caller), and attempts that no
 //! reservation produced (adopted, lost, a submitting predecessor) are recorded
 //! with the public generic commit.
-use herdr_projects::{authority, domain::*, migration, operations::{DeliveryState, Outcome}, runtime};
+use herdr_farm::{authority, domain::*, migration, operations::{DeliveryState, Outcome}, runtime};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fs, os::unix::fs::{MetadataExt, PermissionsExt}, path::{Path, PathBuf}, process::{Command, Output}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 const POLICY: &str = r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#;
 
 fn now() -> i64 { jiff::Timestamp::now().as_millisecond() }
@@ -32,7 +32,7 @@ impl Factory {
         let key = home.path().join("owner");
         assert!(Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).output().unwrap().status.success());
         let public = fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
-        let config = home.path().join(".config/herdr-projects/config.toml");
+        let config = home.path().join(".config/herdr-farm/config.toml");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         fs::write(&config, format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[profiles.worker]\nkind='codex'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=60\nunknown_usage='allow_with_warning'\n")).unwrap();
         let repo = home.path().join("repo");
@@ -61,7 +61,7 @@ impl Factory {
             let id = TaskId::new(*task).unwrap();
             let revision = runtime::snapshot(&f.project).unwrap().tasks.into_iter().find(|t| t.id == id).unwrap().revision;
             let change = runtime::create_binding(&f.project, Some(&id), Some(revision), f.head(), &route).unwrap();
-            observations.push(herdr_projects::reconcile::RuntimeObservation { binding: change.binding.id.clone(), binding_revision: change.binding.revision,
+            observations.push(herdr_farm::reconcile::RuntimeObservation { binding: change.binding.id.clone(), binding_revision: change.binding.revision,
                 task_revision: change.task_revision, observed_unix_ms: now(), collector: "herdr-git-v2".into(),
                 config_digest: migration::config_reference(&config).unwrap().digest, ..Default::default() });
             f.bindings.insert(task.to_string(), change.binding.id);
@@ -113,7 +113,7 @@ impl Factory {
     /// Prepare `worker` over fake binaries; only the native interaction
     /// evidence, which needs a real agent session, is planted.
     fn launchable_profile(&self) -> VersionedReference {
-        use herdr_projects::worker_supervision::{ProcessIncarnation, SupervisorIdentity};
+        use herdr_farm::worker_supervision::{ProcessIncarnation, SupervisorIdentity};
         let bin = self.path("bin");
         let agent_home = self.path("agent-home");
         fs::create_dir_all(&bin).unwrap();
@@ -193,12 +193,12 @@ impl Factory {
     }
     fn wait(&self, args: &[&str]) -> Value { self.ok(&[&["plan", "wait", "demo"], args].concat()) }
     /// Claim the reserved launch as the ticker's launch job would.
-    fn claim(&self, reservation: &Value) -> Result<herdr_projects::operations::Claim, herdr_projects::store::StoreError> {
+    fn claim(&self, reservation: &Value) -> Result<herdr_farm::operations::Claim, herdr_farm::store::StoreError> {
         let operation = OperationId::new(reservation["record"]["operation"].as_str().unwrap()).unwrap();
         let revision = runtime::snapshot(&self.project).unwrap().deliveries.iter().find(|d| d.operation == operation).unwrap().revision;
         migration::open_active(&self.project).unwrap().claim_operation(&operation, revision, "worker", now(), 60_000)
     }
-    fn delivery(&self, reservation: &Value) -> herdr_projects::operations::Delivery {
+    fn delivery(&self, reservation: &Value) -> herdr_farm::operations::Delivery {
         runtime::snapshot(&self.project).unwrap().deliveries.into_iter().find(|d| d.operation.as_str() == reservation["record"]["operation"]).unwrap()
     }
     /// Record an attempt no reservation produced, through the generic commit.
@@ -333,7 +333,7 @@ fn dependent_reserves_once_after_verified_evidence_and_never_without_a_grant() {
     assert!(refused.contains("not released"), "{refused}");
     // Fixture only: automatic admission is enabled by a signed factory manifest.
     rusqlite::Connection::open(&f.store).unwrap().execute("UPDATE project_control SET factory_admission='on' WHERE singleton=1", []).unwrap();
-    herdr_projects::admission::admit_once(&f.project).unwrap();
+    herdr_farm::admission::admit_once(&f.project).unwrap();
     assert!(f.attempts().is_empty());
     assert_eq!(f.ok(&["approval", "demo", "denials"]), json!([]), "a blocked dependent is not a missing grant");
 
@@ -363,7 +363,7 @@ fn dependent_reserves_once_after_verified_evidence_and_never_without_a_grant() {
     assert!(!f.blockers("dep").iter().any(|b| b.starts_with("verified_dependency_evidence_unavailable")));
 
     // Ready, with knowledge, but no signed grant: a denial and no reservation.
-    herdr_projects::admission::admit_once(&f.project).unwrap();
+    herdr_farm::admission::admit_once(&f.project).unwrap();
     assert_eq!(f.attempts().len(), 1, "only the predecessor's attempt");
     let denials = f.ok(&["approval", "demo", "denials"]);
     assert!(denials.as_array().unwrap().iter().any(|d| d["reason_code"] == "authority_missing" && d["command"] == "admit"), "{denials}");
@@ -378,7 +378,7 @@ fn dependent_reserves_once_after_verified_evidence_and_never_without_a_grant() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let reserved: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(reserved["record"]["inputs"]["dependencies"], *dependencies);
-    herdr_projects::admission::admit_once(&f.project).unwrap();
+    herdr_farm::admission::admit_once(&f.project).unwrap();
     assert_eq!(f.attempts().iter().filter(|a| a.task.as_str() == "dep").count(), 1);
     assert!(!f.reserve_at(&selection, &approval, f.head()).status.success(), "the running dependent is not reserved again");
 }

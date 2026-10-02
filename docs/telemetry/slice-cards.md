@@ -84,7 +84,7 @@ canonical attempt. The success path extends the F1 completion test
 predecessor. Refinements in contracts §4.
 
 Goal: lifecycle marks at every transition, the read-only outcome projection,
-and `herdr-projects telemetry <slug> attempts [--json]`. Files:
+and `herdr-farm telemetry <slug> attempts [--json]`. Files:
 `migrations/0051_attempt_lifecycle.sql`; marks in `src/store/reservations.rs`,
 `src/store/launch.rs`, `src/store/worker_brief.rs`,
 `src/store/worker_termination.rs`, `src/store/worktrees.rs`;
@@ -112,7 +112,7 @@ certification are re-read after it (never `0` meanwhile).
 Outcome `usage` in `telemetry attempts` reads the sidecar (follow-up done).
 Refinements in contracts §5.
 
-Goal: `herdr-projects telemetry <slug> collect` scans Codex execution homes,
+Goal: `herdr-farm telemetry <slug> collect` scans Codex execution homes,
 binds rollouts, writes `telemetry.db` idempotently; outcome `usage` reads it.
 Files: `migrations/telemetry/0001_codex_usage.sql` (`rollout_sources`,
 `codex_usage`, `codex_quarantine`, `codex_discrepancy`, `codex_rate_limits`,
@@ -148,7 +148,7 @@ worktree, a subset rule fails, or ordinals restart within one file.
 gate, `usage_metrics_follow_certified_sources` runs un-ignored since `0.154.0`
 was certified. Refinements in contracts §6.
 
-Goal: `herdr-projects telemetry <slug> report [--json|--text] [--since MS]`
+Goal: `herdr-farm telemetry <slug> report [--json|--text] [--since MS]`
 for M02, M07, M08, M09, M13, M15, M40; M31–M33 listed unavailable. Files:
 `src/telemetry/metrics.rs`, CLI; no migration. Tests (`tests/telemetry.rs`):
 - `golden_acceptance_and_amplification` — contracts §6 scenario → M02 `2/3`,
@@ -176,7 +176,7 @@ says the panel needs `state-store` and doctor warns. The **Projects: fleet**
 action opens the pane (follow-up done).
 
 Goal: read-only `pane fleet` popup (`herdr-plugin.toml` `[[panes]] id =
-"fleet"`, `placement = "popup"`, command `target/release/herdr-projects pane
+"fleet"`, `placement = "popup"`, command `target/release/herdr-farm pane
 fleet`, dispatched by `src/actions.rs` `run_pane`) showing the S6 text report
 and active attempts (configuration label, state, elapsed, usage or `n/a`),
 plus a `doctor` line for sidecar presence and last collect age. Files:

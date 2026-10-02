@@ -579,7 +579,7 @@ the sampling interval and is not applied.
 
 **Observation** (`accounting observe-attention`, and the ticker pass through
 the lane `tick` hook before the ledger sync, at the telemetry pass interval
-`HERDR_PROJECTS_TELEMETRY_COLLECT_SECS`, default 300 s). The canonical binding
+`HERDR_FARM_TELEMETRY_COLLECT_SECS`, default 300 s). The canonical binding
 of an attempt is its latest `runtime.launch_started` receipt (route socket,
 workspace, tab, pane, cwd; agent kind and name). Every attempt with a receipt
 that is not terminated and is `launching`, `running` or `awaiting_input` gets

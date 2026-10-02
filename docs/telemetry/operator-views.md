@@ -111,7 +111,7 @@ A view reads exactly one project:
 ## 6. The switch
 
 ```toml
-# ~/.config/herdr-projects/config.toml
+# ~/.config/herdr-farm/config.toml
 [telemetry]
 views = false
 ```
@@ -228,3 +228,5 @@ prints `bucket denominator rows 3-3 of 3` and `task t4 failed`.
   (`telemetry <slug> watch`, action `fleet-watch`) and the workspace
   sections the popup prints after the views are TM4.8
   ([workspace.md](workspace.md)).
+
+Compatibility: legacy environment variables and existing data/config locations remain supported; see [renaming](../renaming.md).

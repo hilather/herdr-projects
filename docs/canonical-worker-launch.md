@@ -391,7 +391,7 @@ connected server advertises it (the optional patch in `patches/herdr/`). The
 first pane itself runs the bounded, gated PID-namespace supervisor. Stock Herdr
 (0.9.1 and upstream HEAD) lacks that method, so the adapter instead uses
 `workspace.create` and types one line into the new default shell:
-`exec <herdr-projects> launch-exec <spec>`, submitted with an `Enter` key
+`exec <herdr-farm> launch-exec <spec>`, submitted with an `Enter` key
 (stock Herdr does not run a trailing newline in typed text). Both paths are absolute and must
 match `[A-Za-z0-9/._-]`, so no shell (POSIX, fish, ...) needs quoting. The
 literal supervisor argv and working directory are written first to a private
@@ -652,7 +652,7 @@ the production gate.
 
 ### Creation without a recorded process identity
 
-`herdr-projects reconcile <slug> --plan` now reports `inspect_launch_identity`
+`herdr-farm reconcile <slug> --plan` now reports `inspect_launch_identity`
 for retained attempts whose native creation intent exists but whose exact target
 or started process was never recorded. It also identifies the affected runtime
 binding instead of describing it as an unused binding. A still-live original
@@ -860,9 +860,9 @@ test.
    operator inspects the pane and retires the brief or stops the attempt.
 4. **Result submission.** The brief ends with an exact shell script (values from the
    installed contract filled in) that commits the declared outputs on the attempt branch
-   and runs `herdr-projects --root ROOT result PROJECT submit --input-file DOC` through
+   and runs `herdr-farm --root ROOT result PROJECT submit --input-file DOC` through
    the attempt's spool; the worker must see `submission_id` before replying DONE. For a
-   worker that finishes without submitting, `herdr-projects result PROJECT submit-captured
+   worker that finishes without submitting, `herdr-farm result PROJECT submit-captured
    ATTEMPT` captures its worktree, builds the submission from the capture (frozen contract
    revision and digest, base and candidate OIDs, artifact manifest = the blob of every
    declared output at the candidate; objects staged from the repository) and records it
@@ -897,12 +897,12 @@ test.
    (`.herdr-run/PROJECT-TASK/herdr/server.json`). The ticker stops it, only after proving
    the recorded process is still that server (a `herdr server` process whose environment
    names the recorded socket), once the task has no unfinished attempt, and removes its
-   socket directory; `herdr-projects launch PROJECT stop --task ID [--force]` does it
+   socket directory; `herdr-farm launch PROJECT stop --task ID [--force]` does it
    explicitly (refused while the attempt still holds its worker unless `--force`).
 
 ### One operator command
 
-`herdr-projects launch PROJECT run --task ID --profile NAME --repository REPO
+`herdr-farm launch PROJECT run --task ID --profile NAME --repository REPO
 --plan-output docs/FILE.md --prompt-file FILE [--sign-with KEY]` performs the whole
 operator sequence on a migrated project and stops at the first failing step; a
 rerun skips finished steps and never reserves a second attempt. `--prepare-only`
@@ -942,3 +942,5 @@ gives a 64 MiB aggregate retained-byte limit. Both producers report the object c
 ingress reports byte-bound refusals. The trusted base is independent of that
 budget; fetching it uses the verifier's existing 30-second Git command deadline.
 Large changes beyond these bounds need smaller task submissions.
+
+Compatibility: legacy environment variables and existing data/config locations remain supported; see [renaming](renaming.md).

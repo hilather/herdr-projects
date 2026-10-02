@@ -49,11 +49,11 @@ fn coordinator_lines(
     ));
     let age_secs = crate::thread::seconds_since(&record.updated, jiff::Timestamp::now());
     let uncertain_prime = record.prime_claim.as_ref().is_some_and(|c| {
-        c.delivery.phase == herdr_projects::prompt_claim::Phase::Uncertain
-            || c.delivery.phase == herdr_projects::prompt_claim::Phase::Pending
+        c.delivery.phase == herdr_farm::prompt_claim::Phase::Uncertain
+            || c.delivery.phase == herdr_farm::prompt_claim::Phase::Pending
     });
     let uncertain_launch = record.launch_claim.as_ref().is_some_and(|c| {
-        c.phase == herdr_projects::launch_claim::Phase::Uncertain || c.phase == herdr_projects::launch_claim::Phase::Pending
+        c.phase == herdr_farm::launch_claim::Phase::Uncertain || c.phase == herdr_farm::launch_claim::Phase::Pending
     });
     if let Some(agent) = matched {
         if kind_mismatch {
@@ -125,6 +125,15 @@ fn report(
     let _ = writeln!(out, "config dir: {}", config_dir.display());
     write_compiled_features(&mut out);
     let _ = writeln!(out);
+
+    for (new, old) in [
+        (env.home.join(".herdr-farm"), env.home.join(".herdr-projects")),
+        (env.home.join(".config/herdr-farm"), env.home.join(".config/herdr-projects")),
+    ] {
+        if new.exists() && old.exists() {
+            check(&mut out, None, "locations", format!("both {} and {} exist; no data is moved automatically", new.display(), old.display()));
+        }
+    }
 
     let bin = env.herdr_bin();
     match herdr::version(&bin, runner) {
@@ -275,26 +284,26 @@ fn report(
                 #[cfg(feature="state-store")]
                 {
                     // Doctor always runs the whole-store check and shows the ticker's last one.
-                    let last = herdr_projects::store::integrity::load(&dir.join(".state/state.db"))
+                    let last = herdr_farm::store::integrity::load(&dir.join(".state/state.db"))
                         .map_or("none recorded".to_string(), |r| format!("{} at {} (schema {})", r.result, r.checked_unix_ms, r.schema));
-                    match herdr_projects::migration::open_active(&dir) {
+                    match herdr_farm::migration::open_active(&dir) {
                         Ok(_) => check(&mut out, Some(true), &label, format!("store integrity: ok; last periodic check {last}")),
-                        Err(error) if matches!(error.downcast_ref(), Some(herdr_projects::store::StoreError::Corrupt(_))) => check(&mut out, Some(false), &label,
+                        Err(error) if matches!(error.downcast_ref(), Some(herdr_farm::store::StoreError::Corrupt(_))) => check(&mut out, Some(false), &label,
                             format!("store integrity: corrupt; last periodic check {last}; preserve the store and restore it, never auto-repair")),
                         Err(_) => {},
                     }
                     // Telemetry S7: sidecar presence and last collect age, read-only.
-                    match herdr_projects::telemetry::panel::collection(&dir, jiff::Timestamp::now().as_millisecond()) {
+                    match herdr_farm::telemetry::panel::collection(&dir, jiff::Timestamp::now().as_millisecond()) {
                         Ok(line) => check(&mut out, Some(true), &label, format!("telemetry: {line}")),
                         Err(error) => check(&mut out, None, &label, format!("telemetry: sidecar unreadable: {error:#}")),
                     }
                     // TM4.8 (doc 15 §9): query service, ingestion lag, collector coverage,
                     // digest section size and health alerts. Advisory: never FAIL.
-                    for (mark, detail) in herdr_projects::telemetry::workspace::doctor_checks(&dir, &slug, config_dir) {
+                    for (mark, detail) in herdr_farm::telemetry::workspace::doctor_checks(&dir, &slug, config_dir) {
                         check(&mut out, mark, &label, detail);
                     }
                     // L1/F6: a retained Codex profile on an uncertified or drifting agent version.
-                    for (mark, detail) in herdr_projects::telemetry::codex::doctor_checks(&dir) {
+                    for (mark, detail) in herdr_farm::telemetry::codex::doctor_checks(&dir) {
                         check(&mut out, mark, &label, detail);
                     }
                 }
@@ -403,7 +412,7 @@ fn report(
         }
         #[cfg(feature="state-store")]
         if project::ensure_legacy(&project.dir()).is_err() {
-            match herdr_projects::runtime::checkpoint_sizes(&project.dir()) {
+            match herdr_farm::runtime::checkpoint_sizes(&project.dir()) {
                 Ok(Some(sizes)) => check(&mut out, Some(true), &label, format!(
                     "coordinator checkpoint {} full_chars={} delta_chars={} created_unix_ms={}",
                     sizes.checkpoint_id, sizes.full_chars, sizes.delta_chars, sizes.created_unix_ms
@@ -512,10 +521,10 @@ fn factory_platform_label(target_os: &str, live_ssh: bool) -> &'static str {
 pub fn build_info() -> serde_json::Value {
     #[cfg(feature="state-store")]
     let (schema,sqlite,compatible,dispatch)=(
-        Some(herdr_projects::store::SCHEMA),
-        serde_json::json!({"version":rusqlite::version(),"minimum":herdr_projects::store::MIN_SQLITE_VERSION,
-            "compatible":rusqlite::version_number()>=herdr_projects::store::MIN_SQLITE}),
-        rusqlite::version_number()>=herdr_projects::store::MIN_SQLITE,
+        Some(herdr_farm::store::SCHEMA),
+        serde_json::json!({"version":rusqlite::version(),"minimum":herdr_farm::store::MIN_SQLITE_VERSION,
+            "compatible":rusqlite::version_number()>=herdr_farm::store::MIN_SQLITE}),
+        rusqlite::version_number()>=herdr_farm::store::MIN_SQLITE,
         Some(crate::canonical_controller::launch_dispatch_enabled()),
     );
     #[cfg(not(feature="state-store"))]
@@ -533,7 +542,7 @@ fn write_compiled_features(out: &mut String) {
     #[cfg(feature = "state-store")]
     {
         let _ = writeln!(out, "state-store: compiled");
-        let _ = writeln!(out, "schema: {}", herdr_projects::store::SCHEMA);
+        let _ = writeln!(out, "schema: {}", herdr_farm::store::SCHEMA);
         let _ = writeln!(out, "sqlite: {}", rusqlite::version());
         let _ = writeln!(
             out,

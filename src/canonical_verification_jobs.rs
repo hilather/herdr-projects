@@ -8,7 +8,7 @@ use std::{collections::BTreeMap,path::{Path,PathBuf},os::unix::fs::MetadataExt,s
 use anyhow::{Result,Context,ensure};
 use serde::{Serialize,Deserialize};
 use crate::{executor::{Executor,Identity,Lane,Limits,Request,Ticket},runner::{Runner,Cmd,Output,RealRunner},source_tree::Control};
-use herdr_projects::{migration,execution_guard::{CheckGuard,ProjectGuard,Resource},domain::{Operation,OperationId},store::SqliteStore,verification,
+use herdr_farm::{migration,execution_guard::{CheckGuard,ProjectGuard,Resource},domain::{Operation,OperationId},store::SqliteStore,verification,
     operations::{Claim,Outcome,DeliveryState}};
 const JOB:&str="\0herdr-projects-canonical-verification";
 /// Verifier timeout plus checkout and record; the claim lease is the store's 300 s maximum.

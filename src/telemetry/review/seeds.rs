@@ -17,7 +17,7 @@ const EVALUATION_AUTHORITY: &str = "evaluation_owner.v1";
 /// Plan doc 07 §6 provisional minimum for unpaired rates: smaller cells are suppressed.
 pub const DEFAULT_MIN_TRIALS: u32 = 20;
 
-/// `herdr-projects telemetry <slug> review seeds ...`
+/// `herdr-farm telemetry <slug> review seeds ...`
 #[derive(clap::Subcommand)]
 pub enum SeedsCommand {
     /// Evaluation candidates, seeds, detections, trials and the seed history,

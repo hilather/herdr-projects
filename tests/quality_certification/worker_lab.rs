@@ -3,7 +3,7 @@
 //! (a Herdr stand-in server that really runs the supervised command, the
 //! owner-signed `launch draft` → approval → `launch reserve` path, and `ticker
 //! run`, which launches the worker in its sandbox and answers its spool).
-use herdr_projects::{authority, domain::*, migration, runtime};
+use herdr_farm::{authority, domain::*, migration, runtime};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{fs, os::unix::fs::{MetadataExt, PermissionsExt}, path::PathBuf, process::{Child, Command, Output, Stdio}, time::{Duration, Instant}};
@@ -72,7 +72,7 @@ impl WorkerLab {
         let key = home.path().join("owner");
         assert!(Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).output().unwrap().status.success());
         let public = fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
-        let config = home.path().join(".config/herdr-projects/config.toml");
+        let config = home.path().join(".config/herdr-farm/config.toml");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         fs::write(&config, format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[profiles.worker]\nkind='claude'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=600\nunknown_usage='allow_with_warning'\n")).unwrap();
         for dir in ["repo", "bin", "agent-home", "lab"] { fs::create_dir(home.path().join(dir)).unwrap(); }
@@ -98,8 +98,8 @@ impl WorkerLab {
     }
     fn resume(&self) {
         let state = self.state();
-        let config = self.path(".config/herdr-projects/config.toml");
-        let observations = state.runtime_bindings.iter().map(|binding| herdr_projects::reconcile::RuntimeObservation { binding: binding.id.clone(), binding_revision: binding.revision,
+        let config = self.path(".config/herdr-farm/config.toml");
+        let observations = state.runtime_bindings.iter().map(|binding| herdr_farm::reconcile::RuntimeObservation { binding: binding.id.clone(), binding_revision: binding.revision,
             task_revision: binding.task.as_ref().map(|id| state.tasks.iter().find(|t| &t.id == id).unwrap().revision),
             observed_unix_ms: jiff::Timestamp::now().as_millisecond(), collector: "herdr-git-v2".into(),
             config_digest: migration::config_reference(&config).unwrap().digest.clone(), ..Default::default() }).collect::<Vec<_>>();
@@ -150,7 +150,7 @@ sys.stdout.buffer.write(json.dumps({'result':json.loads(reply)['result']}).encod
     /// Prepare `worker` over the lab binaries; only the native interaction
     /// evidence, which needs a real agent session, is planted.
     fn prepare_profile(&mut self) {
-        use herdr_projects::worker_supervision::{ProcessIncarnation, SupervisorIdentity};
+        use herdr_farm::worker_supervision::{ProcessIncarnation, SupervisorIdentity};
         let prepared = self.ok(&["profile", "prepare", "demo", "worker", "--herdr-executable", self.herdr.to_str().unwrap(),
             "--agent-executable", self.path("bin/claude").to_str().unwrap(), "--execution-home", self.path("agent-home").to_str().unwrap()]);
         let mut profile: FrozenProfile = serde_json::from_value(prepared["profile"].clone()).unwrap();

@@ -2,7 +2,7 @@
 use std::{fs::{self,File,OpenOptions},io::Write,os::unix::fs::{OpenOptionsExt,DirBuilderExt},path::{Path,PathBuf}};
 use anyhow::{Context,Result,ensure};
 use crate::{artifacts,cleanup,paths::Ctx,project::Project,thread::Thread,source_tree::Control};
-use herdr_projects::{domain::{Operation,OperationId},migration,operations::{Claim,Outcome,Delivery,dispatch::{self,DeliveryAdapter,PreparedDelivery,DispatchRequest,DispatchResult},finalization::{Finalization,FinalizationReceipt,digest}},runtime};
+use herdr_farm::{domain::{Operation,OperationId},migration,operations::{Claim,Outcome,Delivery,dispatch::{self,DeliveryAdapter,PreparedDelivery,DispatchRequest,DispatchResult},finalization::{Finalization,FinalizationReceipt,digest}},runtime};
 
 pub(crate) fn record(payload:&Finalization)->Thread {Thread{id:payload.artifact_key(),thread_dir:payload.source.clone(),lifecycle_generation:payload.binding_revision,..Default::default()}}
 pub(crate) fn project(path:&Path)->Result<Project> {Ok(Project{root:path.parent().context("project has no root")?.into(),slug:path.file_name().and_then(|s|s.to_str()).context("invalid project slug")?.into()})}
@@ -47,10 +47,10 @@ pub(crate) fn save_receipt_authorized(project:&Project,op:&Operation,receipt:&Fi
 }
 
 #[cfg(target_os="linux")]
-pub(crate) fn preserved_outputs(path:&Path,binding:&str,control:&Control)->Result<Option<herdr_projects::worktree_preservation::VerifiedOutputs>> {
+pub(crate) fn preserved_outputs(path:&Path,binding:&str,control:&Control)->Result<Option<herdr_farm::worktree_preservation::VerifiedOutputs>> {
     control.check()?;let rows=migration::open_active_unchecked(path)?.binding_output_rows(binding,None)?;
     let binding=rows.binding.as_ref().context("output binding missing")?;
-    herdr_projects::worktree_preservation::load_binding_output_rows(path,&rows,binding,&herdr_projects::source_tree::Control{deadline:control.deadline,cancellation:control.cancellation.clone()})
+    herdr_farm::worktree_preservation::load_binding_output_rows(path,&rows,binding,&herdr_farm::source_tree::Control{deadline:control.deadline,cancellation:control.cancellation.clone()})
 }
 
 pub fn enqueue(ctx:&Ctx,path:&Path,binding:&str,head:u64,reason:String)->Result<Operation> {
@@ -67,7 +67,7 @@ pub fn enqueue(ctx:&Ctx,path:&Path,binding:&str,head:u64,reason:String)->Result<
     let op=payload.operation_rows(&rows,jiff::Timestamp::now().as_millisecond())?;
     runtime::enqueue_finalization(&path,head,op)
 }
-fn source_report_hash(binding:&herdr_projects::domain::RuntimeBinding)->Result<String> {
+fn source_report_hash(binding:&herdr_farm::domain::RuntimeBinding)->Result<String> {
     ensure!(fs::canonicalize(&binding.identity.thread_dir)?==Path::new(&binding.identity.thread_dir),"artifact source must be its canonical recorded path");
     Ok(digest(&migration::read_plan_file(&Path::new(&binding.identity.thread_dir).join("report.md"))?))
 }
@@ -126,10 +126,10 @@ pub fn observe(ctx:&Ctx,path:&Path,id:&OperationId,revision:u64,head:u64)->Resul
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use herdr_projects::execution_guard::GatedSpawn;
+    use herdr_farm::execution_guard::GatedSpawn;
     use super::*;
     use crate::scenarios::World;
-    use herdr_projects::{domain::{TaskState,Attempt,AttemptId,AttemptState,Commit,Mutation},operations::DeliveryState};
+    use herdr_farm::{domain::{TaskState,Attempt,AttemptId,AttemptState,Commit,Mutation},operations::DeliveryState};
     pub(crate) fn fixture()->(World,PathBuf,Operation) {
         let world=World::new();let project=crate::project::create(&world.root,"finalize","",vec![]).unwrap();project.set_status(crate::project::Status::Paused).unwrap();
         let source=world.home.path().join("artifact-root/source");fs::create_dir_all(source.join("library")).unwrap();fs::write(source.join("report.md"),"report for review\n").unwrap();fs::write(source.join("library/artifact"),b"preserved bytes").unwrap();

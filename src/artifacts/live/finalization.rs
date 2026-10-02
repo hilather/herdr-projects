@@ -1,6 +1,8 @@
 //! Recoverable report-optional projection followed by one atomic finalization.
 use super::*;
-use herdr_projects::{execution_guard::{ProjectEffect,ProjectGuard},final_copy_intent::{FinalCopyIntent,Purpose}};
+use herdr_farm::{execution_guard::ProjectEffect,final_copy_intent::{FinalCopyIntent,Purpose}};
+#[cfg(test)]
+use herdr_farm::execution_guard::ProjectGuard;
 
 fn eligible(project:&Project,guard:&dyn ProjectEffect,t:&Thread)->Result<()> {
     guard.check_project(&project.dir())?;crate::project::ensure_legacy(&project.dir())?;

@@ -40,7 +40,7 @@ pub const DIGEST_MAX_BYTES: usize = 4096;
 pub const WATCH_DEFAULT_SECS: u64 = 5;
 pub const WATCH_MAX_SECS: u64 = 300;
 
-/// `herdr-projects telemetry <slug> workspace ...`
+/// `herdr-farm telemetry <slug> workspace ...`
 #[derive(clap::Subcommand, Clone, Debug)]
 pub enum Command {
     /// The fleet snapshot every workspace surface renders (the pane body; `--json`: `telemetry-workspace.v1`). Read-only.
@@ -49,7 +49,7 @@ pub enum Command {
     Digest,
 }
 
-/// `herdr-projects telemetry <slug> watch`: the fleet pane, refreshed.
+/// `herdr-farm telemetry <slug> watch`: the fleet pane, refreshed.
 #[derive(clap::Args, Clone, Debug)]
 pub struct WatchArgs {
     /// Seconds between refreshes (1-300).

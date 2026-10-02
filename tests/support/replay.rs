@@ -11,12 +11,12 @@
 //! are verified by the hidden checks in the isolated verifier. One candidate
 //! is launched for real through the ticker on a Herdr stand-in and probes its
 //! sandbox for the hidden checks.
-use herdr_projects::{authority, domain::*, migration, runtime};
+use herdr_farm::{authority, domain::*, migration, runtime};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fs, io::Write as _, os::unix::fs::{MetadataExt, PermissionsExt}, path::{Path, PathBuf}, process::{Child, Command, Output, Stdio}, time::{Duration, Instant}};
 
-pub(crate) const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+pub(crate) const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 const HISTORY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/replay/sample-history.json");
 pub(crate) const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/replay/suite-v1.golden.json");
 pub(crate) const CLEAN: &str = r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#;
@@ -86,7 +86,7 @@ impl Lab {
         let key = home.path().join("owner");
         assert!(Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).output().unwrap().status.success());
         let public = fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
-        let config = home.path().join(".config/herdr-projects/config.toml");
+        let config = home.path().join(".config/herdr-farm/config.toml");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         fs::write(&config, format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[profiles.worker]\nkind='claude'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=600\n{budget}\n")).unwrap();
         for dir in ["repo", "bin", "agent-home", "lab"] { fs::create_dir(home.path().join(dir)).unwrap(); }
@@ -158,8 +158,8 @@ impl Lab {
     /// A fresh observation of every binding, then the project active.
     pub(crate) fn observe(&self) {
         let state = self.state();
-        let config = self.path(".config/herdr-projects/config.toml");
-        let observations = state.runtime_bindings.iter().map(|binding| herdr_projects::reconcile::RuntimeObservation { binding: binding.id.clone(), binding_revision: binding.revision,
+        let config = self.path(".config/herdr-farm/config.toml");
+        let observations = state.runtime_bindings.iter().map(|binding| herdr_farm::reconcile::RuntimeObservation { binding: binding.id.clone(), binding_revision: binding.revision,
             task_revision: binding.task.as_ref().map(|id| state.tasks.iter().find(|t| &t.id == id).unwrap().revision),
             observed_unix_ms: jiff::Timestamp::now().as_millisecond(), collector: "herdr-git-v2".into(),
             config_digest: migration::config_reference(&config).unwrap().digest.clone(), ..Default::default() }).collect::<Vec<_>>();
@@ -188,7 +188,7 @@ sys.stdout.buffer.write(json.dumps({'result':json.loads(reply)['result']}).encod
     }
     /// `profile prepare` over the lab binaries; only the native interaction evidence is planted.
     pub(crate) fn prepare_profile(&mut self) {
-        use herdr_projects::worker_supervision::{ProcessIncarnation, SupervisorIdentity};
+        use herdr_farm::worker_supervision::{ProcessIncarnation, SupervisorIdentity};
         let prepared = self.ok(&["profile", "prepare", "demo", "worker", "--herdr-executable", self.herdr.to_str().unwrap(),
             "--agent-executable", self.path("bin/claude").to_str().unwrap(), "--execution-home", self.path("agent-home").to_str().unwrap()]);
         let mut profile: FrozenProfile = serde_json::from_value(prepared["profile"].clone()).unwrap();

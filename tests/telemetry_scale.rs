@@ -30,7 +30,7 @@
 mod support;
 
 /// SQLite's memory statistics are off in this process before any SQLite use,
-/// as in the `herdr-projects` binary (src/main.rs), whose ticker hosts the
+/// as in the `herdr-farm` binary (src/main.rs), whose ticker hosts the
 /// telemetry pass on a thread beside the controller: with them on, every
 /// SQLite allocation of every thread takes one process-wide mutex.
 /// `SCALE_SQLITE_MEMSTATUS=1` keeps them on, to measure that contention.
@@ -46,7 +46,7 @@ unsafe extern "C" fn sqlite_memstatus_from_env() {
     }
 }
 
-use herdr_projects::telemetry::{self, codex};
+use herdr_farm::telemetry::{self, codex};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{fs, io::{Read, Write}, os::unix::process::CommandExt, path::{Path, PathBuf}, process::{Command, Stdio},
@@ -228,7 +228,7 @@ fn generate(f: Fixture, scale: Scale) -> Dataset {
     let now = unix_ms();
     // The fixture's one runtime binding, read before the planted rows (the store's
     // snapshot decodes every operation; planted ones carry no launch payload).
-    let snapshot = herdr_projects::store::SqliteStore::open(&f.project.join(".state/state.db")).unwrap().read_snapshot(None).unwrap();
+    let snapshot = herdr_farm::store::SqliteStore::open(&f.project.join(".state/state.db")).unwrap().read_snapshot(None).unwrap();
     let binding = snapshot.runtime_bindings[0].clone();
     let observed = (binding.id.clone(), binding.revision, snapshot.tasks.iter().find(|t| Some(&t.id) == binding.task.as_ref()).map(|t| t.revision));
     let homes: Vec<PathBuf> = (0..scale.homes).map(|h| f.tmp.path().join(format!("codex-homes/h{h}"))).collect();
@@ -705,8 +705,8 @@ fn scale_gates_hold_under_load() {
     assert!(gaps(&d, "pending") >= 1, "the refused range is a recorded gap");
 
     // A stalled exporter (its reader never reads) blocks only itself.
-    fs::create_dir_all(d.home().join(".config/herdr-projects")).unwrap();
-    let config = d.home().join(".config/herdr-projects/telemetry-export.toml");
+    fs::create_dir_all(d.home().join(".config/herdr-farm")).unwrap();
+    let config = d.home().join(".config/herdr-farm/telemetry-export.toml");
     fs::write(&config, "schema = \"telemetry-export-config.v1\"\n[external]\nenabled = true\ndestination = \"stdout\"\n").unwrap();
     fs::set_permissions(&config, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     let (mut stalled, _reader) = stalled_exporter(&d);
@@ -899,7 +899,7 @@ fn refused_collect(d: &Dataset) -> Run {
 /// the unread end.
 fn stalled_exporter(d: &Dataset) -> (std::process::Child, std::os::fd::OwnedFd) {
     use std::os::fd::{FromRawFd, OwnedFd};
-    let config = d.home().join(".config/herdr-projects");
+    let config = d.home().join(".config/herdr-farm");
     fs::create_dir_all(&config).unwrap();
     let path = config.join("telemetry-export.toml");
     fs::write(&path, "schema = \"telemetry-export-config.v1\"\n[external]\nenabled = true\ndestination = \"stdout\"\n").unwrap();
@@ -1075,7 +1075,7 @@ fn scale_2_queries() {
     let d = Dataset::load(&dir);
     let repeats = env_usize("SCALE_REPEATS", 5);
     let per = env_usize("SCALE_PER_ROUND", 4);
-    let config = d.home().join(".config/herdr-projects");
+    let config = d.home().join(".config/herdr-farm");
     fs::create_dir_all(&config).unwrap();
     let queries: Vec<(&str, Vec<&str>)> = vec![
         ("query M08 (lane usage)", vec!["query", "--metric", "M08", "--json"]),
@@ -1329,19 +1329,19 @@ fn scale_4_freshness_burst() {
 /// Controller operations: an admission decision (read path) and a
 /// reconciliation commit (the observation record the ticker writes each pass),
 /// every 100 ms. Returns `(admission_ms, reconcile_ms)` samples.
-fn controller(d: &Dataset, store: &mut herdr_projects::store::SqliteStore, stop: &AtomicBool, until: Instant) -> (Vec<f64>, Vec<f64>) {
+fn controller(d: &Dataset, store: &mut herdr_farm::store::SqliteStore, stop: &AtomicBool, until: Instant) -> (Vec<f64>, Vec<f64>) {
     let (mut admission, mut reconcile) = (Vec::new(), Vec::new());
     let (binding, binding_revision, task_revision) = d.binding.clone();
     while Instant::now() < until && !stop.load(Ordering::Relaxed) {
         let started = Instant::now();
-        let observed = herdr_projects::admission::admit_decision_observed(&d.project);
+        let observed = herdr_farm::admission::admit_decision_observed(&d.project);
         admission.push(started.elapsed().as_secs_f64() * 1e3);
         observed.result.unwrap();
         let t = Instant::now();
         let head = store.current_head().unwrap();
-        store.record_observations(head, &[herdr_projects::reconcile::RuntimeObservation { binding: binding.clone(), binding_revision,
+        store.record_observations(head, &[herdr_farm::reconcile::RuntimeObservation { binding: binding.clone(), binding_revision,
             task_revision, observed_unix_ms: unix_ms(), collector: "herdr-git-v1".into(), config_digest: d.config_digest.clone(),
-            ..herdr_projects::reconcile::RuntimeObservation::default() }]).unwrap();
+            ..herdr_farm::reconcile::RuntimeObservation::default() }]).unwrap();
         reconcile.push(t.elapsed().as_secs_f64() * 1e3);
         std::thread::sleep(Duration::from_millis(100).saturating_sub(started.elapsed()));
     }
@@ -1364,9 +1364,9 @@ fn scale_3_controller() {
     let cadence = Duration::from_millis(env_usize("SCALE_CADENCE_MS", 1000) as u64);
     let reader_every = Duration::from_millis(env_usize("SCALE_READER_MS", 1000) as u64);
     let sids: Vec<String> = d.active.iter().map(|s| s.sid.clone()).collect();
-    let config = d.home().join(".config/herdr-projects");
+    let config = d.home().join(".config/herdr-farm");
     fs::create_dir_all(&config).unwrap();
-    let mut store = herdr_projects::store::SqliteStore::open(&d.state()).unwrap();
+    let mut store = herdr_farm::store::SqliteStore::open(&d.state()).unwrap();
     let state = Arc::new(Mutex::new((std::mem::take(&mut d.active), d.totals, d.mix.clone())));
     let load0 = load_average();
     let mut blocks = Vec::new();
@@ -1443,10 +1443,10 @@ fn scale_3_controller() {
 fn scale_5_faults() {
     let dir = data_dir();
     let mut d = Dataset::load(&dir);
-    let mut store = herdr_projects::store::SqliteStore::open(&d.state()).unwrap();
+    let mut store = herdr_farm::store::SqliteStore::open(&d.state()).unwrap();
     let load0 = load_average();
     let mut out = serde_json::Map::new();
-    let config = d.home().join(".config/herdr-projects");
+    let config = d.home().join(".config/herdr-farm");
     fs::create_dir_all(&config).unwrap();
 
     // Contention: three racing processes plus the controller (4 threads), 60 s, with a backlog to collect.
@@ -1662,7 +1662,7 @@ fn scale_6_fairness() {
     let sids: Vec<Vec<String>> = datasets.iter().map(|d| d.active.iter().map(|s| s.sid.clone()).collect()).collect();
     let projects: Vec<PathBuf> = datasets.iter().map(|d| d.project.clone()).collect();
     let state = Arc::new(Mutex::new(datasets.iter_mut().map(|d| (std::mem::take(&mut d.active), d.totals, d.mix.clone())).collect::<Vec<_>>()));
-    let mut stores: Vec<_> = datasets.iter().map(|d| herdr_projects::store::SqliteStore::open(&d.state()).unwrap()).collect();
+    let mut stores: Vec<_> = datasets.iter().map(|d| herdr_farm::store::SqliteStore::open(&d.state()).unwrap()).collect();
     let cadence = Duration::from_millis(env_usize("SCALE_CADENCE_MS", 1_000) as u64);
     let reader_every = Duration::from_millis(env_usize("SCALE_READER_MS", 5_000) as u64);
     let length = Duration::from_secs(env_usize("SCALE_FAIRNESS_S", 15) as u64);

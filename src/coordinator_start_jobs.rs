@@ -1,6 +1,6 @@
 //! Coordinator startup under the same ownership and frozen inputs as priming.
 use super::*;
-use herdr_projects::launch_claim::{Claim as LaunchClaim,Phase as LaunchPhase};
+use herdr_farm::launch_claim::{Claim as LaunchClaim,Phase as LaunchPhase};
 
 pub(super) fn ready(c:&Coordinator)->Result<()> {
     super::ready(c)?;
@@ -24,7 +24,7 @@ fn execute_with(input:&Input,control:&Control,after_claim:impl FnOnce()->Result<
     let(c,kind)=current(input,&p,&guard,control)?;ready(&c)?;ensure!(c.launch_sequence==input.sequence,"coordinator launch sequence changed");
     crate::brief_jobs::ownership::check_coordinator(&p,&c.pane_id,&input.socket,control)?;
     let h=crate::herdr::Herdr::new(&input.herdr,&input.socket,&crate::runner::RealRunner);
-    let probe=herdr_projects::supervision::run(h.cmd(crate::herdr::CALL_TIMEOUT).args(["remote-api-bridge","--check"]),control.deadline,control.cancellation.clone(),&locks)?;
+    let probe=herdr_farm::supervision::run(h.cmd(crate::herdr::CALL_TIMEOUT).args(["remote-api-bridge","--check"]),control.deadline,control.cancellation.clone(),&locks)?;
     control.check()?;ensure!(probe.success()&&probe.stdout.trim()=="herdr-api-bridge-v1","coordinator JSON API bridge unavailable");
     let agents:Vec<crate::herdr::Agent>=serde_json::from_value(run(h.cmd(crate::herdr::CALL_TIMEOUT).args(["agent","list"]),control,&locks)?["agents"].clone())?;
     ensure!(!agents.iter().any(|a|a.pane_id==c.pane_id),"coordinator pane already has an agent");
@@ -43,7 +43,7 @@ fn execute_with(input:&Input,control:&Control,after_claim:impl FnOnce()->Result<
     let id=format!("coordinator-start-{}-{}",claim.generation,claim.sequence);
     let payload=serde_json::to_string(&serde_json::json!({"id":id,"method":"agent.start","params":{"name":c.agent_name,"kind":kind,"pane_id":c.pane_id,"args":args,"timeout_ms":20000}}))?+"\n";
     ensure!(payload.len()<=64*1024,"coordinator start frame exceeds bounds");
-    let out=herdr_projects::supervision::run(h.cmd(crate::herdr::CALL_TIMEOUT).arg("remote-api-bridge").stdin(payload),control.deadline,control.cancellation.clone(),&locks)?;
+    let out=herdr_farm::supervision::run(h.cmd(crate::herdr::CALL_TIMEOUT).arg("remote-api-bridge").stdin(payload),control.deadline,control.cancellation.clone(),&locks)?;
     control.check()?;ensure!(out.success(),"coordinator start command failed");let reply:serde_json::Value=serde_json::from_str(&out.stdout)?;
     let result=&reply["result"];ensure!(reply["id"].as_str()==Some(&id)&&reply.get("error").is_none()&&result["type"].as_str()==Some("agent_started")&&result["agent"]["terminal_id"].as_str()==Some(&claim.terminal),"coordinator start acknowledgement mismatch");
     for (field,expected) in [("pane_id",&c.pane_id),("tab_id",&c.tab_id),("workspace_id",&c.workspace_id),("cwd",&c.cwd),("name",&c.agent_name)] {

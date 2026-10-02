@@ -31,7 +31,7 @@ if metadata.st_mode & 0o077 or metadata.st_size > 256 * 1024:
     parser.error('Authentication file must be private and at most 256 KiB.')
 build = subprocess.run(
     ['cargo', 'test', '--release', '--locked', '--offline', '--features', 'state-store',
-     '--lib', '--bin', 'herdr-projects', '--no-run', '--message-format=json'],
+     '--lib', '--bin', 'herdr-farm', '--no-run', '--message-format=json'],
     cwd=root, stdout=subprocess.PIPE, text=True,
 )
 executables = {}

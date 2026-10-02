@@ -5,7 +5,7 @@ use crate::{
     runner::{Cmd, Output, Runner},
 };
 use anyhow::{Context, Result, ensure};
-use herdr_projects::domain::{AttemptId, Operation, OperationId};
+use herdr_farm::domain::{AttemptId, Operation, OperationId};
 use serde::{Deserialize, Serialize};
 use std::{
     os::unix::fs::MetadataExt,
@@ -140,13 +140,13 @@ impl Runner for JobRunner {
         ensure!(!input.launch_advance || (!input.resource_recovery && input.preparation.is_none() && input.termination.is_none()),"ambiguous launch advancement action");
         if input.launch_advance {
             #[cfg(target_os="linux")]
-            { herdr_projects::canonical_worker::advance_launch(&input.project,&input.operation,input.revision,deadline,cancellation)?; }
+            { herdr_farm::canonical_worker::advance_launch(&input.project,&input.operation,input.revision,deadline,cancellation)?; }
             #[cfg(not(target_os="linux"))]
             anyhow::bail!("canonical launch requires Linux pidfs");
         } else if input.resource_recovery {
             #[cfg(target_os = "linux")]
             {
-                herdr_projects::canonical_worker::reconcile_launch(
+                herdr_farm::canonical_worker::reconcile_launch(
                     &input.project,
                     &input.operation,
                     input.revision,
@@ -157,7 +157,7 @@ impl Runner for JobRunner {
             #[cfg(not(target_os = "linux"))]
             anyhow::bail!("canonical resource recovery requires Linux pidfs");
         } else if let Some(attempt) = input.preparation {
-            herdr_projects::canonical_worker::prepare_brief(
+            herdr_farm::canonical_worker::prepare_brief(
                 &input.project,
                 &attempt,
                 input.revision,
@@ -167,7 +167,7 @@ impl Runner for JobRunner {
         } else if let Some(attempt) = input.termination {
             #[cfg(target_os = "linux")]
             {
-                herdr_projects::canonical_worker::reconcile_termination(
+                herdr_farm::canonical_worker::reconcile_termination(
                     &input.project,
                     &attempt,
                     input.revision,
@@ -181,7 +181,7 @@ impl Runner for JobRunner {
                 anyhow::bail!("canonical termination requires Linux pidfs");
             }
         } else {
-            herdr_projects::canonical_worker::deliver_brief(
+            herdr_farm::canonical_worker::deliver_brief(
                 &input.project,
                 &input.operation,
                 input.revision,

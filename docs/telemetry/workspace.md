@@ -89,7 +89,7 @@ symlink checks as the views ([operator-views.md](operator-views.md) §5).
 | action id (`herdr-plugin.toml`) | opens | what it does |
 |---|---|---|
 | `fleet` | popup `fleet` | one-shot fleet view: report, active attempts, the five operator views, then the workspace snapshot (§7) |
-| `fleet-watch` | split pane `fleet-watch` | `telemetry <slug> watch` for the invoking workspace's project until the pane is closed (`HERDR_PROJECTS_FLEET_INTERVAL` overrides the 5 s interval) |
+| `fleet-watch` | split pane `fleet-watch` | `telemetry <slug> watch` for the invoking workspace's project until the pane is closed (`HERDR_FARM_FLEET_INTERVAL` overrides the 5 s interval) |
 | `fleet-race` | popup `fleet-race` | proposes a candidate group (§4) |
 | `fleet-select` | popup `fleet-select` | records a candidate-group selection (§4) |
 | `fleet-replay` | popup `fleet-replay` | launches a replay-suite run (§4) |
@@ -108,25 +108,25 @@ for example:
 [[keys.command]]
 key = "prefix+f"
 type = "plugin_action"
-command = "herdr-projects.fleet-watch"
+command = "herdr-farm.fleet-watch"
 description = "Projects: fleet pane"
 
 [[keys.command]]
 key = "prefix+F"
 type = "plugin_action"
-command = "herdr-projects.fleet"
+command = "herdr-farm.fleet"
 description = "Projects: fleet at a glance"
 
 [[keys.command]]
 key = "prefix+r"
 type = "plugin_action"
-command = "herdr-projects.fleet-race"
+command = "herdr-farm.fleet-race"
 description = "Projects: propose a candidate group"
 
 [[keys.command]]
 key = "prefix+s"
 type = "plugin_action"
-command = "herdr-projects.fleet-select"
+command = "herdr-farm.fleet-select"
 description = "Projects: select candidate"
 ```
 
@@ -137,7 +137,7 @@ above, and a user binds those actions to keys.
 ## 4. Owner popups: proposals routed through owner commands
 
 Each popup asks its questions and prints the exact owner command it would
-run (`Runs: herdr-projects …`). It runs that command only when the answer to
+run (`Runs: herdr-farm …`). It runs that command only when the answer to
 `Confirm (y/N)` is `y`. The command is parsed by its own `clap` definition
 and runs through its own entry point (`workspace::owner`). Only
 `quality groups create|select|show` and `replay run|subset|report|show` can
@@ -421,3 +421,5 @@ a claimed occurrence is never automatically replayed.
 
 E2E evidence: `tests/telemetry_routines.rs`, using the shared signed replay
 workflow fixture in `tests/support/replay.rs`.
+
+Compatibility: legacy environment variables and existing data/config locations remain supported; see [renaming](../renaming.md).

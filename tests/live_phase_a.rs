@@ -47,7 +47,7 @@ fn live_herdr_workspace_and_worktree_contract() {
     std::fs::write(project.join("threads/t-0001.toml"), toml::to_string(&thread).unwrap()).unwrap();
     // Close only the fixture's worktree workspace so its shell cannot write.
     lab.herdr(&["workspace", "close", reopened["result"]["root_pane"]["workspace_id"].as_str().unwrap()]);
-    let mut removal = lab.command(env!("CARGO_BIN_EXE_herdr-projects"));
+    let mut removal = lab.command(env!("CARGO_BIN_EXE_herdr-farm"));
     removal.args(["thread", "resolve", "demo", "t-0001", "--remove-worktree", "--writers-stopped"]);
     let (removed_ok, _, error) = lab.run(removal);
     assert!(removed_ok || std::env::var_os("HP_LIVE_REQUIRE_REMOVAL").is_none(), "positive cleanup required: {error}");
@@ -118,7 +118,7 @@ fn live_ssh_native_stream_preserves_literal_paths_and_binary_data() {
     fs::write(source.join("report.md"), &payload).unwrap();
     fs::write(source.join("library/quotes 'λ$\nfile"), b"binary\0\xff").unwrap();
     let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
-    let script = format!("/usr/bin/env -i HOME={} PATH=/usr/bin:/bin {} artifact-stream --path {}", quote(lab.path().join("home").to_str().unwrap()), quote(env!("CARGO_BIN_EXE_herdr-projects")), quote(source.to_str().unwrap()));
+    let script = format!("/usr/bin/env -i HOME={} PATH=/usr/bin:/bin {} artifact-stream --path {}", quote(lab.path().join("home").to_str().unwrap()), quote(env!("CARGO_BIN_EXE_herdr-farm")), quote(source.to_str().unwrap()));
     let mut command = lab.command("ssh");
     command.arg("-F").arg(lab.path().join("ssh_config")).args(["--", "fixture", &format!("sh -c {}", quote(&script))]);
     let (ok, bytes, error) = lab.run_bytes(command);
@@ -149,7 +149,7 @@ fn live_popup_handoff_routes_input_to_the_requested_action() {
     let mut lab = Lab::new();
     let plugin = lab.path().join("plugin");
     fs::create_dir_all(plugin.join("target/release")).unwrap();
-    fs::copy(env!("CARGO_BIN_EXE_herdr-projects"), plugin.join("target/release/herdr-projects")).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_herdr-farm"), plugin.join("target/release/herdr-farm")).unwrap();
     let mut manifest: toml::Value = toml::from_str(include_str!("../herdr-plugin.toml")).unwrap();
     // This fixture tests the action/popup contract, not package build or startup.
     manifest.as_table_mut().unwrap().remove("build");
@@ -169,7 +169,7 @@ fn live_popup_handoff_routes_input_to_the_requested_action() {
     assert!(client.wait_for("fixture"), "{}", lab.diagnostics());
     for (action, expected) in [("pause", "paused"), ("resume", "active")] {
         client.clear_output();
-        lab.herdr(&["plugin", "action", "invoke", action, "--plugin", "herdr-projects"]);
+        lab.herdr(&["plugin", "action", "invoke", action, "--plugin", "herdr-farm"]);
         assert!(client.wait_for("number:"), "{}", lab.diagnostics());
         client.type_text(b"1\r");
         assert!(client.wait_for("close:"), "{}", lab.diagnostics());
@@ -193,9 +193,9 @@ fn live_canonical_supervisor_stops_detached_worker_descendants() {
     let workspace=created["result"]["workspace"]["workspace_id"].as_str().unwrap();
     let heartbeat=lab.path().join("detached-heartbeat");
     let script="/usr/bin/setsid /bin/sh -c 'while :; do printf x >> \"$1\"; /usr/bin/sleep 0.05; done' detached-worker \"$1\" & wait";
-    let argv=herdr_projects::worker_supervision::command(std::path::Path::new("/bin/sh"),
+    let argv=herdr_farm::worker_supervision::command(std::path::Path::new("/bin/sh"),
         &["-c".into(),script.into(),"worker".into(),heartbeat.to_str().unwrap().into()],10).unwrap();
-    let line=herdr_projects::worker_supervision::posix_command(&argv).unwrap();
+    let line=herdr_farm::worker_supervision::posix_command(&argv).unwrap();
     let mut command=lab.command(&lab.herdr);
     command.args(["--session","hp-acceptance","pane","run",pane,&line]);
     let(ok,_,error)=lab.run(command);assert!(ok,"supervised submission failed: {error}");
@@ -208,7 +208,7 @@ fn live_canonical_supervisor_stops_detached_worker_descendants() {
     let outer=process["result"]["process_info"]["foreground_processes"].as_array().unwrap().iter()
         .find(|p|p["argv"][0]=="/usr/bin/unshare").expect("namespace supervisor was not in the pane's foreground process group");
     let pid=outer["pid"].as_u64().unwrap();
-    let observation=herdr_projects::worker_supervision::SupervisorObservation::observe(u32::try_from(pid).unwrap(),&argv).unwrap();
+    let observation=herdr_farm::worker_supervision::SupervisorObservation::observe(u32::try_from(pid).unwrap(),&argv).unwrap();
     assert!(!observation.exited().unwrap());
     use std::os::unix::fs::MetadataExt;
     let (device,inode)=observation.namespace_identity().unwrap();
@@ -240,7 +240,7 @@ fn live_canonical_layout_launches_literal_argv() {
     let workspace=created["result"]["workspace"]["workspace_id"].as_str().unwrap();
     let literal="space ' $(touch injected); `touch injected` \\ λ";
     let destination=lab.path().join("literal-result");
-    let argv=herdr_projects::worker_supervision::isolated_gated_command(std::path::Path::new("/bin/sh"),&[
+    let argv=herdr_farm::worker_supervision::isolated_gated_command(std::path::Path::new("/bin/sh"),&[
         "-c".into(),"printf '%s' \"$1\" > \"$2\"; exec /usr/bin/sleep 30".into(),
         "fixture".into(),literal.into(),destination.display().to_string()],15,"release-live-fixture",&lab.path().join("home"),&isolation(lab.path(),std::path::Path::new("/bin/sh"))).unwrap();
     let request=serde_json::json!({"id":"literal-launch","method":"layout.apply","params":{
@@ -272,10 +272,10 @@ fn live_canonical_layout_launches_literal_argv() {
     let process=lab.herdr(&["pane","process-info","--pane",pane]);
     let outer=process["result"]["process_info"]["foreground_processes"].as_array().unwrap().iter()
         .find(|p|p["argv"][0]=="/usr/bin/unshare").expect("direct supervisor was not observed");
-    let observed=herdr_projects::worker_supervision::SupervisorObservation::observe(u32::try_from(outer["pid"].as_u64().unwrap()).unwrap(),&argv).unwrap();
+    let observed=herdr_farm::worker_supervision::SupervisorObservation::observe(u32::try_from(outer["pid"].as_u64().unwrap()).unwrap(),&argv).unwrap();
     let gate=observed.waiting_gate(&argv).unwrap();
     let identity=observed.identity().clone();drop(observed);
-    assert!(!herdr_projects::worker_supervision::SupervisorObservation::reconnect(&identity).unwrap().exited().unwrap());
+    assert!(!herdr_farm::worker_supervision::SupervisorObservation::reconnect(&identity).unwrap().exited().unwrap());
     assert!(!destination.exists(), "worker executed before gate release");
     let release=serde_json::json!({"id":"release-live","method":"pane.send_input",
         "params":{"pane_id":pane,"text":"release-live-fixture\n","keys":[]}});
@@ -295,7 +295,7 @@ fn live_canonical_layout_launches_literal_argv() {
     assert!(gate.check().is_err(),"gate proof survived agent exec");
     lab.herdr(&["workspace","close",workspace]);
     let deadline=Instant::now()+Duration::from_secs(5);
-    while !herdr_projects::worker_supervision::SupervisorObservation::recover_exited(&identity).unwrap() {
+    while !herdr_farm::worker_supervision::SupervisorObservation::recover_exited(&identity).unwrap() {
         assert!(Instant::now()<deadline,"direct supervisor survived closure");std::thread::sleep(Duration::from_millis(25));
     }
 }
@@ -324,20 +324,20 @@ fn live_vendor_direct_exec_and_native_naming_contract() {
     let mut lab=Lab::new(); lab.start();
     let mut version=lab.command(&agent); version.arg("--version");
     let (ok,version,error)=lab.run(version);assert!(ok,"{error}");
-    assert!(herdr_projects::profile_config::observed_version("codex",&version).is_some());
+    assert!(herdr_farm::profile_config::observed_version("codex",&version).is_some());
     let workspace=lab.herdr(&["workspace","create","--cwd",lab.path().to_str().unwrap(),"--label","Vendor startup contract","--no-focus"]);
     let workspace=workspace["result"]["workspace"]["workspace_id"].as_str().unwrap();
     // No inherited home, credentials, user configuration or task prompt. This
     // tests startup/naming/termination, never authenticated protocol capability.
     let args:Vec<String>=vec!["--no-alt-screen".into()];
-    let argv=herdr_projects::worker_supervision::isolated_gated_command(&agent,&args,45,"release-vendor-contract",&lab.path().join("home"),&isolation(lab.path(),&agent)).unwrap();
+    let argv=herdr_farm::worker_supervision::isolated_gated_command(&agent,&args,45,"release-vendor-contract",&lab.path().join("home"),&isolation(lab.path(),&agent)).unwrap();
     let created=request(&lab,"layout.apply",serde_json::json!({"workspace_id":workspace,"tab_label":"Vendor contract","focus":false,
         "root":{"type":"pane","cwd":lab.path(),"command":argv,"env":{}}}));
     let pane=created["layout"]["focused_pane_id"].as_str().unwrap();
     let info=request(&lab,"pane.process_info",serde_json::json!({"pane_id":pane}));
     let outer=info["process_info"]["foreground_processes"].as_array().unwrap().iter()
         .find(|p|p["argv"][0]=="/usr/bin/unshare").unwrap();
-    let supervisor=herdr_projects::worker_supervision::SupervisorObservation::observe(u32::try_from(outer["pid"].as_u64().unwrap()).unwrap(),&argv).unwrap();
+    let supervisor=herdr_farm::worker_supervision::SupervisorObservation::observe(u32::try_from(outer["pid"].as_u64().unwrap()).unwrap(),&argv).unwrap();
     let gate=supervisor.waiting_gate(&argv).unwrap();
     let released=request(&lab,"pane.send_input",serde_json::json!({"pane_id":pane,"text":"release-vendor-contract\n","keys":[]}));
     assert_eq!(released["type"],"ok");
@@ -371,7 +371,7 @@ fn live_vendor_direct_exec_and_native_naming_contract() {
     let identity=supervisor.identity().clone();
     lab.herdr(&["workspace","close",workspace]);
     let end=Instant::now()+Duration::from_secs(5);
-    while !herdr_projects::worker_supervision::SupervisorObservation::recover_exited(&identity).unwrap() {
+    while !herdr_farm::worker_supervision::SupervisorObservation::recover_exited(&identity).unwrap() {
         assert!(Instant::now()<end,"vendor supervisor survived workspace closure");
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -396,8 +396,8 @@ fn live_workspace_bootstrap_marker_contract() {
         if let Some(processes)=info["result"]["process_info"]["foreground_processes"].as_array() {
             for process in processes {
                 let pid=u32::try_from(process["pid"].as_u64().unwrap()).unwrap();
-                assert!(herdr_projects::worker_supervision::ProcessMarkerObservation::observe(pid,&"8".repeat(64),lab.path()).unwrap().is_none());
-                if let Some(proof)=herdr_projects::worker_supervision::ProcessMarkerObservation::observe(pid,&token,lab.path()).unwrap() {
+                assert!(herdr_farm::worker_supervision::ProcessMarkerObservation::observe(pid,&"8".repeat(64),lab.path()).unwrap().is_none());
+                if let Some(proof)=herdr_farm::worker_supervision::ProcessMarkerObservation::observe(pid,&token,lab.path()).unwrap() {
                     found=Some(proof);break;
                 }
             }
@@ -452,7 +452,7 @@ fn live_workspace_command_starts_supervised_root_without_bootstrap_shell() {
         std::thread::sleep(Duration::from_millis(25));
     };
     lab.herdr(&["workspace","close",control["result"]["workspace"]["workspace_id"].as_str().unwrap()]);
-    let argv=herdr_projects::worker_supervision::isolated_gated_command(std::path::Path::new("/usr/bin/sleep"),&["30".into()],15,"release-root-fixture",&lab.path().join("home"),&isolation(lab.path(),std::path::Path::new("/usr/bin/sleep"))).unwrap();
+    let argv=herdr_farm::worker_supervision::isolated_gated_command(std::path::Path::new("/usr/bin/sleep"),&["30".into()],15,"release-root-fixture",&lab.path().join("home"),&isolation(lab.path(),std::path::Path::new("/usr/bin/sleep"))).unwrap();
     let inventory=request(&lab,"workspace.list",serde_json::json!({}));
     for command in [serde_json::json!([]),serde_json::json!(["relative"]),serde_json::json!([lab.path().join("missing-executable")])] {
         let response=raw_request(&lab,"workspace.create_command",serde_json::json!({"cwd":lab.path(),"command":command}));
@@ -467,7 +467,7 @@ fn live_workspace_command_starts_supervised_root_without_bootstrap_shell() {
     let pane=created["root_pane"]["pane_id"].as_str().unwrap();
     let info=request(&lab,"pane.process_info",serde_json::json!({"pane_id":pane}));
     let outer=info["process_info"]["foreground_processes"].as_array().unwrap().iter().find(|p|p["argv"]==serde_json::json!(argv)).unwrap();
-    let observed=herdr_projects::worker_supervision::SupervisorObservation::observe(u32::try_from(outer["pid"].as_u64().unwrap()).unwrap(),&argv).unwrap();
+    let observed=herdr_farm::worker_supervision::SupervisorObservation::observe(u32::try_from(outer["pid"].as_u64().unwrap()).unwrap(),&argv).unwrap();
     observed.waiting_gate(&argv).unwrap().check().unwrap();
     assert_eq!(fs::read(&marker).unwrap_or_default(),before,"workspace creation invoked the default shell");
     let released=request(&lab,"pane.send_input",serde_json::json!({"pane_id":pane,"text":"release-root-fixture\n","keys":[]}));
@@ -475,7 +475,7 @@ fn live_workspace_command_starts_supervised_root_without_bootstrap_shell() {
     let identity=observed.identity().clone();
     lab.herdr(&["workspace","close",workspace]);
     let end=Instant::now()+Duration::from_secs(5);
-    while !herdr_projects::worker_supervision::SupervisorObservation::recover_exited(&identity).unwrap() {
+    while !herdr_farm::worker_supervision::SupervisorObservation::recover_exited(&identity).unwrap() {
         assert!(Instant::now()<end,"supervised root survived workspace closure");
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -484,8 +484,8 @@ fn live_workspace_command_starts_supervised_root_without_bootstrap_shell() {
 /// The canonical worker sandbox for a live fixture agent working in `lab`: a
 /// disposable projects root under the lab, no Herdr socket to hide.
 #[cfg(target_os="linux")]
-fn isolation(lab:&std::path::Path,agent:&std::path::Path)->herdr_projects::worker_supervision::Isolation {
+fn isolation(lab:&std::path::Path,agent:&std::path::Path)->herdr_farm::worker_supervision::Isolation {
     let lab=lab.canonicalize().unwrap();let project=lab.join("isolation-root/project");
     std::fs::create_dir_all(&project).unwrap();std::fs::write(lab.join("isolation-root/.execution.lock"),b"").unwrap();
-    herdr_projects::worker_supervision::Isolation::for_agent(&project,&lab.join("home"),&lab,agent,&[],&[],None,None,&[]).unwrap()
+    herdr_farm::worker_supervision::Isolation::for_agent(&project,&lab.join("home"),&lab,agent,&[],&[],None,None,&[]).unwrap()
 }

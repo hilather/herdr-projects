@@ -42,7 +42,7 @@ const MAX_HIDDEN_BYTES: usize = 65_536;
 const MAX_SCAN_FILES: usize = 4096;
 const MAX_SCAN_BYTES: u64 = 1 << 20;
 
-/// `herdr-projects replay <slug> ...` (owner CLI; refused inside a worker execution context).
+/// `herdr-farm replay <slug> ...` (owner CLI; refused inside a worker execution context).
 #[derive(clap::Subcommand)]
 pub enum Command {
     /// Build immutable suite version SUITE from the project's accepted tasks. Writes hidden checks outside the project.

@@ -23,7 +23,7 @@
 
 mod support;
 
-use herdr_projects::{domain::agent_configuration, store::{FindingTarget, SqliteStore, TriageOutcome, TriageRequest}};
+use herdr_farm::{domain::agent_configuration, store::{FindingTarget, SqliteStore, TriageOutcome, TriageRequest}};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{fs, path::{Path, PathBuf}, process::{Command, Output}};
@@ -53,7 +53,7 @@ struct Lab { home: tempfile::TempDir, root: PathBuf, project: PathBuf, key: Path
 
 impl Lab {
     fn new() -> Self {
-        use herdr_projects::{domain::ProjectState, migration, runtime};
+        use herdr_farm::{domain::ProjectState, migration, runtime};
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
         let run = |args: &[&str]| Command::new(BIN).env_clear().env("HOME", home.path()).args(args).output().unwrap();
@@ -62,7 +62,7 @@ impl Lab {
         assert!(Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).output().unwrap().status.success());
         let public = fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
         let project = root.join("demo");
-        let config = home.path().join(".config/herdr-projects/config.toml");
+        let config = home.path().join(".config/herdr-farm/config.toml");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         fs::write(&config, format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[profiles.worker]\nkind='claude'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=60\nunknown_usage='allow_with_warning'\n")).unwrap();
         let plan = migration::inspect_with_config(&project, &config).unwrap();
@@ -95,7 +95,7 @@ impl Lab {
         plant_profile(&db_path, slow);
         plant_profile(&db_path, claude);
         let head = runtime::snapshot(&lab.project).unwrap().head;
-        runtime::add_task(&lab.project, herdr_projects::domain::TaskId::new("reviews").unwrap(), "reviews".into(), head).unwrap();
+        runtime::add_task(&lab.project, herdr_farm::domain::TaskId::new("reviews").unwrap(), "reviews".into(), head).unwrap();
         lab
     }
     fn hp(&self, args: &[&str]) -> Output {
@@ -144,7 +144,7 @@ impl Lab {
     /// A signed verify-then-integrate contract (revision 1) for new task
     /// `task` at `base` with acceptance policy `policy`; returns its digest.
     fn contract(&self, task: &str, base: &str, policy: &str) -> String {
-        use herdr_projects::{authority::CONTRACT_SIGNATURE_NAMESPACE, domain::TaskId, runtime};
+        use herdr_farm::{authority::CONTRACT_SIGNATURE_NAMESPACE, domain::TaskId, runtime};
         let head = runtime::add_task(&self.project, TaskId::new(task).unwrap(), task.into(), runtime::snapshot(&self.project).unwrap().head).unwrap();
         let repository = self.repo.canonicalize().unwrap().display().to_string();
         let mut document = serde_json::to_vec_pretty(&json!({
@@ -152,7 +152,7 @@ impl Lab {
             "project_store": self.store, "expected_head": head, "task_id": task, "contract_revision": 1, "deliverable": "ship", "non_goals": "no launch",
             "acceptance_policies": [{"id": "clean", "text": policy}], "repository": repository, "base_oid": base, "object_format": "sha256",
             "dependencies": [], "capability_flags": [], "profile_kind": "codex", "retry_class": "none", "result_schema_id": "result-v1",
-            "route": "verify_then_integrate", "authority": herdr_projects::authority::policy_reference(&self.project).unwrap()})).unwrap();
+            "route": "verify_then_integrate", "authority": herdr_farm::authority::policy_reference(&self.project).unwrap()})).unwrap();
         document.push(b'\n');
         let doc = self.home.path().join(format!("{task}-contract.json"));
         fs::write(&doc, &document).unwrap();
@@ -737,7 +737,7 @@ impl Lab {
     }
     /// Queue `consumer` behind `predecessor`'s `verified_result` through `task queue`.
     fn queue_dependent(&self, consumer: &str, predecessor: &str) {
-        use herdr_projects::{domain::TaskId, runtime};
+        use herdr_farm::{domain::TaskId, runtime};
         let head = runtime::add_task(&self.project, TaskId::new(consumer).unwrap(), format!("consumer {consumer}"), runtime::snapshot(&self.project).unwrap().head).unwrap();
         let request = self.home.path().join(format!("{consumer}-queue.json"));
         fs::write(&request, json!({"priority": 0, "dependencies": [{"predecessor": predecessor, "requirement": "verified_result"}]}).to_string()).unwrap();
@@ -777,7 +777,7 @@ impl Lab {
     }
     fn auto_integrate(&self) {
         self.configure_integration();
-        let head = herdr_projects::runtime::snapshot(&self.project).unwrap().head.to_string();
+        let head = herdr_farm::runtime::snapshot(&self.project).unwrap().head.to_string();
         assert_eq!(self.ok(&["result", "demo", "auto", "--integrate", "on", "--expected-head", &head])["integrate"], json!(true));
     }
     /// The CLI as a worker runs it: `HOME` is a retained profile's execution home.
@@ -832,12 +832,12 @@ fn selection_that_disagrees_with_verification_verifies_and_releases_nothing() {
     assert_eq!(lab.blockers("bg"), missing("g"), "no arm releases before its group's selection");
     // Both verified arms enter the pending projection; the producer's turn drops every held arm.
     assert_eq!(lab.pending_integration().len(), 2);
-    assert_eq!(herdr_projects::store::service_project_integration_jobs(&lab.project).unwrap().enqueued, 0);
+    assert_eq!(herdr_farm::store::service_project_integration_jobs(&lab.project).unwrap().enqueued, 0);
     assert_eq!(lab.pending_integration(), Vec::<String>::new());
 
     // A worker cannot elevate its own arm: not through the store as a worker principal, not through the owner's CLI from its execution home.
     let mut store = SqliteStore::open(&lab.project.join(".state/state.db")).unwrap();
-    let choice = herdr_projects::store::SelectionChoice::Arm { arm: 1, submission: None, runner_up: vec![] };
+    let choice = herdr_farm::store::SelectionChoice::Arm { arm: 1, submission: None, runner_up: vec![] };
     for principal in ["worker:g-a1", "g-a1", "g-a2", "import:bot"] {
         let err = store.select_candidate(&g, &choice, "operator_judgment", principal, unix_ms()).unwrap_err();
         assert!(format!("{err:?}").contains("cannot select"), "{principal}: {err:?}");
@@ -857,7 +857,7 @@ fn selection_that_disagrees_with_verification_verifies_and_releases_nothing() {
     let outcomes: Vec<(Value, Value)> = selection["evidence"].as_array().unwrap().iter().map(|e| (e["verification"].clone(), e["arm_outcome"].clone())).collect();
     assert_eq!(outcomes, [(json!("rejected"), json!("rejected")), (json!("accepted"), json!("accepted"))]);
     assert_eq!(lab.pending_integration(), Vec::<String>::new(), "nothing verified to queue; the verified loser is held");
-    assert_eq!(herdr_projects::store::service_project_integration_jobs(&lab.project).unwrap().enqueued, 0);
+    assert_eq!(herdr_farm::store::service_project_integration_jobs(&lab.project).unwrap().enqueued, 0);
     let g2_result = subs[&("g", 2)].1.clone().unwrap();
     let work = lab.home.path().join("integrate-g2-work");
     let err = lab.fail(&["result", "demo", "integrate", &g2_result, "--repository", lab.repo.to_str().unwrap(), "--idempotency-key", "integrate-g2", "--work-dir", work.to_str().unwrap()]);
@@ -918,7 +918,7 @@ impl Lab {
             "tasks": [{"task_id": "x", "contract_revision": 1}], "kinds": kinds, "review_configurations": [], "actions": ["accept_review_completion"],
             "max_decisions": 4, "valid_from_unix_ms": now - 60_000, "expires_unix_ms": now + 3_600_000,
             "prohibited_effects": ["alter_requirements", "approve_author_attempt", "approve_own_work", "child_delegation", "increase_permissions"],
-            "authority": herdr_projects::authority::policy_reference(&self.project).unwrap()});
+            "authority": herdr_farm::authority::policy_reference(&self.project).unwrap()});
         let file = self.home.path().join(format!("{name}.json"));
         fs::write(&file, serde_json::to_vec_pretty(&grant).unwrap()).unwrap();
         self.sign(&self.key, "code-review-authority@herdr-projects", &file);
@@ -998,9 +998,9 @@ fn worker_assertions_and_self_approval_never_become_accepted_outcomes() {
     let validate = TriageRequest { outcome: TriageOutcome::Validated { target: FindingTarget::New { title: None }, severity: "high".into() }, evidence: vec![evidence('a')], expected_seq: None };
     for principal in ["worker:rev-1", "rev-1", "x-attempt", "worker:x-attempt", "import:ci"] {
         assert!(store.triage_finding_claim(1, &validate, principal, unix_ms()).is_err(), "{principal} triaged");
-        assert!(store.register_evaluation_candidate(&sx, &herdr_projects::store::EvaluationArm::CleanControl, None, principal, unix_ms()).is_err(), "{principal} registered a seed arm");
+        assert!(store.register_evaluation_candidate(&sx, &herdr_farm::store::EvaluationArm::CleanControl, None, principal, unix_ms()).is_err(), "{principal} registered a seed arm");
         assert!(store.reveal_evaluation_candidate(&sx, None, principal, unix_ms()).is_err(), "{principal} revealed");
-        assert!(store.open_repair("finding:canonical-1", &herdr_projects::store::RepairAssignment::Unassigned, 86_400_000, None, principal, unix_ms()).is_err(), "{principal} opened a repair");
+        assert!(store.open_repair("finding:canonical-1", &herdr_farm::store::RepairAssignment::Unassigned, 86_400_000, None, principal, unix_ms()).is_err(), "{principal} opened a repair");
     }
     drop(store);
     assert_eq!(lab.ledger_head(), head, "refused principals wrote nothing");
@@ -1191,7 +1191,7 @@ fn seeded_recall_and_the_seeded_candidate_guard_end_to_end() {
     let (_, _, rs1) = lab.verify(&candidates[0].1, "verify-s1", WEAK);
     assert_eq!(lab.verify(&candidates[4].1, "verify-c1", WEAK).0, "accepted");
     lab.auto_integrate();
-    assert_eq!(herdr_projects::store::service_project_integration_jobs(&lab.project).unwrap().enqueued, 1);
+    assert_eq!(herdr_farm::store::service_project_integration_jobs(&lab.project).unwrap().enqueued, 1);
     let jobs: Vec<String> = lab.db().prepare("SELECT json_extract(payload,'$.submission_id') FROM operations WHERE kind='integration.run'").unwrap()
         .query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
     assert_eq!(jobs, vec![candidates[4].1.clone()], "the producer enqueues the control, never the seeded candidate");
@@ -1245,7 +1245,7 @@ fn seeded_recall_and_the_seeded_candidate_guard_end_to_end() {
     assert_eq!(lab.git(&["rev-parse", "refs/heads/integration"]), commit);
     assert_ne!(commit, before);
     assert_eq!(lab.count("SELECT count(*) FROM integration_operations WHERE state='integrated'"), 1);
-    assert_eq!(herdr_projects::store::service_project_integration_jobs(&lab.project).unwrap().enqueued, 0, "nothing else of the group is integrable");
+    assert_eq!(herdr_farm::store::service_project_integration_jobs(&lab.project).unwrap().enqueued, 0, "nothing else of the group is integrable");
     // Last: the fixture's minimal launch records are not a full snapshot.
     lab.started("s1", "s1-attempt");
     lab.completion_refused("s1", "a seeded candidate never completes its task");

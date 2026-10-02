@@ -6,7 +6,7 @@
 //! the operator passes; this program never reads a private key itself.
 use crate::paths::Ctx;
 use anyhow::{Context, Result, bail, ensure};
-use herdr_projects::{
+use herdr_farm::{
     authority, domain::{AttemptState, ProjectState, RuntimeRoute, TaskId, VersionedReference}, execution_guard::GatedSpawn,
     launch_preparation::{self, LaunchSelection}, migration, runtime,
 };
@@ -133,7 +133,7 @@ fn finish_instructions(root: &Path, slug: &str, contract: &Value, reference: &Ve
     let (task, repository, base, format) = (text("task_id")?, text("repository")?, text("base_oid")?, text("object_format")?);
     ensure!([task, repository, base, format, reference.digest.as_str()].iter().all(|v| safe(v)) && safe(&root.display().to_string()) && outputs.iter().all(|o| safe(o)),
         "a path or value in the task contract contains a character the submission script cannot carry");
-    let mut script = String::from("set -eu\nattempt=$(basename \"$HERDR_PROJECTS_SUBMISSION_SPOOL\")\n");
+    let mut script = String::from("set -eu\nattempt=$(basename \"$HERDR_FARM_SUBMISSION_SPOOL\")\n");
     script.push_str(&format!("git add --{}\n", outputs.iter().map(|o| format!(" '{o}'")).collect::<String>()));
     script.push_str("git -c user.name=worker -c user.email=worker@invalid commit -q -m 'Deliverable' || true\n");
     script.push_str(&format!("candidate=$(git rev-parse HEAD)\n[ \"$candidate\" != '{base}' ] || {{ echo 'nothing is committed: write the deliverable first' >&2; exit 1; }}\n"));
@@ -146,12 +146,12 @@ fn finish_instructions(root: &Path, slug: &str, contract: &Value, reference: &Ve
     script.push_str(&"list() { { printf '%s\\n' 'BASE' \"$candidate\"; git rev-list --objects --no-object-names \"$candidate\" '^BASE'; } | sort -u; }\n\
 n=$(list | wc -l)\n[ \"$n\" -le LIMIT ] || { echo \"the candidate delta and commit anchors hold $n objects; a submission carries at most LIMIT\" >&2; exit 1; }\n\
 objects=$(list | while IFS= read -r oid; do prefix=$(printf %s \"$oid\" | cut -c1-2); suffix=$(printf %s \"$oid\" | cut -c3-); printf '{\"oid\":\"%s\",\"relative_path\":\"%s/%s\"}\\n' \"$oid\" \"$prefix\" \"$suffix\"; done | paste -sd, -)\n"
-        .replace("BASE", base).replace("LIMIT", &herdr_projects::store::SUBMISSION_OBJECT_LIMIT.to_string()));
+        .replace("BASE", base).replace("LIMIT", &herdr_farm::store::SUBMISSION_OBJECT_LIMIT.to_string()));
     script.push_str("key=result-$(printf %s \"$attempt\" | cut -c1-100)\ndocument=$(mktemp)\ncat > \"$document\" <<EOF\n");
     script.push_str(&format!(
         r#"{{"idempotency_key":"$key","task_id":"{task}","contract_revision":{},"contract_digest":"{}","attempt_id":"$attempt","repository":"{repository}","base_oid":"{base}","candidate_oid":"$candidate","object_format":"{format}","artifact_manifest":[{}],"claimed_checks":[],"objects":[$objects]}}"#,
         reference.revision, reference.digest, manifest.join(",")));
-    script.push_str(&format!("\nEOF\nherdr-projects --root '{}' result {slug} submit --input-file \"$document\"\n", root.display()));
+    script.push_str(&format!("\nEOF\nherdr-farm --root '{}' result {slug} submit --input-file \"$document\"\n", root.display()));
     Ok(format!(
         "\n## When the deliverable is complete: submit it\n\nA result that is not submitted is never verified or integrated. Run exactly this script in the current directory. It commits the declared output(s) on your attempt branch and submits the result through your submission spool (the product's own command; it needs no network and is safe to run again). It must print a submission receipt containing `submission_id`; if it fails, fix what it reports and run it again. Only then stop and reply DONE.\n\n```sh\n{script}```\n"))
 }
@@ -193,8 +193,8 @@ fn herdr_server(run: &mut Run, herdr: &Path, task: &str, existing: Option<&Path>
     }
     // The socket lives in a short private directory (sun_path is 108 bytes);
     // logs and configuration stay beside the run.
-    let socket = herdr_projects::short_socket::stable(&directory)?.join("s");
-    herdr_projects::short_socket::check_length(&socket)?;
+    let socket = herdr_farm::short_socket::stable(&directory)?.join("s");
+    herdr_farm::short_socket::check_length(&socket)?;
     if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
         run.skipped("herdr_server", json!({"socket":socket}));
         return Ok(socket);
@@ -261,14 +261,14 @@ fn steps(run: &mut Run, args: &Args) -> Result<Value> {
         "give --plan-output (planning task) or --contract-file (your own contract), not both");
 
     // 1. The retained, launchable profile evidence.
-    let mut store = herdr_projects::store::SqliteStore::open(&project.join(".state/state.db"))?;
+    let mut store = herdr_farm::store::SqliteStore::open(&project.join(".state/state.db"))?;
     let (profile, kind) = store
         .latest_launchable_native_profile(&args.profile)?
         .with_context(|| format!("no launchable evidence retained for profile {}: run `profile verify-interaction {} {} --retain ...` first", args.profile, run.slug, args.profile))?;
     // A worker that cannot log in would only 401 after launch: refuse now.
     let retained = store.native_profile_report(&profile)?.context("retained native profile not found")?;
-    let frozen: herdr_projects::domain::FrozenProfile = serde_json::from_value(retained["preparation"]["profile"].clone()).context("retained native profile is unreadable")?;
-    herdr_projects::profile_config::check_worker_login(&frozen, &project)?;
+    let frozen: herdr_farm::domain::FrozenProfile = serde_json::from_value(retained["preparation"]["profile"].clone()).context("retained native profile is unreadable")?;
+    herdr_farm::profile_config::check_worker_login(&frozen, &project)?;
     drop(store);
     run.done("profile_evidence", json!({"profile":profile,"kind":kind}));
 
@@ -303,11 +303,11 @@ fn steps(run: &mut Run, args: &Args) -> Result<Value> {
     // 4. Capacity, queue and the integration target.
     let snapshot = runtime::snapshot(&project)?;
     let scheduler = snapshot.scheduler.as_ref().context("project has no scheduler state: migrate it first")?;
-    if snapshot.scheduler.as_ref().is_some_and(|s| s.queue.iter().any(|q| q.task == task_id) && snapshot.tasks.iter().any(|t| t.id == task_id && (t.state == herdr_projects::domain::TaskState::Queued || t.active_attempt.is_some()))) {
+    if snapshot.scheduler.as_ref().is_some_and(|s| s.queue.iter().any(|q| q.task == task_id) && snapshot.tasks.iter().any(|t| t.id == task_id && (t.state == herdr_farm::domain::TaskState::Queued || t.active_attempt.is_some()))) {
         run.skipped("queue", json!({"task":args.task}));
     } else {
         let task = snapshot.tasks.iter().find(|t| t.id == task_id).context("task missing")?;
-        let request = herdr_projects::domain::QueueRequest { priority: 0, dependencies: vec![] };
+        let request = herdr_farm::domain::QueueRequest { priority: 0, dependencies: vec![] };
         let head = runtime::queue_task(&project, &task_id, task.revision, snapshot.head, &request)?;
         run.done("queue", json!({"head":head}));
     }
@@ -319,8 +319,8 @@ fn steps(run: &mut Run, args: &Args) -> Result<Value> {
         run.done("scheduler_capacity", json!({"max_active_workers":args.max_active_workers,"head":head}));
     }
     if let Some(reference) = &args.integration_ref {
-        herdr_projects::integration::configure_project(&project, &repository, reference)?;
-        herdr_projects::store::set_project_result_automation(&project, run.head()?, Some(true), Some(true))?;
+        herdr_farm::integration::configure_project(&project, &repository, reference)?;
+        herdr_farm::store::set_project_result_automation(&project, run.head()?, Some(true), Some(true))?;
         run.done("integration_target", json!({"repository":repository,"reference":reference,"automation":"verify and integrate on"}));
     }
 
@@ -391,11 +391,11 @@ fn steps(run: &mut Run, args: &Args) -> Result<Value> {
     let reference = runtime::task_contract(&project, &task_id)?.context("the task has no installed contract")?;
     instructions.push_str(&finish_instructions(&ctx.root, run.slug.as_str(), &contract, &reference)?);
     let knowledge = {
-        let _guard = herdr_projects::memory::mutation_guard(&project)?;
+        let _guard = herdr_farm::memory::mutation_guard(&project)?;
         let resolved = crate::agents::resolve::resolve(&args.profile, &ctx.config_dir.join("config.toml"), None)?;
-        let request: herdr_projects::domain::SnapshotRequest = serde_json::from_value(json!({
+        let request: herdr_farm::domain::SnapshotRequest = serde_json::from_value(json!({
             "schema_version":1,"task_id":args.task,"profile":args.profile,"domains":[],"paths":[],"pinned_keys":[],"sensitivity":"default"}))?;
-        let mut memory = herdr_projects::memory::MemoryStore::from_sqlite(migration::open_active(&project)?, project.join(".state/objects"));
+        let mut memory = herdr_farm::memory::MemoryStore::from_sqlite(migration::open_active(&project)?, project.join(".state/objects"));
         let created = memory.create_worker_snapshot(request, &resolved.name, &resolved.definition_digest, Some(&resolved.config_digest), resolved.budget.soft_input_chars, &instructions, jiff::Timestamp::now().as_millisecond(), None)?;
         serde_json::to_value(&created)?
     };
@@ -409,7 +409,7 @@ fn steps(run: &mut Run, args: &Args) -> Result<Value> {
         note: None,
     };
     run.done("knowledge_snapshot", json!({"snapshot":selection.knowledge}));
-    let deadline = Instant::now() + herdr_projects::profile_preparation::BUDGET;
+    let deadline = Instant::now() + herdr_farm::profile_preparation::BUDGET;
     let drafted = launch_preparation::draft(&project, &selection, run.head()?, Duration::from_secs(args.validity_seconds), deadline, Default::default())?;
     let approval = dir.join("approval.json");
     fs::write(&approval, serde_json::to_vec_pretty(&drafted.approval)?)?;
@@ -422,7 +422,7 @@ fn steps(run: &mut Run, args: &Args) -> Result<Value> {
     let reservation = launch_preparation::reserve(&project, &selection, &approval_reference, run.head()?, deadline, Default::default())?;
     anyhow::ensure!(reservation.record.inputs == drafted.inputs, "the reservation does not carry the drafted inputs");
     let attempt = reservation.record.attempt.clone();
-    let worktree = herdr_projects::domain::worktree_plans(&drafted.inputs, &attempt).map_err(anyhow::Error::msg)?.into_iter().next().map(|p| p.path);
+    let worktree = herdr_farm::domain::worktree_plans(&drafted.inputs, &attempt).map_err(anyhow::Error::msg)?.into_iter().next().map(|p| p.path);
     run.done("reserve", json!({"attempt":attempt}));
     Ok(report(run, &args.task, &profile, &kind, &herdr, &socket, Some(attempt.as_str().to_owned()), worktree))
 }

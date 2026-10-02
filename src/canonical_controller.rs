@@ -5,9 +5,9 @@ pub mod observations;
 use std::path::Path;
 use anyhow::{Context,Result,ensure};
 use crate::paths::Ctx;
-use herdr_projects::{runtime,operations::dispatch::DispatchResult,reconcile::ResourceState};
+use herdr_farm::{runtime,operations::dispatch::DispatchResult,reconcile::ResourceState};
 #[cfg(test)]
-use herdr_projects::migration;
+use herdr_farm::migration;
 
 // Verified prepared launches participate in ordinary controller polling. Native
 // capabilities, current inputs, signed approval and capacity remain enforced at
@@ -30,18 +30,18 @@ impl crate::runner::Runner for ProbeBudget<'_> {
 }
 pub fn poll(ctx:&Ctx,path:&Path,turn:u64)->Result<PollResult> {
     let path=path.canonicalize()?;
-    let ownership=herdr_projects::execution_guard::ProjectGuard::acquire(&path)?;
+    let ownership=herdr_farm::execution_guard::ProjectGuard::acquire(&path)?;
     let now=jiff::Timestamp::now().as_millisecond();
-    match herdr_projects::store::HOT_PATH_READ {
-        herdr_projects::store::HotPathRead::Targeted=>{
-            let control=herdr_projects::store::controlled::ReadControl::new(
+    match herdr_farm::store::HOT_PATH_READ {
+        herdr_farm::store::HotPathRead::Targeted=>{
+            let control=herdr_farm::store::controlled::ReadControl::new(
                 std::time::Instant::now()+std::time::Duration::from_secs(2),Default::default());
-            let db=herdr_projects::migration::open_active_scoped(&path,control)?;
+            let db=herdr_farm::migration::open_active_scoped(&path,control)?;
             let schema=match db.read_targeted_hot_path(now,launch_dispatch_enabled()) {
                 Ok(schema)=>schema,
                 Err(error)=>{
-                    let _=herdr_projects::watchdog::note(&path,&error);
-                    if matches!(error,herdr_projects::store::StoreError::Cancelled|herdr_projects::store::StoreError::Deadline) {
+                    let _=herdr_farm::watchdog::note(&path,&error);
+                    if matches!(error,herdr_farm::store::StoreError::Cancelled|herdr_farm::store::StoreError::Deadline) {
                         anyhow::bail!("controller read aborted: {error}");
                     }
                     return Err(error.into());
@@ -49,11 +49,11 @@ pub fn poll(ctx:&Ctx,path:&Path,turn:u64)->Result<PollResult> {
             };
             ensure!(schema>=9,"upgrade-store is required before canonical controller polling");
         }
-        herdr_projects::store::HotPathRead::Snapshot=>{
-            let mut db=herdr_projects::migration::open_active(&path)?;
+        herdr_farm::store::HotPathRead::Snapshot=>{
+            let mut db=herdr_farm::migration::open_active(&path)?;
             let snapshot=db.read_snapshot(None)?;
             if let Err(error)=db.shadow_against_snapshot(&snapshot,now,launch_dispatch_enabled()) {
-                if matches!(error,herdr_projects::store::StoreError::Cancelled|herdr_projects::store::StoreError::Deadline) {
+                if matches!(error,herdr_farm::store::StoreError::Cancelled|herdr_farm::store::StoreError::Deadline) {
                     anyhow::bail!("controller read aborted: {error}");
                 }
             }
@@ -63,7 +63,7 @@ pub fn poll(ctx:&Ctx,path:&Path,turn:u64)->Result<PollResult> {
     // Collect without a SQLite transaction. Commit and expiry are serialized with
     // all supported lifecycle/effect adapters, without reacquiring ticker leadership.
     let budget=ProbeBudget{runner:ctx.runner,deadline:std::time::Instant::now()+std::time::Duration::from_secs(15)};
-    let control=herdr_projects::store::controlled::ReadControl::new(budget.deadline,Default::default());
+    let control=herdr_farm::store::controlled::ReadControl::new(budget.deadline,Default::default());
     let probe_ctx=Ctx{env:ctx.env,root:ctx.root.clone(),config_dir:ctx.config_dir.clone(),runner:&budget,detached_ticker:ctx.detached_ticker};
     let batch=crate::reconcile_live::collect_controlled(&probe_ctx,&path,&control)?;
     ensure!(std::time::Instant::now()<budget.deadline,"automatic observation budget exhausted; use explicit reconciliation to investigate");
@@ -90,7 +90,7 @@ pub fn poll_queued_effects(ctx:&Ctx,path:&Path,turn:u64,reads:&mut observations:
 fn finish_poll(ctx:&Ctx,path:&Path,turn:u64,reachable:bool,observation_error:Option<String>,effects:Option<&mut crate::copy_jobs::Queue>,background_plan:Option<bool>)->Result<PollResult> {
     // Background maintenance owns planning. Foreground callers retain their
     // explicit synchronous service; either path still offers independent effects.
-    let scheduled=match background_plan {Some(active)=>Ok(herdr_projects::routines::ScheduleTurn{active,diagnostic:None}),None=>herdr_projects::routines::schedule_turn(path,turn)};
+    let scheduled=match background_plan {Some(active)=>Ok(herdr_farm::routines::ScheduleTurn{active,diagnostic:None}),None=>herdr_farm::routines::schedule_turn(path,turn)};
     let queued=effects.is_some();
     let mut errors=observation_error.into_iter().collect::<Vec<_>>();
     // Each service below takes project ownership, which shares the root
@@ -106,14 +106,14 @@ fn finish_poll(ctx:&Ctx,path:&Path,turn:u64,reachable:bool,observation_error:Opt
         if root_owned {return true;}
         match run(path) {Ok(pending)=>pending,Err(error)=>{errors.push(format!("{name}: {error:#}"));true}}
     };
-    let stop_work=service("barrier stop service",&|path|Ok(herdr_projects::store::service_project_barrier_stops(path)?.pending));
+    let stop_work=service("barrier stop service",&|path|Ok(herdr_farm::store::service_project_barrier_stops(path)?.pending));
     let (admission_log,result)=process_next_with_launches(ctx,&path,turn,effects,launch_dispatch_enabled());
-    let wait_work=service("wait service",&|path|Ok(herdr_projects::store::service_project_waits(path)?.pending));
-    let replan_work=service("replan request service",&|path|Ok(herdr_projects::store::service_project_replans(path)?.pending));
-    let verification_work=service("verification job service",&|path|Ok(herdr_projects::store::service_project_verification_jobs(path)?.pending));
-    let integration_work=service("integration job service",&|path|Ok(herdr_projects::store::service_project_integration_jobs(path)?.pending));
+    let wait_work=service("wait service",&|path|Ok(herdr_farm::store::service_project_waits(path)?.pending));
+    let replan_work=service("replan request service",&|path|Ok(herdr_farm::store::service_project_replans(path)?.pending));
+    let verification_work=service("verification job service",&|path|Ok(herdr_farm::store::service_project_verification_jobs(path)?.pending));
+    let integration_work=service("integration job service",&|path|Ok(herdr_farm::store::service_project_integration_jobs(path)?.pending));
     let completion_work=if root_owned {true} else {
-        match herdr_projects::store::service_project_result_completions(path) {
+        match herdr_farm::store::service_project_result_completions(path) {
             Ok((pending,diagnostic))=>{if let Some(reason)=diagnostic {errors.push(format!("result completion service: {reason}"));}pending},
             Err(error)=>{errors.push(format!("result completion service: {error:#}"));true},
         }
@@ -131,26 +131,26 @@ fn process_next(ctx:&Ctx,path:&Path,turn:u64,effects:Option<&mut crate::copy_job
 }
 #[cfg(target_os="linux")]
 fn linux_admission(path:&Path)->(Option<String>,Option<String>) {
-    if herdr_projects::watchdog::is_paused(path) {
-        let reason=herdr_projects::watchdog::pause_reason(path).unwrap_or("admission_paused");
-        let line=herdr_projects::watchdog::admission_log_line(reason,None,0);
+    if herdr_farm::watchdog::is_paused(path) {
+        let reason=herdr_farm::watchdog::pause_reason(path).unwrap_or("admission_paused");
+        let line=herdr_farm::watchdog::admission_log_line(reason,None,0);
         return (Some(format!("admission_paused: {reason}")),Some(line));
     }
-    if !herdr_projects::admission::wake_enabled(path) {return (None,None);}
+    if !herdr_farm::admission::wake_enabled(path) {return (None,None);}
     // Ok(Some) is backpressure, not success. Prepared dispatch still runs after this note.
-    let observation=herdr_projects::admission::admit_decision_observed(path);
+    let observation=herdr_farm::admission::admit_decision_observed(path);
     match observation.result {
         Ok(decision)=>{
-            let line=herdr_projects::watchdog::admission_log_line_observed(decision.reason,decision.task_id.as_deref(),u128::from(observation.duration_ms),Some(observation.sql));
+            let line=herdr_farm::watchdog::admission_log_line_observed(decision.reason,decision.task_id.as_deref(),u128::from(observation.duration_ms),Some(observation.sql));
             let diagnostic=decision.block.map(|block| format!("{}: {}", block.blocker, block.reason));
             (diagnostic,Some(line))
         }
         Err(error)=>{
-            let reason=error.downcast_ref::<herdr_projects::store::StoreError>().and_then(herdr_projects::watchdog::cause).unwrap_or("error");
-            if let Some(store)=error.downcast_ref::<herdr_projects::store::StoreError>() {
-                let _=herdr_projects::watchdog::note(path,store);
+            let reason=error.downcast_ref::<herdr_farm::store::StoreError>().and_then(herdr_farm::watchdog::cause).unwrap_or("error");
+            if let Some(store)=error.downcast_ref::<herdr_farm::store::StoreError>() {
+                let _=herdr_farm::watchdog::note(path,store);
             }
-            let line=herdr_projects::watchdog::admission_log_line_observed(reason,None,u128::from(observation.duration_ms),Some(observation.sql));
+            let line=herdr_farm::watchdog::admission_log_line_observed(reason,None,u128::from(observation.duration_ms),Some(observation.sql));
             (Some(format!("{error:#}")),Some(line))
         }
     }
@@ -167,27 +167,27 @@ fn process_next_with_launches(ctx:&Ctx,path:&Path,turn:u64,effects:Option<&mut c
 }
 fn dispatch_prepared(ctx:&Ctx,path:&Path,turn:u64,effects:Option<&mut crate::copy_jobs::Queue>,include_launches:bool)->Result<bool> {
     if let Some(effects)=effects{return offer_next(ctx,path,turn,effects,include_launches);}
-    use herdr_projects::store::{identity_inventory::Budget,controller_hint::EffectMode};
+    use herdr_farm::store::{identity_inventory::Budget,controller_hint::EffectMode};
     let mut budget=Budget::new(2*1024*1024,1024,std::time::Instant::now()+std::time::Duration::from_millis(100),Default::default())?;
-    let Some(hint)=herdr_projects::migration::read_controller_dispatch_hint(path,&mut budget,turn,jiff::Timestamp::now().as_millisecond(),include_launches)? else{return Ok(false);};
+    let Some(hint)=herdr_farm::migration::read_controller_dispatch_hint(path,&mut budget,turn,jiff::Timestamp::now().as_millisecond(),include_launches)? else{return Ok(false);};
     let operation=&hint.operation;
     if effect_held(path,&operation.kind) {return Ok(false);}
     if operation.kind=="runtime.launch" {
         #[cfg(target_os="linux")]
         return match hint.mode {
-            EffectMode::Deliver=>Ok(herdr_projects::canonical_worker::advance_launch(path,&operation.id,hint.delivery_revision,std::time::Instant::now()+std::time::Duration::from_secs(45),Default::default())?.is_some()),
-            EffectMode::Observe=>Ok(herdr_projects::canonical_worker::reconcile_launch(path,&operation.id,hint.delivery_revision,std::time::Instant::now()+std::time::Duration::from_secs(45),Default::default())?),
+            EffectMode::Deliver=>Ok(herdr_farm::canonical_worker::advance_launch(path,&operation.id,hint.delivery_revision,std::time::Instant::now()+std::time::Duration::from_secs(45),Default::default())?.is_some()),
+            EffectMode::Observe=>Ok(herdr_farm::canonical_worker::reconcile_launch(path,&operation.id,hint.delivery_revision,std::time::Instant::now()+std::time::Duration::from_secs(45),Default::default())?),
         };
         #[cfg(not(target_os="linux"))]
         anyhow::bail!("canonical resource recovery requires Linux pidfs");
     }
     if operation.kind=="runtime.worker_brief_prepare" {
-        herdr_projects::canonical_worker::prepare_brief(path,&herdr_projects::domain::AttemptId::new(operation.target.clone()).map_err(anyhow::Error::msg)?,hint.delivery_revision,std::time::Instant::now()+std::time::Duration::from_secs(45),Default::default())?;
+        herdr_farm::canonical_worker::prepare_brief(path,&herdr_farm::domain::AttemptId::new(operation.target.clone()).map_err(anyhow::Error::msg)?,hint.delivery_revision,std::time::Instant::now()+std::time::Duration::from_secs(45),Default::default())?;
         return Ok(true);
     }
     if operation.kind=="runtime.worker_termination" {
         #[cfg(target_os="linux")]
-        return Ok(herdr_projects::canonical_worker::reconcile_termination(path,&herdr_projects::domain::AttemptId::new(operation.target.clone()).map_err(anyhow::Error::msg)?,hint.delivery_revision,std::time::Instant::now()+std::time::Duration::from_secs(45),Default::default())?.is_some());
+        return Ok(herdr_farm::canonical_worker::reconcile_termination(path,&herdr_farm::domain::AttemptId::new(operation.target.clone()).map_err(anyhow::Error::msg)?,hint.delivery_revision,std::time::Instant::now()+std::time::Duration::from_secs(45),Default::default())?.is_some());
         #[cfg(not(target_os="linux"))]
         anyhow::bail!("canonical termination requires Linux pidfs");
     }
@@ -201,7 +201,7 @@ fn dispatch_prepared(ctx:&Ctx,path:&Path,turn:u64,effects:Option<&mut crate::cop
     let result=match operation.kind.as_str() {
         "runtime.notification"=>crate::notification_delivery::deliver(ctx,path,&operation.id,hint.delivery_revision)?,
         "runtime.finalization"=>crate::finalization_delivery::deliver(ctx,path,&operation.id,hint.delivery_revision)?,
-        "runtime.worker_brief"=>DispatchResult::Recorded(herdr_projects::canonical_worker::deliver_brief(path,&operation.id,hint.delivery_revision,std::time::Instant::now()+std::time::Duration::from_secs(45),Default::default())?),
+        "runtime.worker_brief"=>DispatchResult::Recorded(herdr_farm::canonical_worker::deliver_brief(path,&operation.id,hint.delivery_revision,std::time::Instant::now()+std::time::Duration::from_secs(45),Default::default())?),
         _=>anyhow::bail!("unsupported controller effect hint"),
     };
     match result {
@@ -212,14 +212,14 @@ fn dispatch_prepared(ctx:&Ctx,path:&Path,turn:u64,effects:Option<&mut crate::cop
 
 /// Queued effect jobs are held while an integrity failure stands.
 fn effect_held(path:&Path,kind:&str)->bool {
-    matches!(kind,"verification.run"|"integration.run"|"runtime.finalization"|"runtime.notification")&&herdr_projects::watchdog::effects_paused(path).is_some()
+    matches!(kind,"verification.run"|"integration.run"|"runtime.finalization"|"runtime.notification")&&herdr_farm::watchdog::effects_paused(path).is_some()
 }
 // A hint selects work only. Concrete workers retain full validation before
 // claiming or acting; a route hint does not certify provenance or authority.
 fn offer_next(ctx:&Ctx,path:&Path,turn:u64,effects:&mut crate::copy_jobs::Queue,include_launches:bool)->Result<bool> {
-    use herdr_projects::store::{identity_inventory::Budget,controller_hint::EffectMode};
+    use herdr_farm::store::{identity_inventory::Budget,controller_hint::EffectMode};
     let mut budget=Budget::new(2*1024*1024,1024,std::time::Instant::now()+std::time::Duration::from_millis(100),Default::default())?;
-    let Some(hint)=herdr_projects::migration::read_controller_dispatch_hint(path,&mut budget,turn,jiff::Timestamp::now().as_millisecond(),include_launches)? else{return Ok(false);};
+    let Some(hint)=herdr_farm::migration::read_controller_dispatch_hint(path,&mut budget,turn,jiff::Timestamp::now().as_millisecond(),include_launches)? else{return Ok(false);};
     if effect_held(path,&hint.operation.kind) {return Ok(false);}
     match hint.operation.kind.as_str() {
         "runtime.notification"=>effects.offer_canonical_notification(ctx,path,&hint.operation,hint.delivery_revision,hint.notification_socket.as_deref().context("notification route hint missing")?)?,
@@ -239,10 +239,10 @@ fn offer_next(ctx:&Ctx,path:&Path,turn:u64,effects:&mut crate::copy_jobs::Queue,
 pub(crate) mod tests {
     use super::*;
     use crate::{notification_delivery,finalization_delivery};
-    use herdr_projects::operations::DeliveryState;
+    use herdr_farm::operations::DeliveryState;
     pub(crate) fn routine_fixture(scripts:&[(&str,&[u8],u64)])->(crate::scenarios::World,std::path::PathBuf) {
         use crate::{scenarios::World,project,runner::{RealRunner,Runner,Cmd}};
-        use herdr_projects::{authority,domain::*};
+        use herdr_farm::{authority,domain::*};
         use std::{fs,time::Duration};use sha2::{Digest,Sha256};
         let world=World::new();let project=project::create(&world.root,"routines","",vec![]).unwrap();project.set_status(project::Status::Paused).unwrap();
         crate::inbox::write(&project,"test","fixture","notification survives routine error","").unwrap();
@@ -280,7 +280,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn blocked_operation_preserves_live_reachability_and_capacity() {
-        use herdr_projects::domain::{Operation,OperationId,Commit,Mutation};
+        use herdr_farm::domain::{Operation,OperationId,Commit,Mutation};
         let(world,path,_socket)=crate::runtime_ownership::tests::fixture();let before=runtime::snapshot(&path).unwrap();crate::runtime_ownership::adopt(&world.ctx(),&path,"thread:t-0001",2,before.head).unwrap();let before=runtime::snapshot(&path).unwrap();let task=before.tasks.iter().find(|t|t.active_attempt.is_some()).unwrap();
         let invalid=Operation{id:OperationId::new("malformed-notification").unwrap(),task:Some(task.id.clone()),kind:"runtime.notification".into(),target:"coordinator".into(),payload_version:1,payload:serde_json::json!({}),expected_revision:task.revision,due_unix_ms:0,idempotency_key:"malformed".into()};migration::open_active(&path).unwrap().commit(Commit{expected_head:before.head,mutations:vec![Mutation::Enqueue(invalid)]}).unwrap();
         let result=poll(&world.ctx(),&path,0).unwrap();assert!(result.reachable);assert!(result.operation_error.is_some());let mut memory=crate::steps::Memory::new(&world.ctx());assert!(crate::ticker::tick_for_test(&world.ctx(),&mut memory));assert!(runtime::snapshot(&path).unwrap().attempts[0].retains_capacity());assert_eq!(world.runner.count("notification show"),0);

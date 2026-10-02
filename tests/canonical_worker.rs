@@ -5,12 +5,12 @@
 //! the CLI; the ticker then creates the worker on a Herdr stand-in server that
 //! really runs the supervised command, briefs it and later stops it. The server
 //! logs every request, so each test counts external effects from the outside.
-use herdr_projects::{authority, domain::*, migration, operations::DeliveryState, runtime};
+use herdr_farm::{authority, domain::*, migration, operations::DeliveryState, runtime};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{fs, os::unix::fs::{MetadataExt, PermissionsExt}, path::PathBuf, process::{Child, Command, Output, Stdio}, time::{Duration, Instant}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 /// A Herdr server on `argv[1]` that runs `workspace.create_command` for real
 /// and logs each request to `requests` beside the socket. `ping.json` there
@@ -92,7 +92,7 @@ impl Lab {
         let key = home.path().join("owner");
         assert!(Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).output().unwrap().status.success());
         let public = fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
-        let config = home.path().join(".config/herdr-projects/config.toml");
+        let config = home.path().join(".config/herdr-farm/config.toml");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         fs::write(&config, format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[profiles.worker]\nkind='{kind}'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=600\n{budget}\n")).unwrap();
         for dir in ["repo", "bin", "agent-home", "lab"] { fs::create_dir(home.path().join(dir)).unwrap(); }
@@ -121,8 +121,8 @@ impl Lab {
     /// Record a fresh observation of every (resource-free) binding and set the project active.
     fn resume(&self) {
         let state = self.state();
-        let config = self.path(".config/herdr-projects/config.toml");
-        let observations = state.runtime_bindings.iter().map(|binding| herdr_projects::reconcile::RuntimeObservation { binding: binding.id.clone(), binding_revision: binding.revision,
+        let config = self.path(".config/herdr-farm/config.toml");
+        let observations = state.runtime_bindings.iter().map(|binding| herdr_farm::reconcile::RuntimeObservation { binding: binding.id.clone(), binding_revision: binding.revision,
             task_revision: binding.task.as_ref().map(|id| state.tasks.iter().find(|t| &t.id == id).unwrap().revision),
             observed_unix_ms: jiff::Timestamp::now().as_millisecond(), collector: "herdr-git-v2".into(),
             config_digest: migration::config_reference(&config).unwrap().digest.clone(), ..Default::default() }).collect::<Vec<_>>();
@@ -207,7 +207,7 @@ sys.stdout.buffer.write(json.dumps({'result':json.loads(reply)['result']}).encod
     /// Prepare `worker` over the lab binaries; only the native interaction
     /// evidence, which needs a real agent session, is planted.
     fn prepare_profile(&mut self) {
-        use herdr_projects::worker_supervision::{ProcessIncarnation, SupervisorIdentity};
+        use herdr_farm::worker_supervision::{ProcessIncarnation, SupervisorIdentity};
         let prepared = self.ok(&["profile", "prepare", "demo", "worker", "--herdr-executable", self.herdr.to_str().unwrap(),
             "--agent-executable", self.agent().to_str().unwrap(), "--execution-home", self.path("agent-home").to_str().unwrap()]);
         let mut profile: FrozenProfile = serde_json::from_value(prepared["profile"].clone()).unwrap();
@@ -417,7 +417,7 @@ fn ticker_launches_and_briefs_once_then_stops_a_cancelled_worker_while_paused_an
     assert_eq!(lab.attempt(&attempt), running);
     assert!(lab.events("runtime.worker_terminated").is_empty());
     assert_eq!((lab.state().tasks, lab.state().deliveries), (observed.tasks, observed.deliveries));
-    assert!(!herdr_projects::worker_supervision::SupervisorObservation::recover_exited(&supervisor).unwrap(), "the worker is running");
+    assert!(!herdr_farm::worker_supervision::SupervisorObservation::recover_exited(&supervisor).unwrap(), "the worker is running");
 
     // The operator cancels the attempt, revokes its approval and pauses the
     // project while that same ticker keeps running. The ticker keeps its store
@@ -432,7 +432,7 @@ fn ticker_launches_and_briefs_once_then_stops_a_cancelled_worker_while_paused_an
     lab.wait(&mut ticker, 60, &|| lab.attempt(&attempt).termination_observed);
     lab.stop(ticker);
     let after = lab.state();
-    assert!(herdr_projects::worker_supervision::SupervisorObservation::recover_exited(&supervisor).unwrap(), "the worker has exited");
+    assert!(herdr_farm::worker_supervision::SupervisorObservation::recover_exited(&supervisor).unwrap(), "the worker has exited");
     let stopped = lab.attempt(&attempt);
     assert_eq!((stopped.state, stopped.retains_capacity()), (AttemptState::Cancelled, false));
     assert_eq!((after.tasks[0].state, after.tasks[0].active_attempt.as_ref()), (TaskState::Cancelled, None));
@@ -546,7 +546,7 @@ fn ticker_stops_the_dedicated_herdr_server_of_a_finished_task() {
     assert!(!run.join("demo-work/herdr/server.json").exists());
 }
 
-/// A worker that edits its deliverable and never submits. `herdr-projects result
+/// A worker that edits its deliverable and never submits. `herdr-farm result
 /// DEMO submit-captured ATTEMPT` captures the worktree, builds the submission
 /// from the capture (frozen contract revision and digest, base and candidate,
 /// the declared output's blob) and records it; with verification and
@@ -638,7 +638,7 @@ fn main() {
         fs::write("submission.json", document).unwrap();
         let mut submitted = false;
         for _ in 0..200 {
-            let out = Command::new("herdr-projects").args(["--root", ROOT, "result", "demo", "submit", "--input-file", "submission.json"]).output().unwrap();
+            let out = Command::new("herdr-farm").args(["--root", ROOT, "result", "demo", "submit", "--input-file", "submission.json"]).output().unwrap();
             if out.status.success() { submitted = true; break }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -711,11 +711,11 @@ fn accepted_verify_only_editing_worker_completes_without_integration_automation(
 #[test]
 fn rejected_editing_worker_stays_running_and_can_resubmit() {
     let (mut lab, attempt, worktree) = editing_submission_lab("verify_only", r#"{"version":1,"checks":["/usr/bin/false"]}"#, true, false);
-    herdr_projects::telemetry::sidecar::open(&lab.project, true).unwrap().unwrap();
+    herdr_farm::telemetry::sidecar::open(&lab.project, true).unwrap().unwrap();
     lab.serve();
     let mut ticker = lab.spawn();
     lab.wait_for(&mut ticker, "rejected verification", &attempt, 120, &|| {
-        let report = herdr_projects::telemetry::outcome::attempts(&lab.project).unwrap();
+        let report = herdr_farm::telemetry::outcome::attempts(&lab.project).unwrap();
         report["attempts"].as_array().unwrap().iter().any(|a| a["attempt_id"] == attempt.as_str() && a["verification"]["state"] == "rejected")
     });
     // The worker submits before its brief's acceptance window closes, so the
@@ -865,7 +865,7 @@ fn ticker_retires_a_cancelled_gated_worker_without_starting_it() {
     lab.stop(ticker);
     let target: LaunchTarget = serde_json::from_value(lab.events("runtime.launch_target")[0].payload.clone()).unwrap();
     let supervisor = target.supervisor.clone().unwrap();
-    assert!(!herdr_projects::worker_supervision::SupervisorObservation::recover_exited(&supervisor).unwrap(), "the gated worker is waiting");
+    assert!(!herdr_farm::worker_supervision::SupervisorObservation::recover_exited(&supervisor).unwrap(), "the gated worker is waiting");
     let staged = lab.attempt(&attempt);
     assert_eq!((staged.state, staged.retains_capacity()), (AttemptState::Reserved, true));
     lab.ok(&["task", "demo", "cancel-attempt", attempt.as_str(), "--expected-revision", &staged.revision.to_string(), "--expected-head", &lab.head().to_string(), "--reason", "stop staged resource"]);
@@ -874,7 +874,7 @@ fn ticker_retires_a_cancelled_gated_worker_without_starting_it() {
     lab.stop(ticker);
     let stopped = lab.attempt(&attempt);
     assert_eq!((stopped.state, stopped.retains_capacity()), (AttemptState::Cancelled, false));
-    assert!(herdr_projects::worker_supervision::SupervisorObservation::recover_exited(&supervisor).unwrap(), "the gated worker has exited");
+    assert!(herdr_farm::worker_supervision::SupervisorObservation::recover_exited(&supervisor).unwrap(), "the gated worker has exited");
     assert!(lab.events("runtime.launch_started").is_empty() && lab.state().ownership.is_empty());
     assert_eq!(serde_json::from_value::<LaunchTarget>(lab.events("runtime.launch_target")[0].payload.clone()).unwrap(), target);
     assert_eq!((lab.count("workspace.create_command"), lab.count("agent.prompt")), (1, 0));
@@ -974,7 +974,7 @@ fn a_legacy_thread_holding_the_planned_worktree_blocks_its_creation() {
 #[test]
 fn a_worker_wall_deadline_outside_one_second_to_seven_days_is_refused() {
     let lab = Lab::new("unknown_usage='allow_with_warning'");
-    let config = lab.path(".config/herdr-projects/config.toml");
+    let config = lab.path(".config/herdr-farm/config.toml");
     let original = fs::read_to_string(&config).unwrap();
     for (wall, reason) in [("0", "budget limits must be positive bounded integers"), ("604801", "worker wall deadline exceeds supported bounds")] {
         fs::write(&config, original.replace("max_wall_seconds=600", &format!("max_wall_seconds={wall}"))).unwrap();
@@ -1484,7 +1484,7 @@ fn main() {
     let mut last = (false, String::new());
     for _ in 0..200 {
         // Bare: the sandbox puts the product binary first on the agent's PATH.
-        last = run("herdr-projects", &["--root", ROOT, "result", "demo", "submit", "--input-file", "submit.json"]);
+        last = run("herdr-farm", &["--root", ROOT, "result", "demo", "submit", "--input-file", "submit.json"]);
         if last.0 { break }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -1669,8 +1669,8 @@ fn an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_com
         (home.join(".ssh/id_owner"), "SENTINEL-SSH-KEY"),
         (home.join(".gnupg/private-keys-v1.d/key"), "SENTINEL-GNUPG"),
         (home.join(".codex/auth.json"), "SENTINEL-OWNER-CODEX-AUTH"),
-        (home.join(".config/herdr-projects/review-signer/reviewer"), "SENTINEL-REVIEW-SIGNER"),
-        (home.join(".config/herdr-projects/notes"), "SENTINEL-CONFIG-DIR"),
+        (home.join(".config/herdr-farm/review-signer/reviewer"), "SENTINEL-REVIEW-SIGNER"),
+        (home.join(".config/herdr-farm/notes"), "SENTINEL-CONFIG-DIR"),
         (home.join("root/other/SECRET.txt"), "SENTINEL-OTHER-PROJECT"),
         (home.join("lab/secret"), "SENTINEL-HERDR-DIR"),
     ];
@@ -1683,7 +1683,7 @@ fn an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_com
     fs::set_permissions(home.join("agent-home"), fs::Permissions::from_mode(0o700)).unwrap();
     let owner_key = fs::read_to_string(&lab.key).unwrap();
     let mut reads: Vec<PathBuf> = secrets.iter().map(|(p, _)| p.clone()).collect();
-    reads.extend([agent_socket.clone(), lab.key.clone(), home.join(".config/herdr-projects/config.toml"), home.join("agent-home/.codex/auth.json")]);
+    reads.extend([agent_socket.clone(), lab.key.clone(), home.join(".config/herdr-farm/config.toml"), home.join("agent-home/.codex/auth.json")]);
     // Files the owner's shell, systemd or Git later run, and the repository's
     // working tree: none may change from inside the worker.
     let repo_git = lab.repo.canonicalize().unwrap().join(".git");
@@ -1705,11 +1705,11 @@ fn an_isolated_worker_cannot_read_owner_secrets_or_lift_the_hiding_but_still_com
     let before = owner_files();
     // The worker's /tmp is private: a host file there is invisible and a file
     // the worker writes there never reaches the host.
-    let host_tmp = tempfile::Builder::new().prefix("herdr-projects-host-").tempdir_in("/tmp").unwrap();
+    let host_tmp = tempfile::Builder::new().prefix("herdr-farm-host-").tempdir_in("/tmp").unwrap();
     plant(&host_tmp.path().join("secret"), "SENTINEL-HOST-TMP");
     reads.push(host_tmp.path().join("secret"));
     let worker_tmp = PathBuf::from(format!("{}-worker", host_tmp.path().display()));
-    let hidden = [home.join(".ssh"), home.join(".codex"), home.join(".config/herdr-projects"), home.join("lab"), home.join("root")];
+    let hidden = [home.join(".ssh"), home.join(".codex"), home.join(".config/herdr-farm"), home.join("lab"), home.join("root")];
     let nested = format!("for d in {0}; do umount \"$d\" 2>/dev/null && echo LIFTED-$d; umount -l \"$d\" 2>/dev/null && echo LIFTED-$d; done; \
         mkdir -p nested && mount --bind {1} nested 2>/dev/null && cat nested/.ssh/id_owner; mount --rbind {1} nested 2>/dev/null && cat nested/.ssh/id_owner nested/owner; \
         cat {2} {3}; echo nested-done",
@@ -2202,7 +2202,7 @@ fn canonical_attempt_sidebar_refreshes_and_clears_on_pause_and_termination() {
     let mut ticker = lab.spawn();
     lab.wait(&mut ticker, 120, &|| metadata().iter().any(|p| p["tokens"]["telemetry"] == "claude ○"));
     let published = metadata();
-    assert!(published.iter().all(|p| p["pane_id"] == "w1:p1" && p["source"] == "herdr-projects" && p["tokens"] == json!({"telemetry":"claude ○"})), "{published:?}");
+    assert!(published.iter().all(|p| p["pane_id"] == "w1:p1" && p["source"] == "herdr-farm" && p["tokens"] == json!({"telemetry":"claude ○"})), "{published:?}");
     assert_eq!(lab.attempt(&attempt).state, AttemptState::Running);
     lab.ok_live(&|| { let s = lab.state(); ["runtime", "demo", "state", "paused", "--expected-revision", &s.control.unwrap().revision.to_string(), "--expected-head", &s.head.to_string()].map(String::from).to_vec() });
     lab.wait(&mut ticker, 90, &|| metadata().iter().any(|p| p["tokens"] == json!({"telemetry":null})));
@@ -2343,7 +2343,7 @@ fn canonical_attempt_sidebar_restart_offers_no_historical_cleanup_or_native_requ
     let running = lab.attempt(&attempt);
     lab.ok(&["task", "demo", "cancel-attempt", attempt.as_str(), "--expected-revision", &running.revision.to_string(), "--expected-head", &lab.head().to_string(), "--reason", "expired sidebar fixture"]);
     lab.run_until(90, &|| lab.attempt(&attempt).termination_observed);
-    let control = herdr_projects::store::controlled::ReadControl::new(Instant::now() + Duration::from_secs(10), Default::default());
+    let control = herdr_farm::store::controlled::ReadControl::new(Instant::now() + Duration::from_secs(10), Default::default());
     let mut store = migration::open_active_scoped(&lab.project, control).unwrap();
     assert!(store.attempt_tokens(&[]).unwrap().entries.is_empty());
     let cleanup = store.attempt_tokens(std::slice::from_ref(&lab.binding)).unwrap();

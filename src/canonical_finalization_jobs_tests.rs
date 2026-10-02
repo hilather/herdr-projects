@@ -1,8 +1,8 @@
-use herdr_projects::execution_guard::GatedSpawn;
+use herdr_farm::execution_guard::GatedSpawn;
 use super::*;
 use std::fs;
 use crate::finalization_delivery::tests::fixture;
-use herdr_projects::{domain::TaskState,runtime};
+use herdr_farm::{domain::TaskState,runtime};
 fn input(ctx:&Ctx,path:&Path,op:&Operation,revision:u64,mode:Mode)->Input {serde_json::from_str(request(ctx,path,op,revision,mode).unwrap().command.stdin.as_ref().unwrap()).unwrap()}
 fn control()->Control {Control::default()}
 
@@ -55,7 +55,7 @@ fn canonical_finalization_owner_death_recovers_only_verified_receipts_without_so
         let(world,path,op)=fixture();fs::write(world.home.path().join("input.json"),serde_json::to_vec(&input(&world.ctx(),&path,&op,1,Mode::Deliver)).unwrap()).unwrap();
         let mut child=Command::new(std::env::current_exe().unwrap()).args(["--exact","canonical_finalization_jobs::tests::canonical_finalization_crash_child","--nocapture"]).env("HP_CANONICAL_FINALIZATION_CRASH",world.home.path()).env("HP_CANONICAL_FINALIZATION_PHASE",phase).stdout(Stdio::null()).stderr(Stdio::inherit()).spawn_gated().unwrap();let deadline=Instant::now()+Duration::from_secs(10);
         while !world.home.path().join("ready").exists(){if child.try_wait().unwrap().is_some(){panic!("crash child exited");}if Instant::now()>deadline{let _=child.kill();let _=child.wait();panic!("crash child timed out");}std::thread::sleep(Duration::from_millis(10));}
-        assert!(ProjectGuard::acquire(&path).is_err());assert!(herdr_projects::execution_guard::RootGuard::exclusive(&world.root).is_err());
+        assert!(ProjectGuard::acquire(&path).is_err());assert!(herdr_farm::execution_guard::RootGuard::exclusive(&world.root).is_err());
         child.kill().unwrap();child.wait().unwrap();assert!(ProjectGuard::acquire(&path).is_ok());
         let mut db=migration::open_active(&path).unwrap();let delivery=db.read_snapshot(None).unwrap().deliveries[0].clone();
         if phase=="committed"{assert_eq!(delivery.state,DeliveryState::Confirmed);assert!(execute(&input(&world.ctx(),&path,&op,1,Mode::Deliver),&control()).is_err());continue;}
@@ -68,7 +68,7 @@ fn canonical_finalization_owner_death_recovers_only_verified_receipts_without_so
 #[cfg(target_os="linux")]
 #[test]
 fn stop_snapshot_finalizes_without_source_in_foreground_and_queued_paths() {
-    use herdr_projects::domain::*;
+    use herdr_farm::domain::*;
     // Seed historical canonical evidence directly. Native creation/stop provenance
     // is covered by canonical_worker tests; this fixture tests both consumers.
     for mode in ["foreground","queued","corrupt","absent"] {
@@ -89,16 +89,16 @@ fn stop_snapshot_finalizes_without_source_in_foreground_and_queued_paths() {
         raw.execute("INSERT INTO attempt_inputs VALUES(?1,?2,?3,?4)",rusqlite::params![attempt.as_str(),launch.as_str(),body,digest(body.as_bytes())]).unwrap();raw.execute_batch(&trigger).unwrap();
         let payload=serde_json::to_string(binding).unwrap();raw.execute("UPDATE runtime_bindings SET payload=?2,payload_hash=?3 WHERE id=?1",rusqlite::params![binding.id,payload,digest(payload.as_bytes())]).unwrap();
         let report=digest(b"preserved report");let artifact=digest(&[0,255,3]);
-        let manifest=herdr_projects::worktree_preservation::OutputManifest{version:1,attempt:attempt.clone(),source:source.clone(),entries:vec![
-            herdr_projects::worktree_preservation::Entry{symlink:false,path:"library".into(),directory:true,executable:false,bytes:0,sha256:String::new()},
-            herdr_projects::worktree_preservation::Entry{symlink:false,path:"library/binary".into(),directory:false,executable:true,bytes:3,sha256:artifact.clone()},
-            herdr_projects::worktree_preservation::Entry{symlink:false,path:"report.md".into(),directory:false,executable:false,bytes:16,sha256:report.clone()},
+        let manifest=herdr_farm::worktree_preservation::OutputManifest{version:1,attempt:attempt.clone(),source:source.clone(),entries:vec![
+            herdr_farm::worktree_preservation::Entry{symlink:false,path:"library".into(),directory:true,executable:false,bytes:0,sha256:String::new()},
+            herdr_farm::worktree_preservation::Entry{symlink:false,path:"library/binary".into(),directory:false,executable:true,bytes:3,sha256:artifact.clone()},
+            herdr_farm::worktree_preservation::Entry{symlink:false,path:"report.md".into(),directory:false,executable:false,bytes:16,sha256:report.clone()},
         ]};
         let bytes=serde_json::to_vec(&manifest).unwrap();let manifest_hash=digest(&bytes);let directory=path.join(".state/worker-output-snapshots").join(attempt.as_str()).join(&manifest_hash);
         fs::create_dir_all(&directory).unwrap();fs::write(directory.join("manifest.json"),bytes).unwrap();fs::write(directory.join(&report),b"preserved report").unwrap();fs::write(directory.join(&artifact),[0,255,3]).unwrap();
-        let process=herdr_projects::worker_supervision::ProcessIncarnation{pid:1,device:1,inode:1};
+        let process=herdr_farm::worker_supervision::ProcessIncarnation{pid:1,device:1,inode:1};
         let stop=WorkerTerminationReceipt{version:1,attempt:attempt.clone(),launch,binding:binding.id.clone(),binding_revision:binding.revision,ownership_revision:1,
-            supervisor:herdr_projects::worker_supervision::SupervisorIdentity{version:1,boot_id:"00000000-0000-0000-0000-000000000001".into(),host_id:None,observer_namespace:(1,1),worker_namespace:(1,2),outer:process.clone(),init:process},
+            supervisor:herdr_farm::worker_supervision::SupervisorIdentity{version:1,boot_id:"00000000-0000-0000-0000-000000000001".into(),host_id:None,observer_namespace:(1,1),worker_namespace:(1,2),outer:process.clone(),init:process},
             host_reboot:None,repository_snapshots:vec![],output_snapshot:Some(AttemptOutputReference{source:source.clone(),digest:if mode=="absent"{None}else{Some(manifest_hash)}}),retained_resources:binding.identity.clone(),cause:WorkerTerminationCause::Cancellation,observed_unix_ms:0};
         raw.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.worker_terminated',?1,1,1,?2)",rusqlite::params![attempt.as_str(),serde_json::to_string(&stop).unwrap()]).unwrap();
         if mode=="queued" {raw.execute("UPDATE tasks SET state='cancelled' WHERE id=?1",[old.task.as_ref().unwrap().as_str()]).unwrap();}

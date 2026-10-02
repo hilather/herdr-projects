@@ -3,22 +3,22 @@
 #![allow(clippy::disallowed_methods)]
 mod support;
 use support::replay::*;
-use herdr_projects::{authority, domain::*, migration, runtime};
+use herdr_farm::{authority, domain::*, migration, runtime};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{fs, path::PathBuf};
 
 fn enable(lab: &Lab) {
-    let config = lab.path(".config/herdr-projects/config.toml");
+    let config = lab.path(".config/herdr-farm/config.toml");
     let mut text = fs::read_to_string(&config).unwrap();
     text += &format!("\n[safety.{:?}]\nroutine_commands=true\n", lab.project.canonicalize().unwrap().display().to_string());
     fs::write(config, text).unwrap();
     lab.observe();
     let s = lab.state();
-    runtime::set_state(&lab.project, s.head, s.control.unwrap().revision, ProjectState::Active, &lab.path(".config/herdr-projects/config.toml")).unwrap();
+    runtime::set_state(&lab.project, s.head, s.control.unwrap().revision, ProjectState::Active, &lab.path(".config/herdr-farm/config.toml")).unwrap();
 }
 fn install(lab: &Lab, name: &str, template: Value) {
-    let config = lab.path(".config/herdr-projects/config.toml");
+    let config = lab.path(".config/herdr-farm/config.toml");
     let script = format!("# herdr-telemetry-routine.v1\n{template}\n");
     let path = lab.project.join(format!("{name}.routine"));
     fs::write(&path, &script).unwrap();
@@ -79,7 +79,7 @@ Advisory; grants no launch, budget or selection. All-time evidence at export que
     let binding = lab.state().runtime_bindings.iter().find(|b| b.task.as_ref().is_some_and(|t| t.as_str() == "work")).unwrap().id.as_str().to_owned();
     let selection = lab.selection("work", &binding, &lab.repo, None);
     let attempt = lab.reserve(&selection);
-    let brief = herdr_projects::memory::render_attempt_brief(&lab.project, attempt.as_str()).unwrap();
+    let brief = herdr_farm::memory::render_attempt_brief(&lab.project, attempt.as_str()).unwrap();
     assert!(brief.text.contains("Retained instructions"));
     assert!(!brief.text.contains("# Fleet report:") && !brief.text.contains("no_replay_suite") && !brief.text.contains(&format!("fleet-{week}")));
 }

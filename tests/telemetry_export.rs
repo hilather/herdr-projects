@@ -1,4 +1,4 @@
-//! TM4.3 portable exports end to end, through `herdr-projects telemetry
+//! TM4.3 portable exports end to end, through `herdr-farm telemetry
 //! <slug> export` on the CLI over planted canonical rows: totals reconcile
 //! with `telemetry query`, JSON and CSV round-trip, pinned pagination under
 //! concurrent ingestion, authenticated/scoped/expiring cursors, planted
@@ -12,7 +12,7 @@
 
 mod support;
 
-use herdr_projects::store::SqliteStore;
+use herdr_farm::store::SqliteStore;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::os::unix::fs::PermissionsExt;
@@ -34,7 +34,7 @@ impl Planted {
         Planted { tmp, root, project }
     }
     fn home(&self) -> PathBuf { self.tmp.path().join("home") }
-    fn config(&self) -> PathBuf { self.home().join(".config/herdr-projects") }
+    fn config(&self) -> PathBuf { self.home().join(".config/herdr-farm") }
     fn db(&self) -> rusqlite::Connection {
         let db = rusqlite::Connection::open(self.project.join(".state/state.db")).unwrap();
         db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();

@@ -914,7 +914,7 @@ pub fn deliver_migrated(project_dir: &Path, project_slug: &str) -> Result<Vec<(S
 /// head check, and reads only the head and that row, never a whole snapshot.
 #[cfg(feature = "state-store")]
 fn deliver_one_migrated(project_dir: &Path, item: &str, thread_id: &str, summary: &str) -> Result<()> {
-    use herdr_projects::domain::InboxContent;
+    use herdr_farm::domain::InboxContent;
     let content = InboxContent {
         id: item.into(),
         kind: "memory-review".into(),
@@ -923,15 +923,15 @@ fn deliver_one_migrated(project_dir: &Path, item: &str, thread_id: &str, summary
         summary: summary.into(),
         body: String::new(),
     };
-    let _ownership = herdr_projects::execution_guard::ProjectGuard::acquire(project_dir)?;
+    let _ownership = herdr_farm::execution_guard::ProjectGuard::acquire(project_dir)?;
     for _ in 0..3 {
-        let mut db = herdr_projects::migration::open_active_unchecked(project_dir)?;
+        let mut db = herdr_farm::migration::open_active_unchecked(project_dir)?;
         let head = db.current_head()?;
         let now_ms = jiff::Timestamp::now().as_millisecond();
         match db.deliver_memory_review_reminder(head, &content, now_ms) {
             // Both outcomes mean a committed row with this stable id.
             Ok(_) => return Ok(()),
-            Err(herdr_projects::store::StoreError::Conflict) => continue,
+            Err(herdr_farm::store::StoreError::Conflict) => continue,
             Err(error) => return Err(error.into()),
         }
     }

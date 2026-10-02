@@ -2,9 +2,9 @@
 use std::{collections::BTreeMap,path::Path,time::Duration};
 use anyhow::{Result,ensure};
 use crate::{paths::Ctx,herdr::{self,Herdr,Pane,Agent},runner::Cmd};
-use herdr_projects::{migration,reconcile::{ObservationBatch,RuntimeObservation,ResourceState as State},runtime};
+use herdr_farm::{migration,reconcile::{ObservationBatch,RuntimeObservation,ResourceState as State},runtime};
 
-fn pane_state(identity:&herdr_projects::domain::RuntimeIdentity,state:&Result<(Vec<Pane>,Vec<Agent>),String>)->(State,bool) {
+fn pane_state(identity:&herdr_farm::domain::RuntimeIdentity,state:&Result<(Vec<Pane>,Vec<Agent>),String>)->(State,bool) {
     let Ok((panes,agents))=state else{return (State::Unknown,false);};
     let matching=panes.iter().filter(|p|p.pane_id==identity.pane_id).collect::<Vec<_>>();
     let agents=agents.iter().filter(|a|a.pane_id==identity.pane_id).collect::<Vec<_>>();
@@ -22,18 +22,18 @@ fn pane_state(identity:&herdr_projects::domain::RuntimeIdentity,state:&Result<(V
 }
 
 pub fn collect(ctx:&Ctx,project:&Path)->Result<ObservationBatch> {collect_limited(ctx,project,None)}
-pub fn collect_controlled(ctx:&Ctx,project:&Path,control:&herdr_projects::store::controlled::ReadControl)->Result<ObservationBatch> {
+pub fn collect_controlled(ctx:&Ctx,project:&Path,control:&herdr_farm::store::controlled::ReadControl)->Result<ObservationBatch> {
     collect_limited(ctx,project,Some(control))
 }
-fn map_store(error:herdr_projects::store::StoreError)->anyhow::Error {
-    if matches!(error,herdr_projects::store::StoreError::UnsupportedSchema(_)) {anyhow::anyhow!("upgrade-store is required for reconciliation observations")} else {error.into()}
+fn map_store(error:herdr_farm::store::StoreError)->anyhow::Error {
+    if matches!(error,herdr_farm::store::StoreError::UnsupportedSchema(_)) {anyhow::anyhow!("upgrade-store is required for reconciliation observations")} else {error.into()}
 }
-fn collect_limited(ctx:&Ctx,project:&Path,control:Option<&herdr_projects::store::controlled::ReadControl>)->Result<ObservationBatch> {
+fn collect_limited(ctx:&Ctx,project:&Path,control:Option<&herdr_farm::store::controlled::ReadControl>)->Result<ObservationBatch> {
     let run=match control {
         Some(control)=>migration::open_active_scoped(project,control.clone())?.reconcile_active_work(None).map_err(map_store)?,
         None=>migration::open_active(project)?.reconcile_active_work(None).map_err(map_store)?,
     };
-    ensure!(run.coverage==herdr_projects::store::ActiveCoverage::Complete,"active inventory coverage incomplete; capacity retained");
+    ensure!(run.coverage==herdr_farm::store::ActiveCoverage::Complete,"active inventory coverage incomplete; capacity retained");
     let head=run.head;
     let config=std::path::absolute(ctx.config_dir.join("config.toml"))?;
     let config=migration::config_reference(&config)?;
@@ -87,7 +87,7 @@ fn collect_limited(ctx:&Ctx,project:&Path,control:Option<&herdr_projects::store:
             let after=resource_identity(Path::new(&identity.worktree_path),false);
             if worktree_before.is_some()&&worktree_before==after&&common.is_some()&&common_dirs.get(&identity.repo)==Some(&common)&&top.as_deref()==Some(identity.worktree_path.as_str()) {worktree_identity=after;}else{worktree=State::Unknown;}
         }
-        let mut agent_identity=if agent_present {sessions.get(&(identity.socket.clone(),identity.machine.clone())).and_then(|s|s.as_ref().ok()).and_then(|(_,agents)|agents.iter().find(|a|a.pane_id==identity.pane_id)).map(|a|herdr_projects::domain::AgentIdentity{kind:a.agent.clone(),name:a.name.clone()})}else{None};
+        let mut agent_identity=if agent_present {sessions.get(&(identity.socket.clone(),identity.machine.clone())).and_then(|s|s.as_ref().ok()).and_then(|(_,agents)|agents.iter().find(|a|a.pane_id==identity.pane_id)).map(|a|herdr_farm::domain::AgentIdentity{kind:a.agent.clone(),name:a.name.clone()})}else{None};
         if let Some(owned)=item.ownership.as_ref().filter(|o|o.binding==binding.id&&o.binding_revision==binding.revision) {
             if owned.session!=session_identity||owned.agent!=agent_identity {pane=State::Mismatch;agent_present=false;agent_identity=None;}
         }
@@ -129,13 +129,13 @@ pub fn run(ctx:&Ctx,project:&Path,apply:bool)->Result<ObservationBatch> {
 
 /// Incarnation evidence is local and conservative. Unsupported birth-time metadata
 /// or aliases do not become authority merely because Herdr returned a pane ID.
-pub(crate) fn resource_identity(path:&Path,socket:bool)->Option<herdr_projects::domain::ResourceIdentity> {
+pub(crate) fn resource_identity(path:&Path,socket:bool)->Option<herdr_farm::domain::ResourceIdentity> {
     use std::os::unix::fs::{MetadataExt,FileTypeExt};
     if !path.is_absolute()||std::fs::canonicalize(path).ok()?.as_path()!=path{return None;}
     let metadata=std::fs::symlink_metadata(path).ok()?;
     if if socket {!metadata.file_type().is_socket()}else{!metadata.is_dir()}{return None;}
     let born=metadata.created().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
-    Some(herdr_projects::domain::ResourceIdentity{device:metadata.dev(),inode:metadata.ino(),born_secs:born.as_secs(),born_nanos:born.subsec_nanos()})
+    Some(herdr_farm::domain::ResourceIdentity{device:metadata.dev(),inode:metadata.ino(),born_secs:born.as_secs(),born_nanos:born.subsec_nanos()})
 }
 
 fn git_common(ctx:&Ctx,path:&str)->Option<std::path::PathBuf> {
@@ -146,10 +146,10 @@ fn git_common(ctx:&Ctx,path:&str)->Option<std::path::PathBuf> {
 }
 
 /// Read-only plan: no evidence or repair is applied to canonical state.
-pub fn plan(ctx:&Ctx,project:&Path)->Result<herdr_projects::reconcile::plan::RecoveryPlan> {
+pub fn plan(ctx:&Ctx,project:&Path)->Result<herdr_farm::reconcile::plan::RecoveryPlan> {
     let config=std::path::absolute(ctx.config_dir.join("config.toml"))?;
     let config=migration::config_reference(&config)?;
     let batch=collect(ctx,project)?;let snapshot=runtime::snapshot(project)?;
     ensure!(migration::config_reference(Path::new(&config.path))?==config,"config changed during recovery planning");
-    herdr_projects::reconcile::plan::build(&snapshot,&batch,jiff::Timestamp::now().as_millisecond(),config.digest.as_deref())
+    herdr_farm::reconcile::plan::build(&snapshot,&batch,jiff::Timestamp::now().as_millisecond(),config.digest.as_deref())
 }

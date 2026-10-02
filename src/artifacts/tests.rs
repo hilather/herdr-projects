@@ -161,7 +161,7 @@ fn expired_or_cancelled_capture_and_retained_load_do_not_start_new_work() {
 #[cfg(feature="state-store")]
 fn canonical_fixture()->(crate::scenarios::World,Project,Thread) {
     let(world,path,op)=crate::finalization_delivery::tests::fixture();
-    let payload=herdr_projects::operations::finalization::Finalization::decode(&op).unwrap();
+    let payload=herdr_farm::operations::finalization::Finalization::decode(&op).unwrap();
     let project=Project{root:path.parent().unwrap().into(),slug:path.file_name().unwrap().to_str().unwrap().into()};
     let record=Thread{id:payload.artifact_key(),thread_dir:payload.source,lifecycle_generation:payload.binding_revision,..Default::default()};
     (world,project,record)
@@ -230,7 +230,7 @@ fn canonical_publication_rechecks_source_after_authorization() {
 #[cfg(all(feature="state-store",target_os="linux"))]
 #[test]
 fn preserved_outputs_publish_artifacts_without_original_source_and_recheck_authority() {
-    use herdr_projects::{domain::{AttemptId,AttemptOutputReference},worktree_preservation::{Entry as OutputEntry,OutputManifest,load_outputs}};
+    use herdr_farm::{domain::{AttemptId,AttemptOutputReference},worktree_preservation::{Entry as OutputEntry,OutputManifest,load_outputs}};
     let(world,project,record)=canonical_fixture();let _lease=crate::cleanup::lease(&world.root).unwrap();
     let original=capture_canonical_controlled(&project,&record,&Control::default(),None,||Ok(())).unwrap();
     let attempt=AttemptId::new(format!("attempt-{}","c".repeat(64))).unwrap();
@@ -243,7 +243,7 @@ fn preserved_outputs_publish_artifacts_without_original_source_and_recheck_autho
     let manifest=OutputManifest{version:1,attempt:attempt.clone(),source:record.thread_dir.clone(),entries};let bytes=serde_json::to_vec(&manifest).unwrap();let digest=crate::thread::sha256_hex(&bytes);
     let root=project.state_dir().join("worker-output-snapshots").join(attempt.as_str()).join(&digest);fs::create_dir_all(&root).unwrap();fs::write(root.join("manifest.json"),bytes).unwrap();for (id,bytes) in blobs{fs::write(root.join(id),bytes).unwrap();}
     fs::remove_dir_all(&record.thread_dir).unwrap();
-    let outputs=load_outputs(&project.dir(),&attempt,&AttemptOutputReference{source:record.thread_dir.clone(),digest:Some(digest)},&herdr_projects::source_tree::Control::default()).unwrap();
+    let outputs=load_outputs(&project.dir(),&attempt,&AttemptOutputReference{source:record.thread_dir.clone(),digest:Some(digest)},&herdr_farm::source_tree::Control::default()).unwrap();
     let loaded=capture_preserved_outputs(&project,&record,&outputs,&Control::default(),||Ok(())).unwrap();assert_eq!(loaded.id,original.id);assert_eq!(loaded.manifest,original.manifest);
     assert!(!Path::new(&record.thread_dir).exists());
     let target=project.state_dir().join("canonical-artifacts").join(&record.id).join(&loaded.id);

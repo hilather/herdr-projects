@@ -37,7 +37,7 @@ fn build_from(snapshot:&Rows,task:&TaskId,project_slug:&str,config:ConfigReferen
     let task=snapshot.tasks.iter().find(|t|&t.id==task).context("task not found")?;
     let inbox_ids=unseen(snapshot);ensure!(!inbox_ids.is_empty(),"no unseen inbox items");ensure!(inbox_ids.len()<=1000,"notification batch exceeds 1000 inbox items");
     let id=identity(&inbox_ids);
-    let notification=Notification{authority:"operator.session_notification".into(),binding_revision:binding.revision,control_epoch:snapshot.control.context("upgrade-store required")?.epoch,config,inbox_ids,title:format!("herdr-projects: {project_slug}"),body:format!("{} new inbox item(s). The coordinator reads them at its next turn.",unseen(snapshot).len())};
+    let notification=Notification{authority:"operator.session_notification".into(),binding_revision:binding.revision,control_epoch:snapshot.control.context("upgrade-store required")?.epoch,config,inbox_ids,title:format!("herdr-farm: {project_slug}"),body:format!("{} new inbox item(s). The coordinator reads them at its next turn.",unseen(snapshot).len())};
     let op=Operation{id:OperationId::new(id.clone()).map_err(anyhow::Error::msg)?,task:Some(task.id.clone()),kind:"runtime.notification".into(),target:"coordinator".into(),payload_version:1,payload:serde_json::to_value(&notification)?,expected_revision:task.revision,due_unix_ms:now,idempotency_key:id};
     notification.validate_from(&op,snapshot,&notification.config)?;Ok(op)
 }
@@ -48,7 +48,7 @@ impl Notification {
     }
     fn validate_payload(&self,operation:&Operation)->Result<()> {
         ensure!(self.authority=="operator.session_notification","notification lacks explicit operator scope");
-        ensure!(self.title.starts_with("herdr-projects: ")&&self.title.len()<=256&&!self.title.chars().any(char::is_control),"invalid notification title");
+        ensure!((self.title.starts_with("herdr-farm: ") || self.title.starts_with("herdr-projects: "))&&self.title.len()<=256&&!self.title.chars().any(char::is_control),"invalid notification title");
         ensure!(!self.inbox_ids.is_empty()&&self.inbox_ids.len()<=1000&&self.inbox_ids.iter().all(|id|!id.is_empty())&&self.inbox_ids.windows(2).all(|ids|ids[0]<ids[1]),"invalid notification inbox set");
         for id in &self.inbox_ids{crate::domain::InboxContent{id:id.clone(),..Default::default()}.validate().map_err(anyhow::Error::msg)?;}
         ensure!(self.binding_revision>0&&self.control_epoch>0&&std::path::Path::new(&self.config.path).is_absolute()&&self.config.digest.as_ref().is_none_or(|digest|super::finalization::hash(digest)),"invalid notification authority reference");

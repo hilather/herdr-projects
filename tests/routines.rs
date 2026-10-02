@@ -4,11 +4,11 @@
 //! projects. Routines are signed with `ssh-keygen` and installed with
 //! `routine-store import`; migration, activation and runtime bindings use the
 //! public library API, as in tests/cli.rs, because they have no CLI verb.
-use herdr_projects::{authority, domain::*, migration, reconcile::ResourceState, runtime};
+use herdr_farm::{authority, domain::*, migration, reconcile::ResourceState, runtime};
 use sha2::{Digest, Sha256};
 use std::{fs, os::unix::fs::PermissionsExt, path::{Path, PathBuf}, process::{Command, Stdio}, time::{Duration, Instant}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 struct Root { home: tempfile::TempDir, key: PathBuf, config: PathBuf }
 
@@ -20,7 +20,7 @@ impl Root {
         let key = home.path().join("owner");
         assert!(Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).output().unwrap().status.success());
         let public = fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
-        let config = home.path().join(".config/herdr-projects/config.toml");
+        let config = home.path().join(".config/herdr-farm/config.toml");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         let root = Root { home, key, config };
         let mut text = format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n");

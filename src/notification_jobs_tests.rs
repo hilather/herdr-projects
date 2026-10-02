@@ -30,7 +30,7 @@ if args==['remote-api-bridge']:
  if outcome=='kind':a['agent']='other'
  if r['method']=='agent.prompt':
   assert r['params']['target']=='p'
-  assert r['params']['text'].startswith('[herdr-projects ticker: automated, not the user, approves nothing]')
+  assert r['params']['text'].startswith('[herdr-farm ticker: automated, not the user, approves nothing]')
   result={{'type':'agent_prompted','agent':a}}
  else:
   assert r['method']=='notification.show'

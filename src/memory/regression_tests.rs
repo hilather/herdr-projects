@@ -1,8 +1,8 @@
 #![cfg(feature = "state-store")]
 //! Regression coverage derived from the 2026-09-20 independent memory audit.
 use crate::execution_guard::GatedSpawn;
-use crate as herdr_projects;
-use herdr_projects::{domain::*, memory::*, store::SqliteStore};
+use crate as herdr_farm;
+use herdr_farm::{domain::*, memory::*, store::SqliteStore};
 use std::{fs, path::Path};
 
 fn fixture() -> (tempfile::TempDir, MemoryStore) {
@@ -183,15 +183,15 @@ fn project_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
         r#"{"status":"paused"}"#,
     )
     .unwrap();
-    let plan = herdr_projects::migration::inspect(&project).unwrap();
-    herdr_projects::migration::apply(&project, &plan, true).unwrap();
+    let plan = herdr_farm::migration::inspect(&project).unwrap();
+    herdr_farm::migration::apply(&project, &plan, true).unwrap();
     (temp, project)
 }
 #[test]
 fn coordinator_must_refuse_missing_mandatory_bytes() {
     let (_tmp, project) = project_fixture();
     let mut memory = MemoryStore::from_sqlite(
-        herdr_projects::migration::open_active(&project).unwrap(),
+        herdr_farm::migration::open_active(&project).unwrap(),
         project.join(".state/objects"),
     );
     let hash = put(
@@ -223,7 +223,7 @@ fn coordinator_must_refuse_missing_mandatory_bytes() {
 fn corrupt_object_bytes_must_not_be_rendered_as_verified_memory() {
     let (_tmp, project) = project_fixture();
     let mut memory = MemoryStore::from_sqlite(
-        herdr_projects::migration::open_active(&project).unwrap(),
+        herdr_farm::migration::open_active(&project).unwrap(),
         project.join(".state/objects"),
     );
     let hash = put(
@@ -256,7 +256,7 @@ fn corrupt_object_bytes_must_not_be_rendered_as_verified_memory() {
 fn coordinator_output_must_fit_profile_budget() {
     let (_tmp, project) = project_fixture();
     let mut memory = MemoryStore::from_sqlite(
-        herdr_projects::migration::open_active(&project).unwrap(),
+        herdr_farm::migration::open_active(&project).unwrap(),
         project.join(".state/objects"),
     );
     put(
@@ -305,8 +305,8 @@ fn abandoned_gc_claim_must_be_recoverable_after_reopen() {
 
 #[test]
 fn cutover_must_verify_object_bytes_before_publishing_authority() {
-    use crate as herdr_projects;
-    use herdr_projects::{authority, migration, runtime};
+    use crate as herdr_farm;
+    use herdr_farm::{authority, migration, runtime};
     use sha2::{Digest, Sha256};
     use std::process::Command;
     let temp = tempfile::tempdir().unwrap();
@@ -419,7 +419,7 @@ fn cutover_must_verify_object_bytes_before_publishing_authority() {
 #[test]
 fn supported_object_body_must_not_be_silently_truncated_on_render() {
     let (_tmp, project) = project_fixture();
-    let mut db = herdr_projects::migration::open_active(&project).unwrap();
+    let mut db = herdr_farm::migration::open_active(&project).unwrap();
     let head = db.read_snapshot(None).unwrap().head;
     db.commit(Commit {
         expected_head: head,

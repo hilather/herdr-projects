@@ -6,7 +6,7 @@
 use serde_json::{json, Value};
 use std::{fs, os::unix::{fs::PermissionsExt, net::UnixListener}, path::PathBuf, process::{Command, Stdio}, time::{Duration, Instant}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 /// Lists `agents.json` and `panes.json`. `agent.start` over the bridge is
 /// logged to `started` and puts a launching agent in the pane; its reply is

@@ -332,7 +332,7 @@ pub fn fetch_dir(runner: &dyn Runner, target: &str, remote_dir: &str, local_dir:
 
 #[cfg(test)]
 mod tests {
-    use herdr_projects::execution_guard::GatedSpawn;
+    use herdr_farm::execution_guard::GatedSpawn;
     use super::*;
     use crate::runner::RealRunner;
     use crate::runner::fake::{FakeRunner, ok};

@@ -27,7 +27,7 @@ struct Report {
 /// deadline. It neither reserves capacity nor authenticates an owner approval.
 /// The serialized report cannot recreate the live proof.
 /// ```compile_fail
-/// use herdr_projects::profile_preparation::RevalidatedProfile;
+/// use herdr_farm::profile_preparation::RevalidatedProfile;
 /// let _: RevalidatedProfile = serde_json::from_str("{}").unwrap();
 /// ```
 #[derive(Serialize)]

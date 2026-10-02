@@ -6,18 +6,18 @@
 use serde_json::Value;
 use std::{fs, os::unix::fs::PermissionsExt, path::{Path, PathBuf}, process::{Command, Output}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 struct Home { dir: tempfile::TempDir }
 
 impl Home {
     fn new() -> Self {
         let home = Home { dir: tempfile::tempdir().unwrap() };
-        fs::create_dir_all(home.path(".config/herdr-projects")).unwrap();
+        fs::create_dir_all(home.path(".config/herdr-farm")).unwrap();
         home
     }
     fn path(&self, name: &str) -> PathBuf { self.dir.path().join(name) }
-    fn config(&self, text: &str) { fs::write(self.path(".config/herdr-projects/config.toml"), text).unwrap(); }
+    fn config(&self, text: &str) { fs::write(self.path(".config/herdr-farm/config.toml"), text).unwrap(); }
     fn cli(&self, args: &[&str]) -> Output {
         Command::new(BIN).env_clear().env("HOME", self.dir.path()).env("PATH", "/usr/bin:/bin").args(args).output().unwrap()
     }
@@ -89,7 +89,7 @@ fn profile_resolve_turns_token_budgets_into_character_envelopes_without_argument
         home.config(&format!("[profiles.p]\nkind='codex'\npermission_policy='interactive'\n[profiles.p.budget]\nmax_wall_seconds=10\n{bad}\n"));
         home.refused(&["profile", "resolve", "p"]);
     }
-    assert!(!home.path(".herdr-projects").exists());
+    assert!(!home.path(".herdr-farm").exists());
 }
 
 fn probe(home: &Home, herdr: &Path, agent: &Path) -> (Value, String) {

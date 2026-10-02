@@ -15,7 +15,7 @@ use crate::store::{SelectionChoice, SqliteStore, arm_outcome};
 /// Principal recorded for groups and selections made on this CLI.
 const OPERATOR: &str = "operator:cli";
 
-/// `herdr-projects telemetry <slug> quality groups ...`
+/// `herdr-farm telemetry <slug> quality groups ...`
 #[derive(clap::Subcommand)]
 pub enum Command {
     /// Seal a candidate group for a task: one arm per retained native profile,

@@ -41,7 +41,7 @@ pub fn resolve(output:&Output,selector:&str)->Result<Route> {
 }
 fn execute(mut command:Cmd,control:&Control,locks:&[InheritedLock])->Result<Output> {
     control.check()?;command.capture_limit=LIMIT;
-    let output=herdr_projects::supervision::run(command,control.deadline,control.cancellation.clone(),locks)?;
+    let output=herdr_farm::supervision::run(command,control.deadline,control.cancellation.clone(),locks)?;
     control.check()?;ensure!(output.success(),"remote API bridge command failed");Ok(output)
 }
 pub fn probe(route:&Route,binary:&str,control:&Control,locks:&[InheritedLock])->Result<()> {
@@ -79,7 +79,7 @@ mod tests {
     #[test]
     fn concrete_transport_keeps_json_literal_and_rejects_lost_or_wrong_acknowledgement() {
         use std::{fs,os::unix::fs::PermissionsExt};
-        let root=tempfile::tempdir().unwrap();let project=root.path().join("project");fs::create_dir_all(project.join(".state")).unwrap();let guard=herdr_projects::execution_guard::ProjectGuard::acquire(&project).unwrap();let locks=guard.inherit_transfer().unwrap();
+        let root=tempfile::tempdir().unwrap();let project=root.path().join("project");fs::create_dir_all(project.join(".state")).unwrap();let guard=herdr_farm::execution_guard::ProjectGuard::acquire(&project).unwrap();let locks=guard.inherit_transfer().unwrap();
         let helper=root.path().join("ssh");let captured=root.path().join("input");let text=format!("brief '$() `touch {}`\nnext line",root.path().join("BAD").display());let payload=serde_json::json!({"id":"delivery-1","method":"agent.prompt","params":{"target":"pane","text":text}}).to_string()+"\n";
         for mode in ["ok","wrong","lost"] {
             let reply=serde_json::json!({"id":if mode=="wrong"{"other"}else{"delivery-1"},"result":{"type":"agent_prompted"}}).to_string();

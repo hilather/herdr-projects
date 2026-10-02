@@ -1,5 +1,5 @@
 //! Telemetry sidecar end to end: a real reserved attempt, hand-written Codex
-//! rollouts under its execution home, and `herdr-projects telemetry` on the CLI.
+//! rollouts under its execution home, and `herdr-farm telemetry` on the CLI.
 
 #![cfg(all(feature = "state-store", target_os = "linux"))]
 #![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
@@ -8,7 +8,7 @@ mod support;
 #[path = "../src/store/test_schema.rs"]
 mod test_schema;
 
-use herdr_projects::store::SqliteStore;
+use herdr_farm::store::SqliteStore;
 use std::{fs, path::{Path, PathBuf}, process::Command};
 use support::telemetry::*;
 
@@ -547,7 +547,7 @@ fn sidecar_streams_upgrade_v2_store() {
     f.cli("collect");
     // Every lane stream with migrations is at its latest version beside `codex`.
     let expected = |extra: (&str, i64)| {
-        let mut streams: std::collections::BTreeMap<String, i64> = herdr_projects::telemetry::LANES.iter().filter(|l| !l.migrations.is_empty())
+        let mut streams: std::collections::BTreeMap<String, i64> = herdr_farm::telemetry::LANES.iter().filter(|l| !l.migrations.is_empty())
             .map(|l| (l.stream.to_owned(), l.migrations.len() as i64)).collect();
         streams.insert("codex".to_owned(), 4);
         streams.insert(extra.0.to_owned(), extra.1);

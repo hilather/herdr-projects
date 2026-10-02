@@ -43,7 +43,7 @@ pub const MIGRATIONS: &[&str] = &[include_str!("../../../migrations/telemetry/ac
     include_str!("../../../migrations/telemetry/accounting/0019_otlp_ledger.sql"),
     include_str!("../../../migrations/telemetry/accounting/0020_otlp_devin.sql")];
 
-/// `herdr-projects telemetry <slug> accounting ...`
+/// `herdr-farm telemetry <slug> accounting ...`
 #[derive(clap::Subcommand)]
 pub enum Command {
     /// Stream version of this lane's sidecar tables. Read-only.

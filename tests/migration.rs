@@ -7,11 +7,11 @@
 //! claim types so fixtures track the on-disk format. Lost attempts that still
 //! hold capacity have no CLI verb, so they are committed with the public store
 //! API, as in tests/memory_regressions.rs.
-use herdr_projects::{coordinator_prime, domain::*, launch_claim, migration, notification_claim, prompt_claim};
+use herdr_farm::{coordinator_prime, domain::*, launch_claim, migration, notification_claim, prompt_claim};
 use serde_json::{json, Value};
 use std::{fs, path::PathBuf, process::{Command, Output}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 struct Project { home: tempfile::TempDir, project: PathBuf }
 
@@ -209,7 +209,7 @@ fn migrated_project_resumes_only_with_matching_evidence_and_pause_fences_the_epo
 
     // Evidence recorded under one config does not authorize another.
     p.record();
-    let config = p.home.path().join(".config/herdr-projects/config.toml");
+    let config = p.home.path().join(".config/herdr-farm/config.toml");
     fs::create_dir_all(config.parent().unwrap()).unwrap();
     fs::write(&config, "# changed after observation\n").unwrap();
     assert!(!p.set_state("active").status.success());
@@ -360,8 +360,8 @@ fn preflight_observes_the_recorded_session_and_fingerprints_config_without_mutat
         let p = Project::new("pause");
         let home = p.home.path();
         p.write(".state/coordinator.json", br#"{"socket":"/recorded/session.sock","pane_id":"p1","workspace_id":"w1","tab_id":"t1","cwd":"/repo"}"#);
-        fs::create_dir_all(home.join(".config/herdr-projects")).unwrap();
-        fs::write(home.join(".config/herdr-projects/config.toml"), "private_value='secret-must-not-print'\n").unwrap();
+        fs::create_dir_all(home.join(".config/herdr-farm")).unwrap();
+        fs::write(home.join(".config/herdr-farm/config.toml"), "private_value='secret-must-not-print'\n").unwrap();
         if let Some(panes) = &panes { fs::write(home.join("panes.json"), json!({"result": {"panes": panes}}).to_string()).unwrap(); }
         fs::write(home.join("herdr"), "#!/bin/sh\nprintf '%s %s\\n' \"$HERDR_SOCKET_PATH\" \"$*\" >> \"$HOME/calls\"\ncase \"$*\" in\n--version) echo 'herdr 0.9.1';;\n\
 'pane list') cat \"$HOME/panes.json\" || exit 1;;\n'agent list') echo '{\"result\":{\"agents\":[]}}';;\n*) exit 9;;\nesac\n").unwrap();

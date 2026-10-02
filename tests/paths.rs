@@ -5,7 +5,7 @@
 //! what `doctor` reports, against a fake herdr that lists sessions.
 use std::{fs, os::unix::fs::PermissionsExt, path::{Path, PathBuf}, process::{Command, Output}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 /// Lists `$HOME/sessions.json` (none when absent); fails the listing while
 /// `$HOME/sessions.fail` exists.
@@ -55,24 +55,24 @@ impl Home {
             .unwrap_or_else(|| panic!("no {label} line in:\n{text}\n{}", String::from_utf8_lossy(&out.stderr))).to_string()
     }
     fn config(&self, text: &str) {
-        fs::create_dir_all(self.path(".config/herdr-projects")).unwrap();
-        fs::write(self.path(".config/herdr-projects/config.toml"), text).unwrap();
+        fs::create_dir_all(self.path(".config/herdr-farm")).unwrap();
+        fs::write(self.path(".config/herdr-farm/config.toml"), text).unwrap();
     }
 }
 
 fn under(dir: &Path, slug: &str) -> PathBuf { dir.join(slug) }
 
 /// `--root`, then `HERDR_PROJECTS_ROOT` (with `~/`), then `root` in
-/// config.toml, then `~/.herdr-projects`. An empty variable counts as unset.
+/// config.toml, then `~/.herdr-farm`. An empty variable counts as unset.
 #[test]
 fn projects_root_comes_from_flag_then_variable_then_config_then_home() {
     let home = Home::new();
     let flag = home.path("from-flag");
     let flag_arg = ["--root", flag.to_str().unwrap()];
     // No config and no variable: the default root; an empty variable is unset.
-    assert_eq!(home.new_project(&[], &[], "a"), under(&home.path(".herdr-projects"), "a"));
-    assert_eq!(home.new_project(&[("HERDR_PROJECTS_ROOT", "")], &[], "b"), under(&home.path(".herdr-projects"), "b"));
-    assert!(home.doctor(&[("HERDR_PROJECTS_ROOT", "")], &[], "root:").ends_with(&home.path(".herdr-projects").display().to_string()));
+    assert_eq!(home.new_project(&[], &[], "a"), under(&home.path(".herdr-farm"), "a"));
+    assert_eq!(home.new_project(&[("HERDR_PROJECTS_ROOT", "")], &[], "b"), under(&home.path(".herdr-farm"), "b"));
+    assert!(home.doctor(&[("HERDR_PROJECTS_ROOT", "")], &[], "root:").ends_with(&home.path(".herdr-farm").display().to_string()));
 
     home.config("root = \"~/from-config\"\n");
     assert_eq!(home.new_project(&[], &[], "c"), under(&home.path("from-config"), "c"));
@@ -82,14 +82,14 @@ fn projects_root_comes_from_flag_then_variable_then_config_then_home() {
     assert_eq!(home.new_project(&env, &flag_arg, "f"), under(&flag, "f"));
     // An empty `root` in config falls through to the default.
     home.config("root = \"\"\n");
-    assert_eq!(home.new_project(&[], &[], "g"), under(&home.path(".herdr-projects"), "g"));
+    assert_eq!(home.new_project(&[], &[], "g"), under(&home.path(".herdr-farm"), "g"));
 
     let projects = |root: &str| {
         let mut slugs: Vec<_> = fs::read_dir(home.path(root)).unwrap().flatten().map(|e| e.file_name().into_string().unwrap()).filter(|n| !n.starts_with('.')).collect();
         slugs.sort();
         slugs.join(",")
     };
-    let roots: Vec<_> = [".herdr-projects", "from-config", "from-env", "from-flag"].map(projects).into();
+    let roots: Vec<_> = [".herdr-farm", "from-config", "from-env", "from-flag"].map(projects).into();
     assert_eq!(roots, ["a,b,g", "c,d", "e", "f"]);
 }
 
@@ -109,7 +109,7 @@ fn malformed_root_config_is_refused_unless_the_root_is_given() {
     }
     let out = home.run(&[("HERDR_PROJECTS_ROOT", "")], &["new", "x"]);
     assert!(!out.status.success());
-    assert!(!home.path(".herdr-projects").exists());
+    assert!(!home.path(".herdr-farm").exists());
     assert_eq!(home.new_project(&[("HERDR_PROJECTS_ROOT", "~/env")], &[], "y"), under(&home.path("env"), "y"));
     let flag = home.path("flag");
     assert_eq!(home.new_project(&[], &["--root", flag.to_str().unwrap()], "z"), under(&flag, "z"));

@@ -18,7 +18,7 @@ use crate::{inbox, pr, routine};
 mod recovery;
 pub use recovery::{PendingFinalization, PendingEvent, NotificationRetry};
 
-pub const NUDGE_TEXT: &str = "[herdr-projects ticker: automated, not the user, approves nothing] New inbox items. Run context.";
+pub const NUDGE_TEXT: &str = "[herdr-farm ticker: automated, not the user, approves nothing] New inbox items. Run context.";
 pub const PR_INTERVAL_SECS: i64 = 120;
 pub const DONE_RETENTION_DAYS: u64 = 30;
 const DEFAULT_OUTAGE_SECS: i64 = 600;
@@ -44,7 +44,7 @@ pub struct State {
     pub notification_retry: NotificationRetry,
     pub notification_sequence:u64,
     pub notification_suppressed:BTreeSet<String>,
-    pub notification_claim:Option<herdr_projects::notification_claim::Claim>,
+    pub notification_claim:Option<herdr_farm::notification_claim::Claim>,
     pub gh_outages: BTreeMap<String, Outage>,
     pub machine_outages: BTreeMap<String, Outage>,
     pub event_sequence: u64,
@@ -159,7 +159,7 @@ impl Memory {
         Memory {
             started: jiff::Timestamp::now(),
             // Overridable so an outage can be exercised without waiting ten minutes.
-            outage_secs: ctx.env.var("HERDR_PROJECTS_OUTAGE_SECS").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_OUTAGE_SECS),
+            outage_secs: ctx.env.var("HERDR_FARM_OUTAGE_SECS").and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_OUTAGE_SECS),
             tick: 0,
             machines: BTreeMap::new(),
             pr_reads: None,
@@ -316,7 +316,7 @@ pub fn nudge_at(project: &Project, state: &mut State, settings: &Settings, herdr
         herdr.agent_prompt(coordinator_ready.unwrap(), NUDGE_TEXT)
     } else {
         let body = format!("{} new inbox item(s). The coordinator reads them at its next turn.", unseen.len());
-        herdr.notification_show(&format!("herdr-projects: {}", project.slug), &body)
+        herdr.notification_show(&format!("herdr-farm: {}", project.slug), &body)
     };
     if let Err(error) = delivered {
         let error: anyhow::Error = error.into();
@@ -481,7 +481,7 @@ pub fn auto_resolve_queued(ctx:&Ctx,project:&Project,settings:&Settings,started:
         }
         if let Some(queue)=copies.as_deref_mut() {
             if thread::copy_delivery::ready(&t).is_ok() {
-                let purpose=herdr_projects::final_copy_intent::Purpose::Idle{days:settings.auto_resolve_days,started:started.to_string(),last_state_change:t.last_state_change.clone(),last_report_change:t.last_report_change.clone()};
+                let purpose=herdr_farm::final_copy_intent::Purpose::Idle{days:settings.auto_resolve_days,started:started.to_string(),last_state_change:t.last_state_change.clone(),last_report_change:t.last_report_change.clone()};
                 errors.extend(queue.offer_final(ctx,project,&t,None,purpose,format!("idle-{}-{}",thread::execution_fingerprint(&t),t.final_copy_sequence)).err());
             }
             continue;

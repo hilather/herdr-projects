@@ -7,7 +7,7 @@
 use serde_json::{json, Value};
 use std::{fs, os::unix::{fs::PermissionsExt, net::UnixListener}, path::{Path, PathBuf}, process::{Command, Output, Stdio}, time::{Duration, Instant}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 /// Session `NAME` is the socket `$HOME/NAME.sock`; it lists `NAME.agents` and
 /// `NAME.panes` (`NAME@MACHINE.*` through `--machine`; saved machines are
@@ -497,7 +497,7 @@ fn a_due_legacy_routine_is_claimed_once_and_delivered_after_its_command_ends() {
     lab.session("demo", &[agent_at("p", &project, "coordinator", "idle")], &[pane_at("p", &project)]);
     let command = "printf once >> count; while [ ! -e release ]; do sleep 0.05; done; printf routine-result";
     fs::write(project.join("routines/check.md"), format!("+++\nschedule = \"every 24h\"\ncommand = {}\n+++\nInspect output.\n", json!(command))).unwrap();
-    let config = lab.path(".config/herdr-projects");
+    let config = lab.path(".config/herdr-farm");
     fs::create_dir_all(&config).unwrap();
     fs::write(config.join("config.toml"), format!("[safety.{:?}]\nroutine_commands = true\n", project.display().to_string())).unwrap();
     fs::write(config.join("approved-routines.json"), json!([{"project": project, "routine": "check",

@@ -7,7 +7,7 @@
 use serde_json::{json, Value};
 use std::{fs, os::unix::{fs::PermissionsExt, net::UnixListener}, path::{Path, PathBuf}, process::{Command, Output, Stdio}, time::{Duration, Instant}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 /// Session `NAME` is the socket `$HOME/NAME.sock`; it lists `NAME.agents` and
 /// `NAME.panes` (`NAME@MACHINE.*` through `--machine`; saved machines are

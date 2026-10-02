@@ -107,3 +107,5 @@ pub(crate) mod git_quarantine;
 /// Replay evaluation suite (TM4.6): versioned cases from accepted history, hidden checks, M49.
 #[cfg(all(feature = "state-store", target_os = "linux"))]
 pub mod replay;
+
+pub mod product_environment;

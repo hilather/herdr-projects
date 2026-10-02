@@ -9,7 +9,7 @@ use std::{path::{Path,PathBuf},os::unix::fs::MetadataExt,time::{Duration,Instant
 use anyhow::{Result,Context,ensure};
 use serde::{Serialize,Deserialize};
 use crate::{canonical_verification_jobs::{Mode,Ownership,Slot},executor::{Identity,Lane,Request},runner::{Cmd,Output},source_tree::Control};
-use herdr_projects::{migration,execution_guard::{ProjectGuard,Resource},domain::{Operation,OperationId},verification,
+use herdr_farm::{migration,execution_guard::{ProjectGuard,Resource},domain::{Operation,OperationId},verification,
     integration::{self,IntegrateOutcome,IntegrateRequest,InputsChanged,Refused},
     operations::{Outcome,DeliveryState}};
 pub const JOB:&str="\0herdr-projects-canonical-integration";

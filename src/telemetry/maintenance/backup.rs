@@ -27,7 +27,7 @@ pub const MANIFEST: &str = "manifest.json";
 pub const SCHEMA: &str = "telemetry-backup.v1";
 const SIDECAR: &str = "telemetry.db";
 
-/// `herdr-projects telemetry <slug> backup ...`
+/// `herdr-farm telemetry <slug> backup ...`
 #[derive(clap::Subcommand, Clone, Debug)]
 pub enum Command {
     /// Back up telemetry.db and the operations store into a new directory OUT, with a digest manifest.

@@ -43,7 +43,7 @@ pub struct LaunchInputs {
 /// and canonical task, knowledge, repository and approval state. Raw JSON cannot
 /// supply this capability.
 /// ```compile_fail
-/// use herdr_projects::domain::PreparedLaunch;
+/// use herdr_farm::domain::PreparedLaunch;
 /// let _: PreparedLaunch = serde_json::from_str("{}").unwrap();
 /// ```
 #[derive(Debug,Clone)]

@@ -5,8 +5,8 @@ use crate::{project::Project,paths,source_tree::Control};
 const MAX_IDS:usize=1024;
 const MAX_ID_BYTES:usize=48*1024;
 const MAX_SCAN_BYTES:usize=50*1024*1024;
-pub use herdr_projects::notification_claim::Batch;
-use herdr_projects::notification_claim::valid_id;
+pub use herdr_farm::notification_claim::Batch;
+use herdr_farm::notification_claim::valid_id;
 pub fn capture(project:&Project,control:&Control)->Result<Batch> {
     let control=Control{deadline:control.deadline.min(Instant::now()+Duration::from_secs(10)),cancellation:control.cancellation.clone()};control.check()?;
     let seen=paths::read_control_text(&project.state_dir().join("inbox-seen.json"),1024*1024)?;

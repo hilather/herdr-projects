@@ -4,7 +4,7 @@ use std::{collections::BTreeMap,path::{Path,PathBuf},sync::Arc,time::{Duration,I
 use anyhow::{Result,Context,ensure};
 use serde::{Deserialize,Serialize};
 use crate::{executor::{Identity,Lane,Request},runner::{Cmd,Output,Runner}};
-use herdr_projects::domain::OperationId;
+use herdr_farm::domain::OperationId;
 
 const JOB:&str="\0herdr-projects-routine-execution";
 const BUDGET:Duration=Duration::from_secs(95);
@@ -27,7 +27,7 @@ impl Runner for JobRunner {
         // This trusted service uses concrete RealRunner and commits the claim,
         // output and sealed cleanup receipt itself. An injected observation
         // Runner cannot mint a successful routine receipt.
-        let receipt=herdr_projects::routines::execute_queued(Path::new(&input.project),&input.operation,input.revision,cancellation,deadline)?;
+        let receipt=herdr_farm::routines::execute_queued(Path::new(&input.project),&input.operation,input.revision,cancellation,deadline)?;
         let stdout=serde_json::to_string(&receipt)?;
         ensure!(stdout.len()<=crate::runner::CAPTURE_LIMIT,"routine result exceeds executor capture bound");
         Ok(Output{code:Some(0),stdout_bytes:stdout.as_bytes().to_vec(),stdout_total_bytes:stdout.len() as u64,stdout,elapsed:entered.elapsed(),..Output::default()})
@@ -113,8 +113,8 @@ impl Queue {
             Some(Entry::Cooldown{last,..})=>Some(last.clone()),None=>None,
         };
         ensure!(self.entries.contains_key(&path)||self.entries.len()<128,"routine admission inventory is full");
-        let mut budget=herdr_projects::store::identity_inventory::Budget::new(2*1024*1024,1024,Instant::now()+Duration::from_millis(100),Default::default())?;
-        let Some(hint)=herdr_projects::migration::read_routine_execution_hint(&path,&mut budget,last.as_ref(),jiff::Timestamp::now().as_millisecond())? else{return Ok(());};
+        let mut budget=herdr_farm::store::identity_inventory::Budget::new(2*1024*1024,1024,Instant::now()+Duration::from_millis(100),Default::default())?;
+        let Some(hint)=herdr_farm::migration::read_routine_execution_hint(&path,&mut budget,last.as_ref(),jiff::Timestamp::now().as_millisecond())? else{return Ok(());};
         let work=request(&path,&hint.operation,hint.delivery_revision)?;let identity=work.identity.clone();
         let ticket=self.executor.submit(work)?;
         self.last_project=Some(path.clone());
@@ -127,10 +127,10 @@ impl Drop for Queue {
 
 #[cfg(test)]
 mod tests {
-    use herdr_projects::execution_guard::GatedSpawn;
+    use herdr_farm::execution_guard::GatedSpawn;
     use super::*;
     use crate::executor::{Executor,Limits};
-    use herdr_projects::{runtime,routines,domain::TaskId,operations::DeliveryState};
+    use herdr_farm::{runtime,routines,domain::TaskId,operations::DeliveryState};
     fn fixture(script:&[u8],deadline:u64)->(crate::scenarios::World,std::path::PathBuf,OperationId) {
         let(world,path)=crate::canonical_controller::tests::routine_fixture(&[("check",script,deadline)]);
         let occurrence=routines::schedule(&path,"check",runtime::snapshot(&path).unwrap().head).unwrap().unwrap();
@@ -191,13 +191,13 @@ mod tests {
     #[cfg(target_os="linux")]
     #[test]
     fn all_projects_get_exclusive_effect_opportunity_before_routine_admission() {
-        use herdr_projects::domain::{ProjectState,RuntimeRoute};
+        use herdr_farm::domain::{ProjectState,RuntimeRoute};
         use crate::runner::fake::ok;
         let(world,path)=crate::canonical_controller::tests::routine_fixture(&[("check",b"touch marker",1000)]);
         let config=world.ctx().config_dir.join("config.toml");
         let other=crate::project::create(&world.root,"z-notify","",vec![]).unwrap();other.set_status(crate::project::Status::Paused).unwrap();
         crate::inbox::write(&other,"test","fixture","pending notice","").unwrap();let other=other.dir();
-        let plan=herdr_projects::migration::inspect_with_config(&other,&config).unwrap();herdr_projects::migration::apply(&other,&plan,true).unwrap();
+        let plan=herdr_farm::migration::inspect_with_config(&other,&config).unwrap();herdr_farm::migration::apply(&other,&plan,true).unwrap();
         let task=TaskId::new("notify").unwrap();let head=runtime::add_task(&other,task.clone(),"notify".into(),runtime::snapshot(&other).unwrap().head).unwrap();
         runtime::create_binding(&other,None,None,head,&RuntimeRoute{socket:"/explicit/fairness.sock".into(),..Default::default()}).unwrap();
         crate::reconcile_live::run(&world.ctx(),&other,true).unwrap();let s=runtime::snapshot(&other).unwrap();runtime::set_state(&other,s.head,s.control.unwrap().revision,ProjectState::Active,&config).unwrap();
@@ -234,7 +234,7 @@ mod tests {
         queue.admit(&path).unwrap();let second=match &queue.entries[&path] {Entry::Pending{operation,..}=>operation.clone(),_=>panic!()};assert_ne!(first,second);
         let deadline=Instant::now()+Duration::from_secs(3);while queue.pending(){queue.drain();assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(5));}
         let s=runtime::snapshot(&path).unwrap();assert!(s.deliveries.iter().all(|d|d.attempts==0&&d.state==DeliveryState::Pending));
-        runtime::set_state(&path,s.head,s.control.unwrap().revision,herdr_projects::domain::ProjectState::Paused,&world.ctx().config_dir.join("config.toml")).unwrap();
+        runtime::set_state(&path,s.head,s.control.unwrap().revision,herdr_farm::domain::ProjectState::Paused,&world.ctx().config_dir.join("config.toml")).unwrap();
         queue.entries.clear();queue.admit(&path).unwrap();assert!(!queue.pending());assert!(!path.join("a-marker").exists()&&!path.join("b-marker").exists());assert!(pool.stop(Duration::from_secs(2)));
     }
     #[cfg(target_os="linux")]
@@ -271,10 +271,10 @@ mod tests {
         // fixed delay, and a child that survived cancellation must still write.
         let other=crate::project::create(&world.root,"other","",vec![]).unwrap();other.set_status(crate::project::Status::Paused).unwrap();
         let other=other.dir().canonicalize().unwrap();let config=world.ctx().config_dir.join("config.toml");
-        let plan=herdr_projects::migration::inspect_with_config(&other,&config).unwrap();herdr_projects::migration::apply(&other,&plan,true).unwrap();
-        let s=runtime::snapshot(&other).unwrap();runtime::create_binding(&other,None,None,s.head,&herdr_projects::domain::RuntimeRoute{socket:"/explicit/other.sock".into(),..Default::default()}).unwrap();
+        let plan=herdr_farm::migration::inspect_with_config(&other,&config).unwrap();herdr_farm::migration::apply(&other,&plan,true).unwrap();
+        let s=runtime::snapshot(&other).unwrap();runtime::create_binding(&other,None,None,s.head,&herdr_farm::domain::RuntimeRoute{socket:"/explicit/other.sock".into(),..Default::default()}).unwrap();
         crate::reconcile_live::run(&world.ctx(),&other,true).unwrap();let s=runtime::snapshot(&other).unwrap();
-        runtime::set_state(&other,s.head,s.control.unwrap().revision,herdr_projects::domain::ProjectState::Active,&config).unwrap();
+        runtime::set_state(&other,s.head,s.control.unwrap().revision,herdr_farm::domain::ProjectState::Active,&config).unwrap();
         let pool=Executor::new(Limits::default(),Arc::new(JobRunner{inner:Arc::new(crate::runner::RealRunner)})).unwrap();
         let ticket=pool.submit(request(&path,&id,1).unwrap()).unwrap();let deadline=Instant::now()+Duration::from_secs(3);
         while !path.join("started").exists() {assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(5));}
@@ -284,7 +284,7 @@ mod tests {
         runtime::add_task(&other,TaskId::new("independent").unwrap(),"other project progresses".into(),before_other.head).unwrap();
         assert!(crate::canonical_controller::poll(&world.ctx(),&other,0).is_ok());
         let refreshed=runtime::snapshot(&other).unwrap();assert!(refreshed.head>before_other.head);assert_eq!(refreshed.observations.len(),1);
-        assert!(crate::cleanup::lease(&world.root).is_err());assert!(herdr_projects::migration::upgrade_active(&other).is_err());
+        assert!(crate::cleanup::lease(&world.root).is_err());assert!(herdr_farm::migration::upgrade_active(&other).is_err());
         let control=Request{identity:Identity{operation:"independent-read".into(),revision:1,project:"other-project".into(),machine:"local".into(),terminal:None},lane:Lane::Control,deadline:Instant::now()+Duration::from_secs(1),command:Cmd::new("/bin/true",Duration::from_secs(1))};
         assert!(pool.submit(control).unwrap().recv_timeout(Duration::from_secs(1)).unwrap().result.unwrap().success());
         assert!(pool.stop(Duration::from_secs(2)));assert!(ticket.recv_timeout(Duration::from_secs(1)).unwrap().result.is_ok());

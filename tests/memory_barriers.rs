@@ -7,11 +7,11 @@
 //! `memory readiness`. Attempts, snapshots, consumer-binding retirement, package
 //! acknowledgment and task completion use the public store API because no
 //! worker is launched.
-use herdr_projects::{authority, domain::*, memory::*, migration, runtime, store::{SqliteStore, StoreError, UpdatePackageAck}};
+use herdr_farm::{authority, domain::*, memory::*, migration, runtime, store::{SqliteStore, StoreError, UpdatePackageAck}};
 use serde_json::{json, Value};
 use std::{fs, path::PathBuf, process::{Command, Output}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 struct Project { home: tempfile::TempDir, project: PathBuf, key: PathBuf, store: String }
 

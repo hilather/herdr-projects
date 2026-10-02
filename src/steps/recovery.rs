@@ -205,7 +205,7 @@ pub(super) fn retry_finalizations_queued(ctx:&Ctx,project:&Project,state:&mut St
             if !pending.retry.due(now)||thread::copy_delivery::ready(&record).is_err(){return Ok(());}
             pending.retry.reserve(now,&pending.operation_id);pending.retry.last_error="final copy offered; outcome not yet recorded".into();
             state.finalizations.insert(id.clone(),pending.clone());save_state(project,state)?;
-            queue.offer_final(ctx,project,&record,None,herdr_projects::final_copy_intent::Purpose::Merged{pr:pending.pr.clone()},pending.operation_id.clone())
+            queue.offer_final(ctx,project,&record,None,herdr_farm::final_copy_intent::Purpose::Merged{pr:pending.pr.clone()},pending.operation_id.clone())
         })();
         if let Err(error)=result {if let Some(pending)=state.finalizations.get_mut(&id){pending.retry.failed(&error);}errors.push(error);errors.extend(save_state(project,state).err());}
     }

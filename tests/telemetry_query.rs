@@ -1,7 +1,7 @@
 //! TM4.1 query service end to end: the metric registry, fixed terminal and
 //! assignment cohorts, correction-aware as-of revisions, byte-identical
 //! rebuilds, bounded pagination and the `completed_task` rejection, all
-//! through `herdr-projects telemetry` on the CLI over planted canonical rows.
+//! through `herdr-farm telemetry` on the CLI over planted canonical rows.
 //! Expected values are hand-computed from plan docs 07 §1/§3, 08 §4 and
 //! 10 §3–§4 and contracts §6; none is read back from a production aggregate.
 
@@ -10,7 +10,7 @@
 
 mod support;
 
-use herdr_projects::store::SqliteStore;
+use herdr_farm::store::SqliteStore;
 use serde_json::{Value, json};
 use std::{fs, path::{Path, PathBuf}, process::Command};
 use support::telemetry::*;
@@ -722,7 +722,7 @@ fn candidate_verdict(db: &rusqlite::Connection, task: &str, candidate: &str, pol
 /// canonical acceptances. Endpoints are independent hand-computed facts.
 #[test]
 fn operating_throughput_clips_intervals_and_preserves_revisions() {
-    use herdr_projects::telemetry::operating;
+    use herdr_farm::telemetry::operating;
     let p = Planted::new();
     worked_example(&p);
     let canonical = p.state_bytes();
@@ -753,7 +753,7 @@ fn operating_throughput_clips_intervals_and_preserves_revisions() {
     operating::observe(&p.project,"run-b",true,3,3500,1000).unwrap();
     operating::observe(&p.project,"run-b",true,3,4000,1000).unwrap();
     operating::observe(&p.project,"run-b",true,3,8000,1000).unwrap();
-    let db = herdr_projects::telemetry::sidecar::open(&p.project,false).unwrap().unwrap();
+    let db = herdr_farm::telemetry::sidecar::open(&p.project,false).unwrap().unwrap();
     assert_eq!(db.query_row("SELECT count(*) FROM operating_intervals",[],|r|r.get::<_,i64>(0)).unwrap(),4);
     assert_eq!(db.query_row("SELECT sum(end_unix_ms-start_unix_ms) FROM operating_intervals",[],|r|r.get::<_,i64>(0)).unwrap(),2000);
     drop(db);
@@ -804,7 +804,7 @@ fn operating_throughput_clips_intervals_and_preserves_revisions() {
 /// fresh interval. Assert cadence bounds, never an exact wall-clock duration.
 #[test]
 fn ticker_records_operating_passes_pause_resume_and_restart() {
-    use herdr_projects::domain::ProjectState;
+    use herdr_farm::domain::ProjectState;
     use std::time::{Duration,Instant};
     struct Ticker(std::process::Child);
     impl Drop for Ticker { fn drop(&mut self) { let _=self.0.kill(); let _=self.0.wait(); } }
@@ -867,7 +867,7 @@ fn ticker_records_operating_passes_pause_resume_and_restart() {
 /// existing sidecar, including the operating clock and every lane table.
 #[test]
 fn ticker_telemetry_disabled_and_untouched_projects_have_no_writes() {
-    use herdr_projects::domain::ProjectState;
+    use herdr_farm::domain::ProjectState;
     use std::time::{Duration,Instant};
     struct Ticker(std::process::Child);
     impl Drop for Ticker { fn drop(&mut self) { let _=self.0.kill(); let _=self.0.wait(); } }
@@ -883,7 +883,7 @@ fn ticker_telemetry_disabled_and_untouched_projects_have_no_writes() {
             drop(store);
             if existing {
                 p.json(&["collect"]);
-                herdr_projects::telemetry::operating::observe(&p.project,"before-disable",true,1,1000,15000).unwrap();
+                herdr_farm::telemetry::operating::observe(&p.project,"before-disable",true,1,1000,15000).unwrap();
             }
             let sidecar=p.project.join(".state/telemetry.db");
             let before=existing.then(||fs::read(&sidecar).unwrap());

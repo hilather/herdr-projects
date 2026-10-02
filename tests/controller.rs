@@ -6,12 +6,12 @@
 //! project, set up through the compiled CLI. A Herdr bridge stand-in answers
 //! `notification.show` and logs every request. Each ticker pass republishes
 //! the executor metrics file, so waits count passes, never elapsed time.
-use herdr_projects::{authority, domain::*, migration, operations::DeliveryState, runtime};
+use herdr_farm::{authority, domain::*, migration, operations::DeliveryState, runtime};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{fs, os::unix::fs::{MetadataExt, PermissionsExt}, path::PathBuf, process::{Child, Command, Output, Stdio}, time::{Duration, Instant}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 /// Answers the bridge check and `notification.show`, logging each request
 /// and the time of each show. While `$HOME/busy` exists, one show is answered
@@ -63,7 +63,7 @@ impl Lab {
         runtime::set_state(&self.project, s.head, s.control.unwrap().revision, ProjectState::Active, &self.config()).unwrap();
     }
     fn path(&self, name: &str) -> PathBuf { self.home.path().join(name) }
-    fn config(&self) -> PathBuf { self.path(".config/herdr-projects/config.toml") }
+    fn config(&self) -> PathBuf { self.path(".config/herdr-farm/config.toml") }
     fn store(&self) -> PathBuf { self.project.join(".state/state.db") }
     fn cli(&self, args: &[&str]) -> Output {
         Command::new(BIN).env_clear().env("HOME", self.home.path()).env("PATH", "/usr/bin:/bin")
@@ -103,7 +103,7 @@ impl Lab {
         self.add(task);
         OperationId::new(self.ok(&["operations", "demo", "notify", task, "--expected-head", &self.head()])["id"].as_str().unwrap()).unwrap()
     }
-    fn delivery(&self, operation: &OperationId) -> herdr_projects::operations::Delivery {
+    fn delivery(&self, operation: &OperationId) -> herdr_farm::operations::Delivery {
         self.state().deliveries.into_iter().find(|d| &d.operation == operation).unwrap()
     }
     fn shown(&self) -> usize { fs::read_to_string(self.path("requests")).unwrap_or_default().lines().filter(|l| *l == "notification.show").count() }
@@ -277,7 +277,7 @@ fn ticker_reserves_a_ready_dependent_once_only_with_factory_admission_on() {
     let state = lab.state();
     let binding = runtime::create_binding(&lab.project, Some(&dep), Some(state.tasks.iter().find(|t| t.id == dep).unwrap().revision), state.head,
         &RuntimeRoute { socket: lab.path("session.sock").display().to_string(), cwd: repo.display().to_string(), ..Default::default() }).unwrap();
-    migration::open_active(&lab.project).unwrap().record_observations(lab.state().head, &[herdr_projects::reconcile::RuntimeObservation {
+    migration::open_active(&lab.project).unwrap().record_observations(lab.state().head, &[herdr_farm::reconcile::RuntimeObservation {
         binding: binding.binding.id.clone(), binding_revision: binding.binding.revision, task_revision: binding.task_revision,
         observed_unix_ms: jiff::Timestamp::now().as_millisecond(), collector: "herdr-git-v2".into(),
         config_digest: migration::config_reference(&lab.config()).unwrap().digest, ..Default::default() }]).unwrap();
@@ -341,7 +341,7 @@ fn ticker_reserves_a_ready_dependent_once_only_with_factory_admission_on() {
 /// Prepare `worker` over fake binaries; only the native interaction evidence,
 /// which needs a real agent session, is planted.
 fn launchable_profile(lab: &Lab) -> VersionedReference {
-    use herdr_projects::worker_supervision::{ProcessIncarnation, SupervisorIdentity};
+    use herdr_farm::worker_supervision::{ProcessIncarnation, SupervisorIdentity};
     let (bin, agent_home) = (lab.path("bin"), lab.path("agent-home"));
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir_all(&agent_home).unwrap();

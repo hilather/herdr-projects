@@ -5,11 +5,11 @@
 //! needs a live agent, so its retained report is written as
 //! `retain_native_profile` stores it. Evidence is recorded through the public
 //! `record_native_capability_evidence`, which has no CLI command.
-use herdr_projects::{authority, domain::*, migration, runtime};
+use herdr_farm::{authority, domain::*, migration, runtime};
 use serde_json::{json, Value};
 use std::{fs, os::unix::fs::MetadataExt, path::PathBuf, process::Command};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 const HOUR: i64 = 3_600_000;
 
 struct Project { home: tempfile::TempDir, project: PathBuf, key: PathBuf, repo: PathBuf, db: PathBuf, oid: String }

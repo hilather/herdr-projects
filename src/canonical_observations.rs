@@ -4,7 +4,7 @@ use std::{path::{Path,PathBuf},os::unix::fs::MetadataExt,sync::Arc,time::{Durati
 use anyhow::{Result,Context,ensure};
 use serde::{Serialize,Deserialize};
 use crate::{paths::{Ctx,Env},runner::{Runner,Cmd,Output},source_tree::Control};
-use herdr_projects::{runtime,migration,execution_guard::ProjectGuard,reconcile::ResourceState};
+use herdr_farm::{runtime,migration,execution_guard::ProjectGuard,reconcile::ResourceState};
 const JOB:&str="\0herdr-projects-canonical-observation";
 const BUDGET:Duration=Duration::from_secs(15);
 const LIMIT:usize=1024*1024;
@@ -17,9 +17,9 @@ const LIMIT:usize=1024*1024;
 /// makes 3,096 such reads. Tests therefore bound the read by the budget cap.
 const HEAD_READ:Duration=if cfg!(test){Duration::from_secs(10)}else{Duration::from_millis(100)};
 
-fn sql_control(control:&Control)->herdr_projects::store::controlled::ReadControl {herdr_projects::store::controlled::ReadControl::new(control.deadline,control.cancellation.clone())}
+fn sql_control(control:&Control)->herdr_farm::store::controlled::ReadControl {herdr_farm::store::controlled::ReadControl::new(control.deadline,control.cancellation.clone())}
 fn observation_head(path:&Path)->Result<u64> {
-    let mut budget=herdr_projects::store::identity_inventory::Budget::new(2*1024*1024,0,Instant::now()+HEAD_READ,Default::default())?;
+    let mut budget=herdr_farm::store::identity_inventory::Budget::new(2*1024*1024,0,Instant::now()+HEAD_READ,Default::default())?;
     migration::read_observation_head(path,&mut budget)
 }
 
@@ -78,7 +78,7 @@ fn collect_with(input:&Input,control:&Control,observe:impl FnOnce(&Input,&Contro
     // Planning precedes probes so an offline endpoint cannot monopolize service.
     // SQL checks preserve the original deadline through later observations;
     // aggregate decoded materialization still needs independent allocation caps.
-    let planned=herdr_projects::routines::schedule_next_guarded(&input.project,input.last_selected.as_deref(),&guard,&control.cancellation,control.deadline.min(Instant::now()+Duration::from_secs(5)));
+    let planned=herdr_farm::routines::schedule_next_guarded(&input.project,input.last_selected.as_deref(),&guard,&control.cancellation,control.deadline.min(Instant::now()+Duration::from_secs(5)));
     let (mut scheduled_work,selected_name)=match planned {
         Ok(report)=>{if let Some(error)=report.diagnostic{errors.push(format!("routine planning: {error}"));}(Some(report.active),report.selected_name)},
         Err(error)=>{errors.push(format!("routine planning: {error:#}"));(None,None)},
@@ -89,8 +89,8 @@ fn collect_with(input:&Input,control:&Control,observe:impl FnOnce(&Input,&Contro
         input.current(control)?;guard.check_project(&input.project)?;
         let db=migration::open_active_scoped(&input.project,sql_control(control))?;control.check()?;
         let state=db.project_control()?.context("canonical control missing")?;
-        let active=state.state==herdr_projects::domain::ProjectState::Active&&!state.reconciliation_required;
-        let mut budget=herdr_projects::store::identity_inventory::Budget::new(2*1024*1024,0,control.deadline.min(Instant::now()+HEAD_READ),control.cancellation.clone())?;
+        let active=state.state==herdr_farm::domain::ProjectState::Active&&!state.reconciliation_required;
+        let mut budget=herdr_farm::store::identity_inventory::Budget::new(2*1024*1024,0,control.deadline.min(Instant::now()+HEAD_READ),control.cancellation.clone())?;
         let head=migration::read_observation_head(&input.project,&mut budget)?;input.current(control)?;Ok((head,active))
     })();
     let head=match head {Ok((head,active))=>{if scheduled_work==Some(true)&&!active{scheduled_work=Some(false);}Some(head)},Err(error)=>{errors.push(format!("maintenance result: {error:#}"));None}};

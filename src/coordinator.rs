@@ -141,8 +141,8 @@ pub fn open(ctx: &Ctx, slug: &str, options: &OpenOptions) -> Result<()> {
     }
 
     if !options.reprime && history.as_ref().is_some_and(|c|
-        c.launch_claim.as_ref().is_some_and(|claim|claim.generation==c.prime_request||claim.phase==herdr_projects::launch_claim::Phase::Pending)
-        ||c.prime_claim.as_ref().is_some_and(|claim|claim.request==c.prime_request||claim.delivery.phase==herdr_projects::prompt_claim::Phase::Pending)) {
+        c.launch_claim.as_ref().is_some_and(|claim|claim.generation==c.prime_request||claim.phase==herdr_farm::launch_claim::Phase::Pending)
+        ||c.prime_claim.as_ref().is_some_and(|claim|claim.request==c.prime_request||claim.delivery.phase==herdr_farm::prompt_claim::Phase::Pending)) {
         bail!("coordinator delivery was already claimed; inspect the pane before explicitly running open --reprime");
     }
     let prime_request=history.as_ref().map_or(0,|c|c.prime_request).checked_add(1).filter(|n|*n<=i64::MAX as u64).context("prime requests exhausted")?;
@@ -380,7 +380,7 @@ pub fn digest(ctx: &Ctx, project: &Project, prefix: &str) -> Result<(String, Vec
     }
     // TM4.8 (doc 15 §5): bounded, advisory fleet evidence when the project has a canonical store.
     #[cfg(feature = "state-store")]
-    if let Some(section) = herdr_projects::telemetry::workspace::context_section(&project.dir(), slug, &ctx.config_dir) {
+    if let Some(section) = herdr_farm::telemetry::workspace::context_section(&project.dir(), slug, &ctx.config_dir) {
         let _ = write!(out, "\n{section}");
     }
     let shown = items.into_iter().map(|i| i.id).collect();

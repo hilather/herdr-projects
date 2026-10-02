@@ -1,6 +1,6 @@
 //! Independent verifier. The parent execs `unshare`; only the child switches root.
 //! ```compile_fail
-//! use herdr_projects::verification::VerificationReceipt;
+//! use herdr_farm::verification::VerificationReceipt;
 //! let _: VerificationReceipt = serde_json::from_str("{}").unwrap();
 //! ```
 mod checkout;

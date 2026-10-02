@@ -2,7 +2,7 @@
 #![allow(clippy::disallowed_methods)]
 mod support;
 use support::replay::*;
-use herdr_projects::authority;
+use herdr_farm::authority;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fs, os::unix::fs::MetadataExt, path::{Path, PathBuf}, process::Command};
@@ -70,7 +70,7 @@ fn extraction_golden_contamination_counts_and_reproducible_subset() {
     }
     drop(db);
     // The owner configuration hides nothing extra (no `[worker_isolation]`), yet the run starts.
-    assert!(!fs::read_to_string(lab.path(".config/herdr-projects/config.toml")).unwrap().contains("worker_isolation"));
+    assert!(!fs::read_to_string(lab.path(".config/herdr-farm/config.toml")).unwrap().contains("worker_isolation"));
     lab.replay(&["run", "--suite", "v1", "--configuration", "alpha", "--subset", "stratified:1", "--seed", "alpha", "--expected-head", &lab.head().to_string()]);
     assert_eq!(lab.db().query_row("SELECT count(*) FROM replay_runs", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
 }
@@ -191,7 +191,7 @@ fn replay_candidate_is_verified_by_hidden_checks_but_never_integrates_or_release
     lab.ok(&["result", "demo", "auto", "--integrate", "on", "--expected-head", &head]);
     let pending = || lab.db().query_row("SELECT count(*) FROM pending_integration_work WHERE submission_id=?1", [&right], |r| r.get::<_, i64>(0)).unwrap();
     assert_eq!(pending(), 1, "the verified replay submission enters the pending projection");
-    let turn = herdr_projects::store::service_project_integration_jobs(&lab.project).unwrap();
+    let turn = herdr_farm::store::service_project_integration_jobs(&lab.project).unwrap();
     assert_eq!((turn.enqueued, pending()), (0, 0), "the producer drops it");
     let work = lab.path("integrate-replay");
     let refused = lab.fail(&["result", "demo", "integrate", &result, "--repository", repository.to_str().unwrap(), "--idempotency-key", "integrate-replay", "--work-dir", work.to_str().unwrap()]);

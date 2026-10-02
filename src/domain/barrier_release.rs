@@ -27,7 +27,7 @@ pub struct BarrierReleaseAuthorization {
 /// Signature-verified bytes, constructible only by trusted crate ingress.
 /// Parsing a request is not proof of authority.
 /// ```compile_fail
-/// use herdr_projects::domain::PreparedBarrierRelease;
+/// use herdr_farm::domain::PreparedBarrierRelease;
 /// let _: PreparedBarrierRelease = serde_json::from_str("{}").unwrap();
 /// ```
 #[derive(Debug, Clone)]

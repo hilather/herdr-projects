@@ -1,8 +1,8 @@
 //! Durable brief delivery claims. A lost response never authorizes replay.
 use super::*;
-use herdr_projects::execution_guard::ProjectGuard;
+use herdr_farm::execution_guard::ProjectGuard;
 use crate::source_tree::Control;
-pub use herdr_projects::prompt_claim::{Claim,Phase};
+pub use herdr_farm::prompt_claim::{Claim,Phase};
 pub fn validate(t:&Thread)->Result<()> {
     super::launch_delivery::validate(t)?;
     anyhow::ensure!(t.prompt_sequence<=i64::MAX as u64,"brief sequence exhausted");

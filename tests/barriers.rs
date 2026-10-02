@@ -4,11 +4,11 @@
 //! project store. Members are real verified results: signed contracts, CLI
 //! submissions and sandboxed verification. Attempts are recorded through the
 //! public store API because no worker is launched.
-use herdr_projects::{authority, domain::*, memory::*, migration, runtime};
+use herdr_farm::{authority, domain::*, memory::*, migration, runtime};
 use serde_json::{json, Value};
 use std::{fs, path::PathBuf, process::{Command, Output}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 const POLICY: &str = r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#;
 
 struct Factory { home: tempfile::TempDir, project: PathBuf, key: PathBuf, repo: PathBuf, store: String, oid: String }
@@ -62,7 +62,7 @@ impl Factory {
         assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y", "sign", "-f"]).arg(&self.key).args(["-n", namespace]).arg(&path).output().unwrap().status.success());
         (path, signature)
     }
-    fn db(&self) -> herdr_projects::store::SqliteStore { migration::open_active(&self.project).unwrap() }
+    fn db(&self) -> herdr_farm::store::SqliteStore { migration::open_active(&self.project).unwrap() }
     fn memory(&self) -> MemoryStore { MemoryStore::from_sqlite(self.db(), self.project.join(".state/objects")) }
     /// Install (or revise) a signed verify-only contract; returns its digest.
     fn contract(&self, task: &str, revision: u64, extra: Value) -> String {
@@ -443,7 +443,7 @@ impl Factory {
             db.queue_task(&id, 2, db.current_head().unwrap(), &QueueRequest { priority: 0, dependencies: vec![] }, 0).unwrap();
         }
         let snapshot = db.read_snapshot(None).unwrap();
-        let observations: Vec<_> = snapshot.runtime_bindings.iter().map(|binding| herdr_projects::reconcile::RuntimeObservation {
+        let observations: Vec<_> = snapshot.runtime_bindings.iter().map(|binding| herdr_farm::reconcile::RuntimeObservation {
             binding: binding.id.clone(), binding_revision: binding.revision, task_revision: Some(3),
             config_digest: migration::config_reference(&config).unwrap().digest,
             observed_unix_ms: jiff::Timestamp::now().as_millisecond(), collector: "herdr-git-v1".into(), ..Default::default()

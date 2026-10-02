@@ -1,6 +1,6 @@
 #![cfg(feature = "state-store")]
 #![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
-use herdr_projects::{authority, domain::*, memory::*, migration, runtime};
+use herdr_farm::{authority, domain::*, memory::*, migration, runtime};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -301,12 +301,12 @@ fn schema22_upgrade_does_not_invent_historical_inputs() {
     let db = rusqlite::Connection::open(&path).unwrap();
     test_schema::historical(&db, 22).unwrap();
     drop(db);
-    let mut db = herdr_projects::store::SqliteStore::open(&path).unwrap();
+    let mut db = herdr_farm::store::SqliteStore::open(&path).unwrap();
     let before = db.read_snapshot(None).unwrap();
     db.upgrade_v1().unwrap();
     let after = db.read_snapshot(None).unwrap();
     assert_eq!(before.events, after.events);
-    assert_eq!(after.schema_version, herdr_projects::store::SCHEMA);
+    assert_eq!(after.schema_version, herdr_farm::store::SCHEMA);
     assert!(db.memory_snapshot_inputs("missing").is_err());
     db.integrity_check().unwrap();
 }
@@ -631,7 +631,7 @@ fn manual_import_cli_stages_previews_and_requires_signed_review() {
     let (tmp, project, key) = fixture();
     import(&project);
     let cli = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_herdr-projects"))
+        Command::new(env!("CARGO_BIN_EXE_herdr-farm"))
             .env_clear()
             .env("HOME", tmp.path())
             .env("PATH", "/usr/bin:/bin")
@@ -827,7 +827,7 @@ fn promotion_and_all_consumer_obligations_commit_or_roll_back_together() {
     assert!(rows.iter().all(|r| r["state"] == "pending"));
     assert!(rows.iter().any(|r| r["subscriber"] == "task:consumer-b"));
     let binding:String=raw.query_row("SELECT binding_id FROM consumer_binding_obligations ORDER BY binding_id LIMIT 1",[],|row|row.get(0)).unwrap();
-    let pull=|flag:&str,id:&str|Command::new(env!("CARGO_BIN_EXE_herdr-projects"))
+    let pull=|flag:&str,id:&str|Command::new(env!("CARGO_BIN_EXE_herdr-farm"))
         .env_clear().env("HOME",tmp.path()).env("PATH","/usr/bin:/bin")
         .args(["--root",tmp.path().to_str().unwrap(),"memory","project","package",flag,id])
         .output().unwrap();
@@ -861,15 +861,15 @@ fn worker_update_receipts_are_explicit_exact_and_survive_restart() {
     // Parallel CLI/signature spawns can briefly inherit another test's lock
     // between fork and exec. Exercise the documented retryable acquisition
     // failure without retrying authority, database or receipt-validation errors.
-    fn acknowledge_worker_update_package(project: &Path, attempt: &str, ack: &herdr_projects::store::UpdatePackageAck) -> anyhow::Result<herdr_projects::store::WorkerPackageAckReceipt> {
-        retry_acquisition(|| herdr_projects::memory::acknowledge_worker_update_package(project, attempt, ack))
+    fn acknowledge_worker_update_package(project: &Path, attempt: &str, ack: &herdr_farm::store::UpdatePackageAck) -> anyhow::Result<herdr_farm::store::WorkerPackageAckReceipt> {
+        retry_acquisition(|| herdr_farm::memory::acknowledge_worker_update_package(project, attempt, ack))
     }
     fn acknowledge_memory_update(project: &Path, ack: &MemoryUpdateAck) -> anyhow::Result<MemoryUpdateReceipt> {
-        retry_acquisition(|| herdr_projects::memory::acknowledge_memory_update(project, ack))
+        retry_acquisition(|| herdr_farm::memory::acknowledge_memory_update(project, ack))
     }
     let (tmp, project, key) = fixture();
     let cli = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_herdr-projects"))
+        Command::new(env!("CARGO_BIN_EXE_herdr-farm"))
             .env_clear()
             .env("HOME", tmp.path())
             .env("PATH", "/usr/bin:/bin")
@@ -1003,7 +1003,7 @@ fn worker_update_receipts_are_explicit_exact_and_survive_restart() {
     assert!(read_memory_update(&project, &delivery, "other-attempt").is_err());
     let update: MemoryUpdate = serde_json::from_value(pulled["update"].clone()).unwrap();
     let package = read_snapshot_update_package(&project, &update.input_snapshot_id).unwrap().package;
-    let mut package_ack = herdr_projects::store::UpdatePackageAck {
+    let mut package_ack = herdr_farm::store::UpdatePackageAck {
         schema_version: 1, package_id: package.package_id, manifest_hash: package.manifest_hash,
         change_ids: package.change_ids, disposition: "seen".into(),
     };
@@ -1300,7 +1300,7 @@ fn worker_update_receipts_are_explicit_exact_and_survive_restart() {
     publish("Third approved update", 3);
     let pending = read_snapshot_update_package(&project, snap.id.as_str()).unwrap().package;
     assert_eq!(pending.change_ids.len(), 2);
-    let partial_package = herdr_projects::store::UpdatePackageAck {
+    let partial_package = herdr_farm::store::UpdatePackageAck {
         schema_version: 1, package_id: pending.package_id, manifest_hash: pending.manifest_hash,
         change_ids: pending.change_ids, disposition: "seen".into(),
     };
@@ -1340,7 +1340,7 @@ fn worker_update_receipts_are_explicit_exact_and_survive_restart() {
     let selected_again = cli(&["package", "--binding", selected["package"]["binding_id"].as_str().unwrap(), "--change", &third]);
     assert!(selected_again.status.success());
     assert_eq!(selected_again.stdout, output.stdout);
-    let mut selected_ack = herdr_projects::store::UpdatePackageAck {
+    let mut selected_ack = herdr_farm::store::UpdatePackageAck {
         schema_version: 1,
         package_id: selected["package"]["package_id"].as_str().unwrap().into(),
         manifest_hash: selected["package"]["manifest_hash"].as_str().unwrap().into(),
@@ -1442,7 +1442,7 @@ fn schema23_upgrade_adds_empty_receipts_without_inventing_consumption() {
     let path = project.join(".state/state.db");
     let raw = rusqlite::Connection::open(&path).unwrap();
     test_schema::historical(&raw, 23).unwrap();
-    let mut db = herdr_projects::store::SqliteStore::open(&path).unwrap();
+    let mut db = herdr_farm::store::SqliteStore::open(&path).unwrap();
     let before = db.read_snapshot(None).unwrap();
     assert!(db.memory_update_receipts("attempt").is_err());
     db.upgrade_v1().unwrap();
@@ -1450,7 +1450,7 @@ fn schema23_upgrade_adds_empty_receipts_without_inventing_consumption() {
     let after = db.read_snapshot(None).unwrap();
     assert_eq!(after.events, before.events);
     assert_eq!(after.tasks, before.tasks);
-    assert_eq!(after.schema_version, herdr_projects::store::SCHEMA);
+    assert_eq!(after.schema_version, herdr_farm::store::SCHEMA);
     db.integrity_check().unwrap();
 }
 
@@ -1505,7 +1505,7 @@ fn optional_update_supersession_requires_exact_applied_replacement_and_preserves
     };
     let newer=publish(2,"informational");
     let package=read_snapshot_update_package(&project,&snapshot).unwrap().package;
-    let request=herdr_projects::store::WorkerUpdateSupersession {
+    let request=herdr_farm::store::WorkerUpdateSupersession {
         schema_version:1,binding_id:package.binding_id.clone(),change_id:old["id"].as_str().unwrap().into(),
         replacement_change_id:newer.delivery_id.clone(),replacement_manifest_hash:newer.manifest_hash.clone(),reason:"Replaced by the reviewed current observation".into(),
     };
@@ -1518,10 +1518,10 @@ fn optional_update_supersession_requires_exact_applied_replacement_and_preserves
     let before=runtime::snapshot(&project).unwrap();
     let invalidations_before=db.memory_invalidations("task-proposal").unwrap();
     for bad in [
-        herdr_projects::store::WorkerUpdateSupersession {binding_id:"f".repeat(64),..request.clone()},
-        herdr_projects::store::WorkerUpdateSupersession {replacement_manifest_hash:"0".repeat(64),..request.clone()},
-        herdr_projects::store::WorkerUpdateSupersession {replacement_change_id:request.change_id.clone(),..request.clone()},
-        herdr_projects::store::WorkerUpdateSupersession {change_id:"unknown".into(),..request.clone()},
+        herdr_farm::store::WorkerUpdateSupersession {binding_id:"f".repeat(64),..request.clone()},
+        herdr_farm::store::WorkerUpdateSupersession {replacement_manifest_hash:"0".repeat(64),..request.clone()},
+        herdr_farm::store::WorkerUpdateSupersession {replacement_change_id:request.change_id.clone(),..request.clone()},
+        herdr_farm::store::WorkerUpdateSupersession {change_id:"unknown".into(),..request.clone()},
     ] { assert!(supersede_worker_update(&project,"attempt-a",&bad).is_err()); }
     assert!(supersede_worker_update(&project,"other-attempt",&request).is_err());
     assert_eq!(runtime::snapshot(&project).unwrap().head,before.head);
@@ -1554,7 +1554,7 @@ fn optional_update_supersession_requires_exact_applied_replacement_and_preserves
     // Upgrade a genuine pre-supersession schema and retain its exact receipts;
     // migration must not infer retirement from an already-applied replacement.
     test_schema::historical(&raw,42).unwrap();
-    let mut upgraded=herdr_projects::store::SqliteStore::open(&project.join(".state/state.db")).unwrap();
+    let mut upgraded=herdr_farm::store::SqliteStore::open(&project.join(".state/state.db")).unwrap();
     assert!(upgraded.worker_update_supersession(&package.binding_id,&request.change_id).is_err());
     upgraded.upgrade_v1().unwrap();
     assert_eq!(raw.query_row("SELECT count(*) FROM memory_update_supersessions",[],|r|r.get::<_,u64>(0)).unwrap(),0);
@@ -1563,11 +1563,11 @@ fn optional_update_supersession_requires_exact_applied_replacement_and_preserves
     assert_eq!(read_snapshot_update_package(&project,&snapshot).unwrap().package,package);
     let path=tmp.path().join("supersession.json");
     fs::write(&path,serde_json::to_vec(&request).unwrap()).unwrap();
-    let cli=|args:&[&str]| Command::new(env!("CARGO_BIN_EXE_herdr-projects")).env_clear().env("HOME",tmp.path()).env("PATH","/usr/bin:/bin")
+    let cli=|args:&[&str]| Command::new(env!("CARGO_BIN_EXE_herdr-farm")).env_clear().env("HOME",tmp.path()).env("PATH","/usr/bin:/bin")
         .args(["--root",tmp.path().to_str().unwrap(),"memory","project"]).args(args).output().unwrap();
     let output=cli(&["supersede-update","--attempt","attempt-a","--input",path.to_str().unwrap()]);
     assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
-    let receipt:herdr_projects::store::WorkerUpdateSupersessionReceipt=serde_json::from_slice(&output.stdout).unwrap();
+    let receipt:herdr_farm::store::WorkerUpdateSupersessionReceipt=serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(receipt.replacement_receipt_sequence,source.sequence);
     assert_eq!(receipt.request,request);
     assert!(receipt.sequence>source.sequence);
@@ -1584,7 +1584,7 @@ fn optional_update_supersession_requires_exact_applied_replacement_and_preserves
     assert_eq!(raw.query_row("SELECT count(*) FROM consumer_binding_obligations WHERE binding_id=?1",[&package.binding_id],|r|r.get::<_,u64>(0)).unwrap(),2);
     assert!(raw.execute("UPDATE memory_update_supersessions SET sequence=sequence",[]).is_err());
     assert!(raw.execute("DELETE FROM memory_update_supersessions",[]).is_err());
-    assert!(supersede_worker_update(&project,"attempt-a",&herdr_projects::store::WorkerUpdateSupersession {reason:"Different decision".into(),..request.clone()}).is_err());
+    assert!(supersede_worker_update(&project,"attempt-a",&herdr_farm::store::WorkerUpdateSupersession {reason:"Different decision".into(),..request.clone()}).is_err());
     let next=publish(3,"stop_at_checkpoint");
     // The original accepted decision remains historical after further updates.
     assert_eq!(supersede_worker_update(&project,"attempt-a",&request).unwrap(),receipt);
@@ -1593,7 +1593,7 @@ fn optional_update_supersession_requires_exact_applied_replacement_and_preserves
     acknowledge_memory_update(&project,&latest_ack).unwrap();
     latest_ack.state="applied".into();
     acknowledge_memory_update(&project,&latest_ack).unwrap();
-    let mandatory=herdr_projects::store::WorkerUpdateSupersession {change_id:next.delivery_id,replacement_change_id:latest.delivery_id,replacement_manifest_hash:latest.manifest_hash,..request.clone()};
+    let mandatory=herdr_farm::store::WorkerUpdateSupersession {change_id:next.delivery_id,replacement_change_id:latest.delivery_id,replacement_manifest_hash:latest.manifest_hash,..request.clone()};
     let blockers=db.memory_readiness("task-proposal",jiff::Timestamp::now().as_millisecond()).unwrap().blockers;
     assert!(supersede_worker_update(&project,"attempt-a",&mandatory).is_err());
     assert_eq!(db.memory_readiness("task-proposal",jiff::Timestamp::now().as_millisecond()).unwrap().blockers,blockers);

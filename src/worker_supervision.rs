@@ -167,7 +167,7 @@ pub fn gated_command(
     let mut args = vec![
         "-c".into(),
         "IFS= read -r release && [ \"$release\" = \"$1\" ] || exit 125; shift; exec \"$@\"".into(),
-        "herdr-projects-worker-gate".into(),
+        "herdr-farm-worker-gate".into(),
         token.into(),
         executable
             .to_str()
@@ -211,7 +211,7 @@ pub struct Isolation {
     spool: Option<String>,
     /// The directory of the product binary the worker runs for `result
     /// submit` and the review worker channel, first on the agent's `PATH` so
-    /// a brief's bare `herdr-projects` resolves to it (it stays visible and
+    /// a brief's bare `herdr-farm` resolves to it (it stays visible and
     /// read-only in the sandbox, see [`Isolation::add_executable`]). `None`
     /// when the binary is unknown or its directory cannot be a `PATH` entry.
     product: Option<String>,
@@ -221,7 +221,7 @@ pub struct Isolation {
 /// `result submit` and the `review` worker channel write a request there and
 /// wait for the ticker's receipt instead of opening the project store, which
 /// the sandbox leaves read-only (`crate::submission_spool`).
-pub const SUBMISSION_SPOOL_ENV: &str = "HERDR_PROJECTS_SUBMISSION_SPOOL";
+pub const SUBMISSION_SPOOL_ENV: &str = "HERDR_FARM_SUBMISSION_SPOOL";
 
 /// Owner-writable scratch directories replaced by a private empty tmpfs, so
 /// the worker neither reads the owner's temporary files and sockets nor plants
@@ -306,6 +306,7 @@ const OWNER_SECRETS: &[&str] = &[
     ".local/share/opencode",
     ".config/muse",
     ".local/share/muse",
+    ".config/herdr-farm",
     ".config/herdr-projects",
     ".config/herdr",
     ".config/gh",
@@ -366,14 +367,14 @@ const OWNER_SECRETS: &[&str] = &[
 /// a mount namespace it creates itself receives them locked. Any failure
 /// exits 125 before the agent runs.
 const SANDBOX: &str = concat!(
-    r#"set -u; fail() { printf 'herdr-projects: worker isolation refused: %s\n' "$1" >&2; exit 125; }; "#,
+    r#"set -u; fail() { printf 'herdr-farm: worker isolation refused: %s\n' "$1" >&2; exit 125; }; "#,
     r#"root=$1; shift; cwd=$(pwd -P) || fail cwd; "#,
     r#"for a in "$@"; do case $a in --) break;; tokensrc:*) t=${a#tokensrc:}; "#,
     r#"{ [ -f "$t" ] && [ ! -L "$t" ] && eval "exec 9<\"\$t\""; } || fail "$t";; esac; done; "#,
     r#"if [ -n "$root" ]; then n=3; "#,
     r#"for a in "$@"; do case $a in --) break;; expose:*) [ "$n" -le 9 ] || fail expose; p=${a#expose:}; "#,
     r#"eval "exec $n<\"\$p\"" || fail "$p"; n=$((n+1));; esac; done; "#,
-    r#"/usr/bin/mount -t tmpfs -o nosuid,nodev,noexec,mode=0755,size=1m herdr-projects-root "$root" || fail "$root"; n=3; "#,
+    r#"/usr/bin/mount -t tmpfs -o nosuid,nodev,noexec,mode=0755,size=1m herdr-farm-root "$root" || fail "$root"; n=3; "#,
     r#"for a in "$@"; do case $a in --) break;; expose:*) p=${a#expose:}; rel=${p#"$root"/}; "#,
     r#"case $rel in */*) /usr/bin/mkdir -p -- "$root/${rel%/*}" || fail "$p";; esac; "#,
     r#"if [ -d "/proc/self/fd/$n" ]; then /usr/bin/mkdir -- "$root/$rel" || fail "$p"; else : > "$root/$rel" || fail "$p"; fi; "#,
@@ -382,7 +383,7 @@ const SANDBOX: &str = concat!(
     r#"for d in "$@"; do case $d in --) break;; private:*) d=${d#private:}; if [ -d "$d" ] && [ ! -L "$d" ]; then n=3; "#,
     r#"for a in "$@"; do case $a in --) break;; keep:"$d"/*) [ "$n" -le 9 ] || fail keep; p=${a#keep:}; "#,
     r#"eval "exec $n<\"\$p\"" || fail "$p"; n=$((n+1));; esac; done; "#,
-    r#"/usr/bin/mount -t tmpfs -o nosuid,nodev,mode=1777 herdr-projects-private "$d" || fail "$d"; n=3; "#,
+    r#"/usr/bin/mount -t tmpfs -o nosuid,nodev,mode=1777 herdr-farm-private "$d" || fail "$d"; n=3; "#,
     r#"for a in "$@"; do case $a in --) break;; keep:"$d"/*) p=${a#keep:}; if [ -d "/proc/self/fd/$n" ]; then "#,
     r#"/usr/bin/mkdir -- "$p" && /usr/bin/mount -c --rbind "/proc/self/fd/$n" "$p" || fail "$p"; "#,
     r#"else { case ${p#"$d"/} in */*) /usr/bin/mkdir -p -- "${p%/*}";; esac && : > "$p" && "#,
@@ -392,7 +393,7 @@ const SANDBOX: &str = concat!(
     r#"{ /usr/bin/mkdir -p -m 0700 -- "${q%/*}" && /usr/bin/mkdir -m 0700 -- "$q" "$q/upper" "$q/work"; } || fail "$q"; "#,
     r#"{ exec 3<"$c" 4<"$q"; } || fail "$c"; /usr/bin/mount -t overlay -o "#,
     r#"lowerdir=/proc/self/fd/3,upperdir=/proc/self/fd/4/upper,workdir=/proc/self/fd/4/work,userxattr,index=off,metacopy=off,redirect_dir=off "#,
-    r#"herdr-projects-git "$c" || fail "$c"; exec 3<&- 4<&-;; esac; done; "#,
+    r#"herdr-farm-git "$c" || fail "$c"; exec 3<&- 4<&-;; esac; done; "#,
     r#"for a in "$@"; do case $a in --) break;; "#,
     r#"ro:*) p=${a#ro:}; if [ -e "$p" ]; then /usr/bin/mount --rbind -o ro=recursive "$p" "$p" || fail "$p"; fi;; "#,
     r#"rw:*) p=${a#rw:}; if [ -e "$p" ]; then /usr/bin/mount --rbind -o rw "$p" "$p" || fail "$p"; fi;; "#,
@@ -401,10 +402,10 @@ const SANDBOX: &str = concat!(
     r#"if [ -f "$s" ]; then { [ ! -L "$d" ] && [ ! -L "${d%/*}" ] && /usr/bin/mkdir -p -- "${d%/*}" && { [ -e "$d" ] || : > "$d"; } && "#,
     r#"/usr/bin/mount --bind "$s" "$d" && /usr/bin/mount -o remount,bind,rw,nosuid,nodev,noexec "$d"; } || fail "$d"; fi;; esac; done; "#,
     r#"for a in "$@"; do case $a in --) break;; hide:*) p=${a#hide:}; "#,
-    r#"if [ -d "$p" ]; then /usr/bin/mount -t tmpfs -o ro,nosuid,nodev,noexec,size=4k,mode=0555 herdr-projects-hidden "$p" || fail "$p"; "#,
+    r#"if [ -d "$p" ]; then /usr/bin/mount -t tmpfs -o ro,nosuid,nodev,noexec,size=4k,mode=0555 herdr-farm-hidden "$p" || fail "$p"; "#,
     r#"elif [ -e "$p" ]; then { /usr/bin/mount --bind /dev/null "$p" && /usr/bin/mount -o remount,bind,ro "$p"; } || fail "$p"; fi;; esac; done; "#,
     r#"for p in /tmp/ssh-* /tmp/tmux-*; do if [ -d "$p" ] && [ -O "$p" ]; then "#,
-    r#"/usr/bin/mount -t tmpfs -o ro,nosuid,nodev,noexec,size=4k,mode=0555 herdr-projects-hidden "$p" || fail "$p"; fi; done; "#,
+    r#"/usr/bin/mount -t tmpfs -o ro,nosuid,nodev,noexec,size=4k,mode=0555 herdr-farm-hidden "$p" || fail "$p"; fi; done; "#,
     r#"cd -- "$cwd" || fail "$cwd"; while [ "$1" != -- ]; do shift; done; shift; "#,
     r#"exec /usr/bin/unshare --user --map-root-user -- "$@""#,
 );
@@ -519,12 +520,12 @@ fn executable_dependencies(executable: &Path) -> Vec<std::path::PathBuf> {
     out
 }
 
-/// `HERDR_PROJECTS_OWNER_HOME` (absolute): a declared fixture owner home. It
+/// `HERDR_FARM_OWNER_HOME` (absolute): a declared fixture owner home. It
 /// only ever ADDS a hidden-secret anchor and redirects where the owner login
 /// is looked up; it can never remove the real owner home from the hidden set,
 /// so a stray value cannot expose the owner's keys or agent data to a worker.
 fn declared_owner_home() -> Result<Option<String>> {
-    std::env::var_os("HERDR_PROJECTS_OWNER_HOME").map(|home| normal(Path::new(&home))).transpose()
+    crate::product_environment::product_var_os("HERDR_FARM_OWNER_HOME").map(|home| normal(Path::new(&home))).transpose()
 }
 
 /// Hidden-secret anchors: the real owner homes plus any declared fixture home.
@@ -1007,7 +1008,7 @@ pub fn isolated_gated_command(
         "/bin/sh".into(),
         "-c".into(),
         SANDBOX.into(),
-        "herdr-projects-worker-sandbox".into(),
+        "herdr-farm-worker-sandbox".into(),
     ];
     args.extend(isolation.arguments());
     args.extend([
@@ -1032,11 +1033,12 @@ pub fn isolated_gated_command(
     ]);
     if let Some(spool) = &isolation.spool {
         args.push(format!("{SUBMISSION_SPOOL_ENV}={spool}"));
+        args.push(format!("HERDR_PROJECTS_SUBMISSION_SPOOL={spool}"));
     }
     if isolation.token.is_some() {
         // The token arrives on descriptor 9 and enters the agent's environment
         // only here, never an argument of any process.
-        args.extend(["/bin/sh".into(), "-c".into(), TOKEN_WRAPPER.into(), "herdr-projects-token".into()]);
+        args.extend(["/bin/sh".into(), "-c".into(), TOKEN_WRAPPER.into(), "herdr-farm-token".into()]);
     }
     args.push(
         executable

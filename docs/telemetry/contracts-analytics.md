@@ -188,7 +188,7 @@ Sidecar stream `operating` version 1 stores `operating_intervals`,
 canonical Active/paused state and control epoch at most once per nominal
 15-second cadence, after controller services and before expensive collection.
 Accelerated 250-ms controller ticks do not accelerate operating samples.
-`HERDR_PROJECTS_TELEMETRY_COLLECT_SECS=0` disables all ticker telemetry writes
+`HERDR_FARM_TELEMETRY_COLLECT_SECS=0` disables all ticker telemetry writes
 and sidecar creation. Automatic operating observations use only existing
 sidecars, including paused projects. A configured native-source collect can
 create the sidecar and start its first observed prefix; a project with neither

@@ -1,7 +1,7 @@
 #![cfg(all(feature = "state-store", target_os = "linux"))]
 #![allow(clippy::disallowed_methods)]
 mod support;
-use herdr_projects::telemetry::otlp;
+use herdr_farm::telemetry::otlp;
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -1200,7 +1200,7 @@ fn attempt_tokens_cli_bind_quarantine_revoke_expire_and_never_store_secrets() {
     );
     // A second real canonical attempt exists in this same project.
     f.readmit("other");
-    let second_attempt = herdr_projects::store::SqliteStore::open(&f.project.join(".state/state.db"))
+    let second_attempt = herdr_farm::store::SqliteStore::open(&f.project.join(".state/state.db"))
         .unwrap().read_snapshot(None).unwrap().attempts.into_iter()
         .find(|a| a.id.as_str() != f.attempt).unwrap().id.as_str().to_owned();
     root["resourceLogs"][0]["resource"]["attributes"]

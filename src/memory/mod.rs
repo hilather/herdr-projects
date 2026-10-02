@@ -118,7 +118,7 @@ pub fn mutation_guard(project: &Path) -> anyhow::Result<MemoryMutationGuard> {
 /// Raw revision writes are not a public authority bypass.
 ///
 /// ```compile_fail
-/// use herdr_projects::{memory::MemoryStore, domain::{ControlContext, NewRevision}};
+/// use herdr_farm::{memory::MemoryStore, domain::{ControlContext, NewRevision}};
 /// fn unsigned_write(store: &mut MemoryStore, next: NewRevision) {
 ///     store.insert_revision(&ControlContext { now_unix_ms: 1 }, next).unwrap();
 /// }

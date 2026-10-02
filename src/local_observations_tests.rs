@@ -76,7 +76,7 @@ fn queued_binding_changes_discard_completion_and_recollect_current_records() {
 #[test]
 fn blocked_observation_does_not_hold_effect_locks_and_stop_cancels_processes() {
     let f=Fixture::new("blocked");let pool=f.pool();let mut reads=Reads::new(pool.clone());reads.poll(&f.ctx(),&f.p).unwrap();reads.admit();let end=Instant::now()+Duration::from_secs(5);while !f.root.path().join("calls").exists(){assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(5));}
-    assert!(herdr_projects::execution_guard::ProjectGuard::acquire(&f.p.dir()).is_ok());assert!(crate::cleanup::lease(f.root.path()).is_ok());
+    assert!(herdr_farm::execution_guard::ProjectGuard::acquire(&f.p.dir()).is_ok());assert!(crate::cleanup::lease(f.root.path()).is_ok());
     let start=Instant::now();assert!(pool.stop(Duration::from_secs(3)));assert!(start.elapsed()<Duration::from_secs(3));finish(&mut reads);assert!(!matches!(reads.poll(&f.ctx(),&f.p).unwrap(),Poll::Ready(_)));assert!(reads.unknown());
 }
 struct Negative;

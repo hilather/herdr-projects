@@ -1,8 +1,8 @@
 //! One durable launch claim per execution; missing acknowledgement never retries.
 use super::*;
-use herdr_projects::execution_guard::ProjectGuard;
+use herdr_farm::execution_guard::ProjectGuard;
 use crate::source_tree::Control;
-pub use herdr_projects::launch_claim::{Claim,Phase};
+pub use herdr_farm::launch_claim::{Claim,Phase};
 pub fn validate(t:&Thread)->Result<()> {
     anyhow::ensure!(t.launch_sequence<=i64::MAX as u64,"launch sequence exhausted");
     if let Some(claim)=&t.launch_claim {claim.validate(t.launch_sequence)?;if claim.phase==Phase::Pending {anyhow::ensure!(t.pending_live_copy.is_none()&&t.pending_final_copy.is_none()&&t.prompt_claim.as_ref().is_none_or(|c|c.phase!=Phase::Pending),"pending launch conflicts with another effect");}}

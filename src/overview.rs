@@ -197,7 +197,7 @@ mod tests {
         assert_eq!(requests[0].0.to_string_lossy(), project.coordinator().unwrap().socket);
         let request: serde_json::Value = serde_json::from_str(&requests[0].1).unwrap();
         assert_eq!(request["method"], "agent.view.set");
-        assert_eq!(request["params"]["source"], "herdr-projects");
+        assert_eq!(request["params"]["source"], "herdr-farm");
         assert_eq!(request["params"]["filter"], serde_json::json!({"op":"eq","field":{"token":"project"},"value":"demo"}));
         assert_eq!(request["params"]["sort"], serde_json::json!([{"field":{"token":"rank"},"order":"asc"}]));
     }

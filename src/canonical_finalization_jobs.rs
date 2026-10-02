@@ -3,7 +3,7 @@ use std::{path::{Path,PathBuf},os::unix::fs::MetadataExt,sync::Arc,time::{Durati
 use anyhow::{Result,Context,ensure};
 use serde::{Serialize,Deserialize};
 use crate::{paths::{Ctx,Env},runner::{Runner,Cmd,Output},source_tree::{Control,Directory},finalization_delivery as receipt};
-use herdr_projects::{migration,execution_guard::ProjectGuard,domain::{Operation,OperationId},operations::{Claim,Outcome,DeliveryState,finalization::{Finalization,FinalizationReceipt,digest},dispatch::{self,DeliveryAdapter,PreparedDelivery,DispatchRequest,DispatchResult}}};
+use herdr_farm::{migration,execution_guard::ProjectGuard,domain::{Operation,OperationId},operations::{Claim,Outcome,DeliveryState,finalization::{Finalization,FinalizationReceipt,digest},dispatch::{self,DeliveryAdapter,PreparedDelivery,DispatchRequest,DispatchResult}}};
 const JOB:&str="\0herdr-projects-canonical-finalization";
 const BUDGET:Duration=Duration::from_secs(180);
 #[derive(Clone,Copy,Serialize,Deserialize,PartialEq,Eq)]

@@ -3,7 +3,7 @@ use std::{path::{Path,PathBuf},os::unix::fs::MetadataExt,sync::Arc,time::{Durati
 use anyhow::{Result,Context,ensure};
 use serde::{Serialize,Deserialize};
 use crate::{artifacts::live,executor::{Identity,Lane,Request},paths::{self,Ctx},project::{self,Project},remote,runner::{Cmd,Output,Runner,InheritedLock},source_tree::Control,thread::{self,Thread}};
-use herdr_projects::{copy_receipt::CopyReceipt,execution_guard::{ProjectEffect,ProjectGuard,ProjectSharedGuard,Resource},live_copy_intent::LiveCopyIntent,final_copy_intent::{FinalCopyIntent,Purpose}};
+use herdr_farm::{copy_receipt::CopyReceipt,execution_guard::{ProjectEffect,ProjectGuard,ProjectSharedGuard,Resource},live_copy_intent::LiveCopyIntent,final_copy_intent::{FinalCopyIntent,Purpose}};
 const JOB:&str="\0herdr-projects-live-copy";
 const BUDGET:Duration=Duration::from_secs(180);
 const INPUT_LIMIT:usize=64*1024;
@@ -134,7 +134,7 @@ impl Input {
 }
 fn run(command:Cmd,control:&Control,locks:&[InheritedLock])->Result<Output> {
     control.check()?;
-    let output=herdr_projects::supervision::run(command,control.deadline,control.cancellation.clone(),locks)?;
+    let output=herdr_farm::supervision::run(command,control.deadline,control.cancellation.clone(),locks)?;
     control.check()?;ensure!(output.success(),"supervised live-copy command failed");Ok(output)
 }
 fn supports_live(output:&Output)->Result<()> {
@@ -233,7 +233,7 @@ fn request_parts(ctx:&Ctx<'_>,project:&Project,expected:&Thread,target:Option<&s
     let resources=transfer_resources(&path,&expected.thread_dir);
     let input=Input{finalization,project:path.clone(),project_identity:(metadata.dev(),metadata.ino()),id:expected.id.clone(),execution:thread::execution_fingerprint(expected),
         previous_hash:expected.report_hash.clone(),previous_receipt:expected.copy_receipt.clone(),pending:expected.pending_live_copy.clone(),sequence:expected.live_copy_sequence,
-        config_digest:config(&config_path)?.1,config:config_path,herdr:ctx.env.herdr_bin().into(),helper:ctx.env.var("HERDR_PROJECTS_REMOTE_BIN").unwrap_or("herdr-projects").into(),machine:expected.machine.clone(),target:target.map(str::to_owned),resources:resources.clone()};
+        config_digest:config(&config_path)?.1,config:config_path,herdr:ctx.env.herdr_bin(),helper:ctx.env.var("HERDR_FARM_REMOTE_BIN").unwrap_or("herdr-farm").into(),machine:expected.machine.clone(),target:target.map(str::to_owned),resources:resources.clone()};
     input.validate()?;let text=serde_json::to_string(&input)?;ensure!(text.len()<=INPUT_LIMIT,"copy input exceeds bounds");
     let machine=resources.iter().find(|resource|resource.class=="git").map(|resource|format!("git:{}",resource.identity)).unwrap_or_else(||format!("routine-root:{}",path.parent().unwrap().display()));
     ensure!(machine.len()<=4096&&!machine.chars().any(char::is_control),"copy resource identity exceeds bounds");
@@ -524,7 +524,7 @@ mod tests {
         assert!(execute(&input,&control,&helpers).is_err());assert!(cancel.join().unwrap());
         assert_eq!(thread::load(&project,&t.id).unwrap(),t);assert_eq!(fs::read(thread::home_report_path(&project,&t.id)).unwrap(),b"old");
         assert_eq!(fs::read_dir(project.state_dir().join("live-copies")).unwrap().count(),0);
-        assert!(herdr_projects::execution_guard::RootGuard::exclusive(root.path()).is_ok());
+        assert!(herdr_farm::execution_guard::RootGuard::exclusive(root.path()).is_ok());
     }
     #[test]
     fn observation_runner_cannot_forge_sender_success_or_receipt() {

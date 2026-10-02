@@ -4,7 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 
-pub const ENV: &str = "HERDR_PROJECTS_HANDOFF";
+pub const ENV: &str = "HERDR_FARM_HANDOFF";
 const TTL: i64 = 600;
 const LIMIT: u64 = 64 * 1024;
 

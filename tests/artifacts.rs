@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{fs, os::unix::{fs::{symlink, PermissionsExt}, net::UnixListener}, path::{Path, PathBuf}, process::{Command, Output, Stdio}, time::{Duration, Instant}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 /// Session `NAME` is the socket `$HOME/NAME.sock` (`NAME@MACHINE` through
 /// `--machine`); it lists `NAME.agents` and `NAME.panes`, and acknowledges a

@@ -6,11 +6,11 @@
 //! worker is launched, so coordinator snapshots, the producer's attempt,
 //! consumer-binding retirement and package acknowledgment use the public store
 //! API (as in tests/memory_barriers.rs).
-use herdr_projects::{authority, domain::*, memory::MemoryStore, migration, runtime, store::{SqliteStore, UpdatePackageAck}};
+use herdr_farm::{authority, domain::*, memory::MemoryStore, migration, runtime, store::{SqliteStore, UpdatePackageAck}};
 use serde_json::{json, Value};
 use std::{fs, path::PathBuf, process::{Command, Output}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 struct Project { home: tempfile::TempDir, project: PathBuf, key: PathBuf, store: String }
 

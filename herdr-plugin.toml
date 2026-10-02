@@ -1,5 +1,5 @@
-id = "herdr-projects"
-name = "Projects"
+id = "herdr-farm"
+name = "Farm"
 version = "0.1.0"
 min_herdr_version = "0.9.1"
 description = "A coordinator conversation, parallel worker threads, shared memory and an overview of what needs you."
@@ -9,142 +9,142 @@ platforms = ["macos", "linux"]
 command = ["cargo", "build", "--release", "--locked"]
 
 [[startup]]
-command = ["target/release/herdr-projects", "ticker", "start"]
+command = ["target/release/herdr-farm", "ticker", "start"]
 
 [[actions]]
 id = "new"
-title = "Projects: new project"
+title = "Farm: new project"
 contexts = ["workspace"]
-command = ["target/release/herdr-projects", "action", "new"]
+command = ["target/release/herdr-farm", "action", "new"]
 
 [[actions]]
 id = "open"
-title = "Projects: open project"
+title = "Farm: open project"
 contexts = ["workspace"]
-command = ["target/release/herdr-projects", "action", "open"]
+command = ["target/release/herdr-farm", "action", "open"]
 
 [[actions]]
 id = "overview"
-title = "Projects: overview"
+title = "Farm: overview"
 contexts = ["workspace"]
-command = ["target/release/herdr-projects", "action", "overview"]
+command = ["target/release/herdr-farm", "action", "overview"]
 
 [[actions]]
 id = "focus"
-title = "Projects: focus sidebar on this project"
+title = "Farm: focus sidebar on this project"
 contexts = ["workspace"]
-command = ["target/release/herdr-projects", "action", "focus"]
+command = ["target/release/herdr-farm", "action", "focus"]
 
 [[actions]]
 id = "unfocus"
-title = "Projects: clear sidebar focus"
+title = "Farm: clear sidebar focus"
 contexts = ["workspace"]
-command = ["target/release/herdr-projects", "action", "unfocus"]
+command = ["target/release/herdr-farm", "action", "unfocus"]
 
 [[actions]]
 id = "adopt-workspace"
-title = "Projects: continue this workspace as a project"
+title = "Farm: continue this workspace as a project"
 contexts = ["workspace"]
-command = ["target/release/herdr-projects", "action", "adopt-workspace"]
+command = ["target/release/herdr-farm", "action", "adopt-workspace"]
 
 [[actions]]
 id = "pause"
-title = "Projects: pause project"
+title = "Farm: pause project"
 contexts = ["workspace"]
-command = ["target/release/herdr-projects", "action", "pause"]
+command = ["target/release/herdr-farm", "action", "pause"]
 
 [[actions]]
 id = "resume"
-title = "Projects: resume project"
+title = "Farm: resume project"
 contexts = ["workspace"]
-command = ["target/release/herdr-projects", "action", "resume"]
+command = ["target/release/herdr-farm", "action", "resume"]
 
 [[actions]]
 id = "fleet"
-title = "Projects: fleet"
+title = "Farm: fleet"
 contexts = ["workspace"]
-command = ["target/release/herdr-projects", "action", "fleet"]
+command = ["target/release/herdr-farm", "action", "fleet"]
 
 [[actions]]
 id = "fleet-watch"
-title = "Projects: fleet pane (refreshing)"
+title = "Farm: fleet pane (refreshing)"
 contexts = ["workspace"]
-command = ["target/release/herdr-projects", "action", "fleet-watch"]
+command = ["target/release/herdr-farm", "action", "fleet-watch"]
 
 [[actions]]
 id = "fleet-race"
-title = "Projects: propose a candidate group (race)"
+title = "Farm: propose a candidate group (race)"
 contexts = ["workspace"]
-command = ["target/release/herdr-projects", "action", "fleet-race"]
+command = ["target/release/herdr-farm", "action", "fleet-race"]
 
 [[actions]]
 id = "fleet-select"
-title = "Projects: select candidate"
+title = "Farm: select candidate"
 contexts = ["workspace"]
-command = ["target/release/herdr-projects", "action", "fleet-select"]
+command = ["target/release/herdr-farm", "action", "fleet-select"]
 
 [[actions]]
 id = "fleet-replay"
-title = "Projects: launch a replay-suite run"
+title = "Farm: launch a replay-suite run"
 contexts = ["workspace"]
-command = ["target/release/herdr-projects", "action", "fleet-replay"]
+command = ["target/release/herdr-farm", "action", "fleet-replay"]
 
 [[actions]]
 id = "doctor"
-title = "Projects: check setup"
+title = "Farm: check setup"
 contexts = ["workspace"]
-command = ["target/release/herdr-projects", "action", "doctor"]
+command = ["target/release/herdr-farm", "action", "doctor"]
 
 [[panes]]
 id = "overview"
 title = "Project overview"
 placement = "popup"
-command = ["target/release/herdr-projects", "pane", "overview"]
+command = ["target/release/herdr-farm", "pane", "overview"]
 
 [[panes]]
 id = "new"
 title = "New project"
 placement = "popup"
-command = ["target/release/herdr-projects", "pane", "new"]
+command = ["target/release/herdr-farm", "pane", "new"]
 
 [[panes]]
 id = "pick"
 title = "Pick a project"
 placement = "popup"
-command = ["target/release/herdr-projects", "pane", "pick"]
+command = ["target/release/herdr-farm", "pane", "pick"]
 
 [[panes]]
 id = "adopt"
 title = "Continue as a project"
 placement = "popup"
-command = ["target/release/herdr-projects", "pane", "adopt"]
+command = ["target/release/herdr-farm", "pane", "adopt"]
 
 [[panes]]
 id = "fleet"
-title = "Projects: fleet"
+title = "Farm: fleet"
 placement = "popup"
-command = ["target/release/herdr-projects", "pane", "fleet"]
+command = ["target/release/herdr-farm", "pane", "fleet"]
 
 [[panes]]
 id = "fleet-watch"
-title = "Projects: fleet"
+title = "Farm: fleet"
 placement = "split"
-command = ["target/release/herdr-projects", "pane", "fleet-watch"]
+command = ["target/release/herdr-farm", "pane", "fleet-watch"]
 
 [[panes]]
 id = "fleet-race"
 title = "Propose a candidate group"
 placement = "popup"
-command = ["target/release/herdr-projects", "pane", "fleet-race"]
+command = ["target/release/herdr-farm", "pane", "fleet-race"]
 
 [[panes]]
 id = "fleet-select"
 title = "Select a candidate"
 placement = "popup"
-command = ["target/release/herdr-projects", "pane", "fleet-select"]
+command = ["target/release/herdr-farm", "pane", "fleet-select"]
 
 [[panes]]
 id = "fleet-replay"
 title = "Launch a replay-suite run"
 placement = "popup"
-command = ["target/release/herdr-projects", "pane", "fleet-replay"]
+command = ["target/release/herdr-farm", "pane", "fleet-replay"]

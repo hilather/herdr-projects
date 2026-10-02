@@ -632,7 +632,7 @@ pub(crate) struct DelegationRepoScope {
 /// Trusted ingress capability. JSON cannot construct it. Callers keep the
 /// original signed bytes; this type is not a launch grant.
 /// ```compile_fail
-/// use herdr_projects::domain::PreparedDelegation;
+/// use herdr_farm::domain::PreparedDelegation;
 /// let _: PreparedDelegation = serde_json::from_str("{}").unwrap();
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -3,7 +3,7 @@ use std::{collections::BTreeMap,path::{Path,PathBuf},os::unix::{fs::{MetadataExt
 use anyhow::{Result,Context,ensure};
 use serde::{Serialize,Deserialize};
 use crate::{paths::{self,Ctx},project::{self,Project,Coordinator},thread::{self,Thread},runner::{Cmd,Output,Runner,InheritedLock},source_tree::Control};
-use herdr_projects::execution_guard::ProjectGuard;
+use herdr_farm::execution_guard::ProjectGuard;
 const JOB:&str="\0herdr-projects-tokens";
 const BUDGET:Duration=Duration::from_secs(45);
 #[derive(Clone,Serialize,Deserialize)]
@@ -46,7 +46,7 @@ impl Input {
     fn route(&self,control:&Control,locks:&[InheritedLock])->Result<()> {
         if let Some(r)=&self.remote {
             let mut cmd=Cmd::new(&self.herdr,crate::remote::SSH_TIMEOUT).args(["machine","list","--json"]);cmd.capture_limit=1024*1024;
-            let out=herdr_projects::supervision::run(cmd,control.deadline,control.cancellation.clone(),locks)?;control.check()?;
+            let out=herdr_farm::supervision::run(cmd,control.deadline,control.cancellation.clone(),locks)?;control.check()?;
             let current=crate::remote_api::resolve(&out,&r.selector)?;ensure!(r.route.same_destination(&current),"token remote route changed");
         }Ok(())
     }
@@ -54,7 +54,7 @@ impl Input {
     fn probe(&self,control:&Control,locks:&[InheritedLock])->Result<()> {
         if let Some(r)=&self.remote{return crate::remote_api::probe(&r.route,&r.binary,control,locks);}
         let mut cmd=self.command().args(["remote-api-bridge","--check"]);cmd.capture_limit=1024*1024;
-        let out=herdr_projects::supervision::run(cmd,control.deadline,control.cancellation.clone(),locks)?;control.check()?;
+        let out=herdr_farm::supervision::run(cmd,control.deadline,control.cancellation.clone(),locks)?;control.check()?;
         ensure!(out.success()&&out.stdout.trim()=="herdr-api-bridge-v1","token JSON API bridge unavailable");Ok(())
     }
     fn call(&self,method:&str,params:serde_json::Value,control:&Control,locks:&[InheritedLock])->Result<serde_json::Value> {
@@ -62,7 +62,7 @@ impl Input {
         if let Some(r)=&self.remote{return crate::remote_api::request(&r.route,&r.binary,&id,method,params,control,locks);}
         let payload=serde_json::to_string(&serde_json::json!({"id":id,"method":method,"params":params}))?+"\n";ensure!(payload.len()<=64*1024,"token frame exceeds bounds");
         let mut cmd=self.command().arg("remote-api-bridge").stdin(payload);cmd.capture_limit=1024*1024;
-        let out=herdr_projects::supervision::run(cmd,control.deadline,control.cancellation.clone(),locks)?;control.check()?;ensure!(out.success(),"token API bridge failed");
+        let out=herdr_farm::supervision::run(cmd,control.deadline,control.cancellation.clone(),locks)?;control.check()?;ensure!(out.success(),"token API bridge failed");
         let reply:serde_json::Value=serde_json::from_str(&out.stdout)?;ensure!(reply["id"].as_str()==Some(&id)&&reply.get("error").is_none(),"token API acknowledgement mismatch or rejection");reply.get("result").cloned().context("token API result missing")
     }
 }
@@ -106,7 +106,7 @@ impl Runner for JobRunner {
     fn socket_request(&self,p:&Path,s:&str,t:Duration)->Result<String>{self.inner.socket_request(p,s,t)}
 }
 pub fn request(ctx:&Ctx,p:&Project,t:Option<&Thread>,route:Option<&crate::remote_api::Route>)->Result<crate::executor::Request> {
-    let c=p.try_coordinator()?.context("token coordinator missing")?;let(target,pane,remote)=if let Some(t)=t {ready(t)?;ensure!(t.is_remote()==route.is_some(),"token route kind mismatch");(Target::Thread{id:t.id.clone(),execution:thread::execution_fingerprint(t)},t.pane_id.clone(),route.map(|route|Remote{route:route.clone(),selector:t.machine.clone(),binary:ctx.env.var("HERDR_PROJECTS_REMOTE_HERDR_BIN").unwrap_or("herdr").into()}))}else{ensure!(route.is_none()&&!c.pane_id.is_empty(),"invalid coordinator token route");(Target::Coordinator{execution:coordinator_execution(&c)},c.pane_id.clone(),None)};
+    let c=p.try_coordinator()?.context("token coordinator missing")?;let(target,pane,remote)=if let Some(t)=t {ready(t)?;ensure!(t.is_remote()==route.is_some(),"token route kind mismatch");(Target::Thread{id:t.id.clone(),execution:thread::execution_fingerprint(t)},t.pane_id.clone(),route.map(|route|Remote{route:route.clone(),selector:t.machine.clone(),binary:ctx.env.var("HERDR_FARM_REMOTE_HERDR_BIN").unwrap_or("herdr").into()}))}else{ensure!(route.is_none()&&!c.pane_id.is_empty(),"invalid coordinator token route");(Target::Coordinator{execution:coordinator_execution(&c)},c.pane_id.clone(),None)};
     let project=p.dir().canonicalize()?;let m=std::fs::metadata(&project)?;let socket=PathBuf::from(&c.socket);ensure!(socket.is_absolute(),"token session must be absolute");let config=std::path::absolute(&ctx.config_dir)?;
     let input=Input{project:project.clone(),identity:(m.dev(),m.ino()),target,socket_identity:socket_identity(&socket)?,socket,herdr:ctx.env.herdr_bin(),config_digest:digest(&config.join("config.toml"))?,config,settings_digest:digest(&p.project_md())?.context("token project settings missing")?,remote};
     let text=serde_json::to_string(&input)?;ensure!(text.len()<=64*1024,"token input exceeds bounds");let deadline=Instant::now()+BUDGET;let mut command=Cmd::new(JOB,BUDGET).stdin(text);command.deadline=Some(deadline);

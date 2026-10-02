@@ -59,7 +59,7 @@ fn effect_hints_preserve_publication_cancellation_and_sql_deadline_checks() {
 #[test]
 fn effect_notification_route_is_only_a_bounded_hash_checked_hint() {
     let(_root,path)=fixture(1);let db=rusqlite::Connection::open(path.join(".state/state.db")).unwrap();
-    let notice=crate::operations::notification::Notification{authority:"operator.session_notification".into(),binding_revision:1,control_epoch:1,config:ConfigReference{path:"/tmp/config.toml".into(),digest:None},inbox_ids:vec!["a".into()],title:"herdr-projects: fixture".into(),body:"1 new inbox item(s). The coordinator reads them at its next turn.".into()};let payload=serde_json::to_string(&notice).unwrap();
+    let notice=crate::operations::notification::Notification{authority:"operator.session_notification".into(),binding_revision:1,control_epoch:1,config:ConfigReference{path:"/tmp/config.toml".into(),digest:None},inbox_ids:vec!["a".into()],title:"herdr-farm: fixture".into(),body:"1 new inbox item(s). The coordinator reads them at its next turn.".into()};let payload=serde_json::to_string(&notice).unwrap();
     db.execute("UPDATE operations SET kind='runtime.notification',target='coordinator',payload=?1,payload_hash=?2",rusqlite::params![payload,hash(payload.as_bytes())]).unwrap();
     let raw:String=db.query_row("SELECT payload FROM runtime_bindings WHERE id='coordinator'",[],|r|r.get(0)).unwrap();let mut binding:RuntimeBinding=serde_json::from_str(&raw).unwrap();binding.identity.socket="/tmp/fixture.sock".into();
     let payload=serde_json::to_string(&binding).unwrap();db.execute("UPDATE runtime_bindings SET payload=?1,payload_hash=?2 WHERE id='coordinator'",rusqlite::params![payload,hash(payload.as_bytes())]).unwrap();

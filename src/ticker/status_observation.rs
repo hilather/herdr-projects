@@ -1,7 +1,7 @@
 //! Project-local fallback while another project owns the shared root barrier.
 //! No prompts, metadata writes, copies, launches or notification commands.
 use super::*;
-use herdr_projects::status_notice::StatusNotice;
+use herdr_farm::status_notice::StatusNotice;
 
 pub(super) fn deliver(project:&Project)->Result<()> {
     let (threads,diagnostics)=thread::list_with_diagnostics(project);

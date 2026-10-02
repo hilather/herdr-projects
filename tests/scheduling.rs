@@ -8,12 +8,12 @@
 //! success, lost or terminated attempts) are recorded with the public generic
 //! commit, and one queue entry is back-dated through the public store API
 //! because the binary has no clock override.
-use herdr_projects::{authority, domain::*, migration, runtime};
+use herdr_farm::{authority, domain::*, migration, runtime};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{collections::{BTreeMap, BTreeSet}, fs, os::unix::fs::{MetadataExt, PermissionsExt}, path::{Path, PathBuf}, process::{Command, Output}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 fn now() -> i64 { jiff::Timestamp::now().as_millisecond() }
 
@@ -31,7 +31,7 @@ impl Factory {
         let key = home.path().join("owner");
         assert!(Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).output().unwrap().status.success());
         let public = fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
-        let config = home.path().join(".config/herdr-projects/config.toml");
+        let config = home.path().join(".config/herdr-farm/config.toml");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         fs::write(&config, format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[profiles.worker]\nkind='codex'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=60\nunknown_usage='allow_with_warning'\n")).unwrap();
         let repo = home.path().join("repo");
@@ -52,7 +52,7 @@ impl Factory {
         for task in bound {
             let id = TaskId::new(*task).unwrap();
             let change = runtime::create_binding(&f.project, Some(&id), Some(f.revision(task)), f.head(), &route).unwrap();
-            observations.push(herdr_projects::reconcile::RuntimeObservation { binding: change.binding.id.clone(), binding_revision: change.binding.revision,
+            observations.push(herdr_farm::reconcile::RuntimeObservation { binding: change.binding.id.clone(), binding_revision: change.binding.revision,
                 task_revision: change.task_revision, observed_unix_ms: now(), collector: "herdr-git-v2".into(),
                 config_digest: migration::config_reference(&config).unwrap().digest, ..Default::default() });
             f.bindings.insert(task.to_string(), change.binding.id);
@@ -105,7 +105,7 @@ impl Factory {
     /// Prepare `worker` over fake binaries; only the native interaction
     /// evidence, which needs a real agent session, is planted.
     fn launchable_profile(&self) -> VersionedReference {
-        use herdr_projects::worker_supervision::{ProcessIncarnation, SupervisorIdentity};
+        use herdr_farm::worker_supervision::{ProcessIncarnation, SupervisorIdentity};
         let bin = self.path("bin");
         let agent_home = self.path("agent-home");
         fs::create_dir_all(&bin).unwrap();

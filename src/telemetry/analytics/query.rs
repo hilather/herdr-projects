@@ -20,7 +20,7 @@ pub const MAX_CELLS: usize = 64;
 /// Priced metrics: they carry the valuation (rate card) revision they read.
 const PRICED: [&str; 6] = ["M04", "M12", "M14", "M24", "M34", "M37"];
 
-/// `herdr-projects telemetry <slug> report`: central slice metrics, then every
+/// `herdr-farm telemetry <slug> report`: central slice metrics, then every
 /// lane's (`super::super::LANES`, a lane key replacing a central one).
 pub fn report(project: &Path, since: Option<i64>) -> Result<Value> {
     // Three bounded readers: accounting, the remaining lanes, and central
@@ -534,7 +534,7 @@ pub(crate) fn recorded(project: &Path, request: &Request) -> Result<Value> {
 const CURSOR_KIND: &str = "analytics-drill";
 
 /// `telemetry <slug> query`: the read contract (JSON). Drill-down cursors use
-/// the key under `$HOME/.config/herdr-projects` (`run_with` names it).
+/// the key under `$HOME/.config/herdr-farm` (`run_with` names it).
 pub fn run(project: &Path, request: &Request) -> Result<Value> { run_with(project, request, &Keyring::from_home()) }
 
 /// Live values for rules that read neither lineage nor recorded projections:

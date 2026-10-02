@@ -1044,7 +1044,7 @@ work, binds its runtime binding, and makes it a review task with one worker
 snapshot:
 
 ```
-herdr-projects memory <slug> snapshot --task R --profile P --input-file SCOPE --worker --review-opportunity O
+herdr-farm memory <slug> snapshot --task R --profile P --input-file SCOPE --worker --review-opportunity O
 ```
 
 The snapshot's retained instructions are then the blind brief of O instead of
@@ -1140,7 +1140,7 @@ authority); what it records is only a proposal.
 
 **Inside the worker sandbox: the submission spool.** An isolated worker sees
 its project's `.state` read-only (docs/reviews/2026-09-29-worker-isolation.md,
-"Submission spool"). With `HERDR_PROJECTS_SUBMISSION_SPOOL` in its
+"Submission spool"). With `HERDR_FARM_SUBMISSION_SPOOL` in its
 environment, `review session`, `review present` and `review submit` do not
 open the store: each writes one canonical request into the attempt's spool
 `.state/spool/<attempt>/` and prints the receipt the ticker writes back, which
@@ -1249,7 +1249,7 @@ runs or schedules as the operator (not a ticker job).
 
 **Custody.** One signer per reviewer principal, in
 `<config_dir>/review-signer/<token>/` (`config_dir` is
-`~/.config/herdr-projects`, the directory of the pinned owner
+`~/.config/herdr-farm`, the directory of the pinned owner
 configuration): `id_ed25519` (0600), `id_ed25519.pub`, `policy.json` (0600),
 `audit.jsonl` (0600, append-only) and a transient `work/` for the request
 being signed. `review-signer/` and the signer directory are 0700. The signer
@@ -1357,7 +1357,7 @@ last N audited decisions.
 
 - *Canonical and reviewer workers cannot reach the key.* They run in the
   isolated sandbox (`worker_supervision::Isolation`,
-  docs/reviews/2026-09-29-worker-isolation.md): `~/.config/herdr-projects`
+  docs/reviews/2026-09-29-worker-isolation.md): `~/.config/herdr-farm`
   of every owner home and `<pinned config dir>/review-signer` are empty
   read-only mounts they cannot lift, so the key, policy and audit log are
   unreadable; the signer CLI also refuses their context. The signer

@@ -7,7 +7,7 @@
 use serde_json::{json, Value};
 use std::{fs, os::unix::{fs::PermissionsExt, net::UnixListener}, path::{Path, PathBuf}, process::{Command, Output, Stdio}, time::{Duration, Instant}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 /// Session `NAME` is the socket `$HOME/NAME.sock`; it lists `NAME.agents` and
 /// `NAME.panes`. Prompts, synchronous or through the bridge, are acknowledged.
@@ -315,7 +315,7 @@ fn a_pane_is_the_coordinator_only_while_ids_directory_and_name_all_match() {
 #[cfg(feature = "state-store")]
 #[test]
 fn adopt_refuses_a_pane_that_a_migrated_project_already_binds() {
-    use herdr_projects::{domain::RuntimeRoute, migration, runtime};
+    use herdr_farm::{domain::RuntimeRoute, migration, runtime};
     let mut lab = Lab::new();
     let demo = lab.project_in_session("demo", "a");
     let other = lab.project_in_session("other", "b");

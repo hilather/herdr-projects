@@ -18,7 +18,7 @@ pub struct DelegatedReservationRequest {
 
 /// Constructed only after subject-signature verification by trusted ingress.
 /// ```compile_fail
-/// use herdr_projects::domain::PreparedDelegatedReservation;
+/// use herdr_farm::domain::PreparedDelegatedReservation;
 /// let _: PreparedDelegatedReservation = serde_json::from_str("{}").unwrap();
 /// ```
 #[derive(Debug, Clone)]

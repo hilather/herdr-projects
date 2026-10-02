@@ -31,7 +31,7 @@ fn summary(project: &str, alert: &Value) -> String {
     let mut scope = String::new();
     for key in ["service", "role"] { if let Some(v) = labels[key].as_str() { scope += &format!(" {key}={v}"); } }
     let codes: Vec<&str> = alert["reasons"].as_array().into_iter().flatten().filter_map(|r| r["code"].as_str()).collect();
-    format!("telemetry health {}: {} [{}{scope}] {}; advisory — `herdr-projects telemetry {project} health alerts`", alert["state"].as_str().unwrap_or(""),
+    format!("telemetry health {}: {} [{}{scope}] {}; advisory — `herdr-farm telemetry {project} health alerts`", alert["state"].as_str().unwrap_or(""),
         alert["rule"].as_str().unwrap_or(""), labels["family"].as_str().unwrap_or(""), codes.join(","))
 }
 

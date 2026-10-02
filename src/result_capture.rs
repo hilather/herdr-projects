@@ -92,7 +92,7 @@ pub fn capture(project: &Path, attempt: &AttemptId, message: Option<&str>, deadl
     let commit = run(&["commit-tree", &tree, "-p", &head, "-m", &message])?;
     proof.check()?;
     // Compare-and-swap on the attempt's own branch only.
-    run(&["update-ref", "-m", "herdr-projects capture", &branch, &commit, &head])?;
+    run(&["update-ref", "-m", "herdr-farm capture", &branch, &commit, &head])?;
     proof.check()?;
     Ok(receipt(commit, true))
 }

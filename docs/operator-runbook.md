@@ -15,7 +15,7 @@ that command and only for a path you pass explicitly.
   `[worker_isolation.login] claude_token_file = "/abs/path"` to the owner
   configuration **before** preparing and verifying the Claude profile. Without it
   `verify-interaction` and `launch run` refuse the Claude profile.
-* A pinned owner configuration (`~/.config/herdr-projects/config.toml`) with the
+* A pinned owner configuration (`~/.config/herdr-farm/config.toml`) with the
   `[authority]` key and one profile per worker setup, for example:
 
 ```toml
@@ -42,7 +42,7 @@ unknown_usage = "allow_with_warning"
   active ...`) as usual after editing.
 * A dedicated, owner-controlled execution home per profile, outside the project
   and outside the owner's real agent directories (for example
-  `~/.herdr-projects-homes/codex-sol`).
+  `~/.herdr-farm-homes/codex-sol`).
 * An existing branch of the repository, not checked out, for results to integrate
   into (for example `git branch integration`).
 
@@ -50,12 +50,12 @@ unknown_usage = "allow_with_warning"
 
 ```sh
 HERDR=/absolute/path/to/herdr          # the exact binary you will run the ticker with
-herdr-projects profile verify-interaction PROJECT codex-sol \
+herdr-farm profile verify-interaction PROJECT codex-sol \
   --herdr-executable "$HERDR" --agent-executable /absolute/path/to/codex \
-  --execution-home ~/.herdr-projects-homes/codex-sol --retain
-herdr-projects profile verify-interaction PROJECT claude-sonnet \
+  --execution-home ~/.herdr-farm-homes/codex-sol --retain
+herdr-farm profile verify-interaction PROJECT claude-sonnet \
   --herdr-executable "$HERDR" --agent-executable /absolute/path/to/claude \
-  --execution-home ~/.herdr-projects-homes/claude-sonnet --retain
+  --execution-home ~/.herdr-farm-homes/claude-sonnet --retain
 ```
 
 Each starts the real agent in a disposable Herdr server inside the execution
@@ -77,11 +77,11 @@ export HERDR_BIN_PATH="$HERDR"
 common="--repository /path/to/repo --prompt-file prompt.md --integration-ref refs/heads/integration \
   --sign-with ~/.ssh/owner_key --max-active-workers 2"
 # 1. prepare both: contract, queue, capacity, Herdr server, binding, reconcile, activate
-herdr-projects launch PROJECT run --task plan-codex  --profile codex-sol      --plan-output docs/plan-codex.md  $common --prepare-only
-herdr-projects launch PROJECT run --task plan-claude --profile claude-sonnet  --plan-output docs/plan-claude.md $common --prepare-only
+herdr-farm launch PROJECT run --task plan-codex  --profile codex-sol      --plan-output docs/plan-codex.md  $common --prepare-only
+herdr-farm launch PROJECT run --task plan-claude --profile claude-sonnet  --plan-output docs/plan-claude.md $common --prepare-only
 # 2. reserve both: knowledge snapshot, draft, signed approval, import, reserve
-herdr-projects launch PROJECT run --task plan-codex  --profile codex-sol      --plan-output docs/plan-codex.md  $common
-herdr-projects launch PROJECT run --task plan-claude --profile claude-sonnet  --plan-output docs/plan-claude.md $common
+herdr-farm launch PROJECT run --task plan-codex  --profile codex-sol      --plan-output docs/plan-codex.md  $common
+herdr-farm launch PROJECT run --task plan-claude --profile claude-sonnet  --plan-output docs/plan-claude.md $common
 ```
 
 Per run it: finds the retained launchable evidence for the profile; makes the project
@@ -114,11 +114,11 @@ controller launches the reserved attempts).
 ## 3. Watch and collect
 
 ```sh
-herdr-projects scheduler PROJECT inspect
-herdr-projects operations PROJECT inspect
-herdr-projects result PROJECT capture ATTEMPT      # after the worker has written its document
-herdr-projects result PROJECT jobs                 # verification and integration
-herdr-projects telemetry PROJECT attempts
+herdr-farm scheduler PROJECT inspect
+herdr-farm operations PROJECT inspect
+herdr-farm result PROJECT capture ATTEMPT      # after the worker has written its document
+herdr-farm result PROJECT jobs                 # verification and integration
+herdr-farm telemetry PROJECT attempts
 ```
 
 The worker writes `docs/plan-*.md` in its worktree and finishes by running the
@@ -143,7 +143,7 @@ If a worker stops
 without submitting, finish it yourself:
 
 ```sh
-herdr-projects result PROJECT submit-captured ATTEMPT   # capture + build + record the submission
+herdr-farm result PROJECT submit-captured ATTEMPT   # capture + build + record the submission
 ```
 
 (`result capture ATTEMPT` alone only commits the worktree and prints the candidate; it
@@ -159,7 +159,7 @@ pane is not at its prompt): look at the pane, then retire the brief or stop the 
 The dedicated Herdr server `launch run` started for a task is stopped by the running
 ticker once the task has no unfinished attempt, and its socket directory under the
 private runtime directory is removed. To do it yourself (for example after a failed
-run): `herdr-projects launch PROJECT stop --task ID` (add `--force` while the attempt
+run): `herdr-farm launch PROJECT stop --task ID` (add `--force` while the attempt
 still holds a worker). Servers you started (`--herdr-socket`) are never touched.
 
 Rerunning `launch run` after editing the owner configuration re-acknowledges it
@@ -191,3 +191,5 @@ canonical_worker --test factory_harness` covers large-base automatic integration
 replay, wrong object bytes, and an unstaged candidate blob. The canonical worker
 suite needs Unix socket permissions; compile it with `--no-run` in a restricted
 sandbox and run it on the steward's host.
+
+Compatibility: legacy environment variables and existing data/config locations remain supported; see [renaming](renaming.md).

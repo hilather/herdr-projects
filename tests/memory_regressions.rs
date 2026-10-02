@@ -6,11 +6,11 @@
 //! coordinator `context`. Tasks go through `task add`; running attempts,
 //! worker snapshots, object ingestion and garbage collection use the public
 //! store API because no worker is launched and GC has no CLI verb.
-use herdr_projects::{authority, domain::*, memory::*, migration, runtime};
+use herdr_farm::{authority, domain::*, memory::*, migration, runtime};
 use serde_json::{json, Value};
 use std::{fs, path::PathBuf, process::{Command, Output}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 struct Project { home: tempfile::TempDir, project: PathBuf, key: PathBuf, store: String }
 
@@ -22,7 +22,7 @@ impl Project {
         let public = fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
         let owner = home.path().join("owner.toml");
         fs::write(&owner, format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n")).unwrap();
-        let config = home.path().join(".config/herdr-projects");
+        let config = home.path().join(".config/herdr-farm");
         fs::create_dir_all(&config).unwrap();
         fs::write(config.join("config.toml"), "[profiles.planner]\nkind='claude'\npermission_policy='interactive'\n").unwrap();
         let mut p = Project { project: home.path().join("root/demo"), key, store: String::new(), home };

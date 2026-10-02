@@ -4,7 +4,7 @@ use serde::Serialize;
 use sha2::{Digest,Sha256};
 use std::{collections::BTreeMap,path::Path};
 use crate::{paths::Ctx,herdr::{self,Herdr,Pane,Agent},runner::Cmd};
-use herdr_projects::migration;
+use herdr_farm::migration;
 
 #[derive(Debug,Serialize)]
 pub struct Reference {pub path:String,pub present:bool,pub sha256:Option<String>,pub keys:Vec<String>}

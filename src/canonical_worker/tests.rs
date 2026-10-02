@@ -58,7 +58,7 @@ impl Fixture {
         HOME.get_or_init(|| {
             let home = tempfile::tempdir().unwrap();
             // SAFETY: set once, inside the initializer, before any launch reads it.
-            unsafe { std::env::set_var("HERDR_PROJECTS_OWNER_HOME", home.path()) };
+            unsafe { std::env::set_var("HERDR_FARM_OWNER_HOME", home.path()) };
             home
         });
     }
@@ -4298,7 +4298,7 @@ fn live_unobserved_exit(f:&Fixture,lab:&Path,binary:&Path,socket:&Path) {
     assert_eq!(requests.lines().filter(|m|*m=="pane.send_input").count(),0);
 }
 
-/// Stands in for `herdr-projects launch-exec <spec>`: this harness is not that
+/// Stands in for `herdr-farm launch-exec <spec>`: this harness is not that
 /// binary, so the fixture shell runs the same library launcher through it.
 #[test]
 fn stock_shell_exec_helper() {

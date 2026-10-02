@@ -2,11 +2,11 @@
 //! Real CLI/signature ingress over a disposable store. The installed native
 //! profile is synthetic; this test does not certify an adapter or start workers.
 #![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
-use herdr_projects::{authority, domain::*, migration, runtime};
+use herdr_farm::{authority, domain::*, migration, runtime};
 use sha2::{Digest, Sha256};
 use std::{fs, os::unix::fs::MetadataExt, path::{Path, PathBuf}, process::{Command, Output}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 fn cli(home: &Path, args: &[&str]) -> Output {
     Command::new(BIN).env_clear().env("HOME", home).env("PATH", "/usr/bin:/bin")
@@ -35,7 +35,7 @@ fn sign(key: &Path, path: &Path, bytes: &[u8], namespace: &str) -> PathBuf {
 
 /// Retained worker knowledge for `task`; an automatic draft binds it for the brief.
 fn worker_snapshot(project: &Path, profile: &FrozenProfile, task: &str) {
-    let mut memory = herdr_projects::memory::MemoryStore::from_sqlite(migration::open_active(project).unwrap(), project.join(".state/objects"));
+    let mut memory = herdr_farm::memory::MemoryStore::from_sqlite(migration::open_active(project).unwrap(), project.join(".state/objects"));
     memory.create_worker_snapshot(SnapshotRequest { schema_version: 1, task_id: task.into(), profile: profile.name.clone(), domains: vec![], paths: vec![], pinned_keys: vec![], sensitivity: "default".into() },
         &profile.name, &profile.definition_digest, profile.config.digest.as_deref(), 32000, "Delegated fixture instructions", jiff::Timestamp::now().as_millisecond(), None).unwrap();
 }
@@ -106,7 +106,7 @@ fn git(home: &Path, repository: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
-struct Installed { home: tempfile::TempDir, owner: PathBuf, subject: PathBuf, project: PathBuf, config: PathBuf, path: PathBuf, db: herdr_projects::store::SqliteStore,
+struct Installed { home: tempfile::TempDir, owner: PathBuf, subject: PathBuf, project: PathBuf, config: PathBuf, path: PathBuf, db: herdr_farm::store::SqliteStore,
     repository: PathBuf, oid: String, authority: VersionedReference, first_contract: serde_json::Value, grant_id: String, profile: FrozenProfile, document: PathBuf }
 
 /// An active project with queued tasks `a`, `b` and `c`, each with a signed
@@ -136,7 +136,7 @@ fn install(concurrent: u32, writes: serde_json::Value) -> Installed {
     let snapshot = db.read_snapshot(None).unwrap();
     db.set_scheduler_policy(snapshot.head, snapshot.scheduler.unwrap().policy.revision, 2, 3).unwrap();
     let snapshot = db.read_snapshot(None).unwrap();
-    let observations = snapshot.runtime_bindings.iter().map(|binding| herdr_projects::reconcile::RuntimeObservation {
+    let observations = snapshot.runtime_bindings.iter().map(|binding| herdr_farm::reconcile::RuntimeObservation {
         binding: binding.id.clone(), binding_revision: binding.revision, task_revision: Some(3),
         config_digest: migration::config_reference(&config).unwrap().digest,
         observed_unix_ms: jiff::Timestamp::now().as_millisecond(), collector: "herdr-git-v1".into(), ..Default::default()
@@ -359,7 +359,7 @@ impl Installed {
         accepted(self.cli(&["task","demo","queue",task,"--input-file",request.to_str().unwrap(),"--expected-revision",&revision,"--expected-head",&self.head()]));
         // A new task revision needs fresh binding observations and knowledge.
         let snapshot = runtime::snapshot(&self.project).unwrap();
-        let observations = snapshot.runtime_bindings.iter().map(|binding| herdr_projects::reconcile::RuntimeObservation {
+        let observations = snapshot.runtime_bindings.iter().map(|binding| herdr_farm::reconcile::RuntimeObservation {
             binding: binding.id.clone(), binding_revision: binding.revision,
             task_revision: snapshot.tasks.iter().find(|t| Some(&t.id) == binding.task.as_ref()).map(|t| t.revision),
             config_digest: migration::config_reference(&self.config).unwrap().digest,

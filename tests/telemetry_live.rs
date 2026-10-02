@@ -346,7 +346,7 @@ fn live(kind: &str) {
             ".cursor",
             ".copilot",
             ".ssh",
-            ".herdr-projects",
+            ".herdr-farm",
         ] {
             assert!(
                 !home.starts_with(owner_home.join(dir)),
@@ -414,7 +414,7 @@ fn live(kind: &str) {
     let mut endpoint = None;
     let mut attempt_token = None;
     if matches!(kind, "grok" | "muse" | "devin") {
-        let minted = herdr_projects::telemetry::otlp::mint_attempt_token(&f.project, &f.attempt, 600).unwrap();
+        let minted = herdr_farm::telemetry::otlp::mint_attempt_token(&f.project, &f.attempt, 600).unwrap();
         attempt_token = Some(minted["token"].as_str().unwrap().to_owned());
         let mut c = command(Path::new(BIN), &f.tmp.path().join("home"), f.tmp.path());
         c.args(["--root", f.root.to_str().unwrap(), "telemetry", "demo", "otlp", "serve", "--port", "0", "--seconds", "600"]);

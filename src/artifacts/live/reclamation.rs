@@ -1,6 +1,8 @@
 //! Reclaim unreferenced staging only after exclusive managed project ownership.
 use super::*;
-use herdr_projects::execution_guard::{ProjectEffect,ProjectGuard};
+use herdr_farm::execution_guard::ProjectEffect;
+#[cfg(test)]
+use herdr_farm::execution_guard::ProjectGuard;
 
 fn decimal(text:&str)->bool {text.parse::<u64>().is_ok_and(|n|n.to_string()==text)}
 fn owned_name(name:&str)->bool {
@@ -68,8 +70,8 @@ mod tests {
     #[test]
     fn full_inventory_reclaims_only_unreferenced_owned_stages() {
         let(_root,project)=fixture();let hash="a".repeat(64);
-        let live=thread::allocate(&project,|t|{t.status=thread::Status::Open;t.live_copy_sequence=1;t.pending_live_copy=Some(herdr_projects::live_copy_intent::LiveCopyIntent{sequence:1,execution:hash.clone(),authority:hash.clone(),previous_hash:String::new(),previous_receipt:None,report_hash:hash.clone(),stage_digest:hash.clone()});}).unwrap();
-        let final_copy=thread::allocate(&project,|t|{t.status=thread::Status::Open;t.final_copy_sequence=1;t.pending_final_copy=Some(herdr_projects::final_copy_intent::FinalCopyIntent{sequence:1,execution:hash.clone(),authority:hash.clone(),previous_hash:String::new(),previous_receipt:None,report_hash:None,stage_digest:hash.clone(),snapshot:None,operation:"merged-fixture".into(),purpose:herdr_projects::final_copy_intent::Purpose::Merged{pr:"https://github.com/example/repo/pull/1".into()}});}).unwrap();
+        let live=thread::allocate(&project,|t|{t.status=thread::Status::Open;t.live_copy_sequence=1;t.pending_live_copy=Some(herdr_farm::live_copy_intent::LiveCopyIntent{sequence:1,execution:hash.clone(),authority:hash.clone(),previous_hash:String::new(),previous_receipt:None,report_hash:hash.clone(),stage_digest:hash.clone()});}).unwrap();
+        let final_copy=thread::allocate(&project,|t|{t.status=thread::Status::Open;t.final_copy_sequence=1;t.pending_final_copy=Some(herdr_farm::final_copy_intent::FinalCopyIntent{sequence:1,execution:hash.clone(),authority:hash.clone(),previous_hash:String::new(),previous_receipt:None,report_hash:None,stage_digest:hash.clone(),snapshot:None,operation:"merged-fixture".into(),purpose:herdr_farm::final_copy_intent::Purpose::Merged{pr:"https://github.com/example/repo/pull/1".into()}});}).unwrap();
         let names=[live.pending_live_copy.as_ref().unwrap().stage_name(&live.id),final_copy.pending_final_copy.as_ref().unwrap().stage_name(&final_copy.id),"operator-data".into()];
         for name in &names {let dir=project.state_dir().join("live-copies").join(name);fs::create_dir(&dir).unwrap();fs::write(dir.join("marker"),b"retain").unwrap();}
         let unreferenced=project.state_dir().join("live-copies").join(format!("t-9999-1-{hash}"));fs::create_dir(&unreferenced).unwrap();fs::write(unreferenced.join("manifest.json"),b"orphan").unwrap();

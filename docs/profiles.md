@@ -1,7 +1,7 @@
 # Agent profiles (W04 work in progress)
 
-User-owned profiles live in `~/.config/herdr-projects/config.toml`. Inspect a
-definition with `herdr-projects profile inspect implementation`. This command reads
+User-owned profiles live in `~/.config/herdr-farm/config.toml`. Inspect a
+definition with `herdr-farm profile inspect implementation`. This command reads
 configuration only; it does not start an agent, read environment values or create
 project state. Output is JSON with redacted argument/intent/environment counts,
 config and profile SHA-256 identities, and unresolved requirements.
@@ -50,7 +50,7 @@ Agent and Herdr versions are `null`. `launchable`, `protocol_capable` and `certi
 are all false until the respective evidence paths exist. These are conservative
 admission results, not claims that an installed agent lacks support.
 
-`herdr-projects profile resolve NAME` prints a redacted budget envelope together
+`herdr-farm profile resolve NAME` prints a redacted budget envelope together
 with inspection. It does not launch, write the store, or emit argv/environment
 values. `soft_input_chars` is `soft_input_tokens * 4` when that field is set,
 otherwise 32 000 (the worker brief cap). The estimator is `char-count-v1`.
@@ -267,7 +267,7 @@ one line, outside the project, the projects root and every agent directory such 
 
 ```toml
 [worker_isolation.login]
-claude_token_file = "/home/me/.config/herdr-projects/claude-setup-token"
+claude_token_file = "/home/me/.config/herdr-farm/claude-setup-token"
 ```
 
 At launch the sandbox opens that file before anything is hidden and hands it to the
@@ -302,7 +302,7 @@ claude_token_file = "/home/me/tokens/claude-setup-token"   # a Claude worker's l
 copy placed in the execution home by hand still works with `share_login = false`.
 
 The owner home (where the Codex login is looked up and whose agent directories are
-hidden) is the account's passwd home plus `HOME`. `HERDR_PROJECTS_OWNER_HOME`
+hidden) is the account's passwd home plus `HOME`. `HERDR_FARM_OWNER_HOME`
 (absolute) declares a fixture owner home: the login is then looked up only
 there (so no test binds the real owner's login), and its agent directories are
 hidden **in addition to** the real owner home's. It can never remove the real
@@ -329,7 +329,7 @@ yet; the profile's intended mode is the one written.
 On Linux the gate also isolates the worker's filesystem view before the agent
 starts: the projects root is covered except the worker's own project, the
 owner's key and credential directories (`~/.ssh`, `~/.gnupg`, `~/.codex`, `~/.claude`,
-`~/.config/herdr-projects` including `review-signer/`, Herdr's sockets,
+`~/.config/herdr-farm` including `review-signer/`, Herdr's sockets,
 `/run/user/UID` and others) are replaced by empty read-only mounts, and the
 agent runs in a nested user namespace that cannot unmount them. The execution
 home must therefore be a dedicated directory: a home that contains one of these
@@ -375,7 +375,7 @@ With the `state-store` build, prepare immutable installation inputs using the
 migrated project's pinned owner configuration:
 
 ```sh
-herdr-projects profile prepare PROJECT PROFILE \
+herdr-farm profile prepare PROJECT PROFILE \
   --herdr-executable /absolute/path/to/herdr \
   --agent-executable /absolute/path/to/agent \
   --execution-home /absolute/owner-controlled/agent-home
@@ -409,7 +409,7 @@ JSON output is inspection evidence, not an importable launch authority.
 On Linux with the `state-store` build:
 
 ```sh
-herdr-projects profile verify-native PROJECT PROFILE \
+herdr-farm profile verify-native PROJECT PROFILE \
   --herdr-executable /absolute/patched/herdr \
   --agent-executable /absolute/native/agent \
   --execution-home /absolute/owner-controlled/agent-home
@@ -571,3 +571,5 @@ Worker brief version 2 also previews an attempt-specific `output_directory` unde
 count toward the complete prompt budget. Create a new `--worker` memory snapshot
 and approved attempt for the `char-count-worker-brief-v2` contract; old snapshots
 are not silently given new output instructions.
+
+Compatibility: legacy environment variables and existing data/config locations remain supported; see [renaming](renaming.md).

@@ -3,11 +3,11 @@
 //! Task records through the compiled CLI over a disposable migrated project:
 //! `task add/rename/show`, each call a new process that reopens the store.
 //! Persisted events are read from the store file.
-use herdr_projects::{migration, runtime};
+use herdr_farm::{migration, runtime};
 use serde_json::Value;
 use std::process::{Command, Output};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 struct Project { home: tempfile::TempDir }
 
@@ -96,14 +96,14 @@ fn scoped_attempt_token_inventory_ignores_unrelated_corrupt_history() {
     assert_eq!(p.show("retired")["title"], "Retired task");
     // Establish the scoped-open schema check before injecting a data fault,
     // as the ticker does before a store page is damaged during normal use.
-    let control = herdr_projects::store::controlled::ReadControl::new(std::time::Instant::now() + std::time::Duration::from_secs(10), Default::default());
+    let control = herdr_farm::store::controlled::ReadControl::new(std::time::Instant::now() + std::time::Duration::from_secs(10), Default::default());
     drop(migration::open_active_scoped(&p.project(), control).unwrap());
     let raw = rusqlite::Connection::open(p.project().join(".state/state.db")).unwrap();
     raw.execute_batch("PRAGMA ignore_check_constraints=ON").unwrap();
     assert!(raw.execute("UPDATE events SET payload='{' WHERE entity='retired'", []).unwrap() > 0);
     drop(raw);
     assert!(runtime::snapshot(&p.project()).is_err());
-    let control = herdr_projects::store::controlled::ReadControl::new(std::time::Instant::now() + std::time::Duration::from_secs(10), Default::default());
+    let control = herdr_farm::store::controlled::ReadControl::new(std::time::Instant::now() + std::time::Duration::from_secs(10), Default::default());
     let mut store = migration::open_active_scoped(&p.project(), control).unwrap();
     assert!(store.attempt_tokens(&[]).unwrap().entries.is_empty());
     let out = p.cli(&["scheduler", "demo", "inspect"]);

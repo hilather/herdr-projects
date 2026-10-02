@@ -59,7 +59,7 @@ impl Lab {
     }
     pub fn diagnostics(&self) -> String {
         let mut cmd = self.command(&self.herdr);
-        cmd.args(["--session", "hp-acceptance", "plugin", "log", "--plugin", "herdr-projects"]);
+        cmd.args(["--session", "hp-acceptance", "plugin", "log", "--plugin", "herdr-farm"]);
         let (_, output, error) = self.run(cmd);
         let mut files = Vec::new();
         let mut pending = vec![self.path().join("home/.config/herdr")];
@@ -77,10 +77,10 @@ impl Lab {
         format!("server: {}\nplugin: {output}\n{error}\nfiles: {}\nsnapshot: {}", fs::read_to_string(self.path().join("server.log")).unwrap_or_default(), files.join("\n"), self.herdr(&["api", "snapshot"]))
     }
     pub fn hp(&self, args: &[&str]) -> String {
-        let mut cmd = self.command(env!("CARGO_BIN_EXE_herdr-projects"));
+        let mut cmd = self.command(env!("CARGO_BIN_EXE_herdr-farm"));
         cmd.args(args);
         let (ok, out, err) = self.run(cmd);
-        assert!(ok, "herdr-projects {args:?}: {err}\n{out}");
+        assert!(ok, "herdr-farm {args:?}: {err}\n{out}");
         out
     }
     pub fn start(&mut self) {
@@ -109,7 +109,7 @@ impl Lab {
 impl Drop for Lab {
     fn drop(&mut self) {
         if self.path().join("projects/.ticker.lock").exists() {
-            let mut cmd = self.command(env!("CARGO_BIN_EXE_herdr-projects"));
+            let mut cmd = self.command(env!("CARGO_BIN_EXE_herdr-farm"));
             cmd.args(["ticker", "stop"]);
             let _ = self.run(cmd);
         }

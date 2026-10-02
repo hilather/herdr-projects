@@ -4,7 +4,7 @@
 #![cfg(feature = "state-store")]
 #![allow(clippy::disallowed_methods)] // Test-only spawns outside the library may skip the spawn gate.
 
-use herdr_projects::{
+use herdr_farm::{
     domain::*,
     store::SqliteStore,
 };
@@ -27,7 +27,7 @@ static VERTICAL_SLICE_VERIFY_HOOK: unsafe extern "C" fn() = vertical_slice_verif
 #[cfg(target_os = "linux")]
 unsafe extern "C" fn vertical_slice_verify_hook() {
     if std::env::args().any(|arg| arg == "verification-setup") {
-        std::process::exit(herdr_projects::verification::setup_main());
+        std::process::exit(herdr_farm::verification::setup_main());
     }
 }
 
@@ -112,7 +112,7 @@ fn vertical_slice() {
 #[cfg(target_os = "linux")]
 mod slice {
     use super::git;
-    use herdr_projects::{
+    use herdr_farm::{
         admission,
         domain::*,
         integration,
@@ -290,7 +290,7 @@ mod slice {
             "claimed_checks": [PROSE],
             "objects": objects.iter().map(|(oid, relative)| serde_json::json!({"oid": oid, "relative_path": relative})).collect::<Vec<_>>()
         });
-        let mut db = herdr_projects::store::SqliteStore::open(db_path).unwrap();
+        let mut db = herdr_farm::store::SqliteStore::open(db_path).unwrap();
         let before = count(db_path, "SELECT count(*) FROM dependency_satisfactions");
         db.submit_result(&serde_json::to_vec(&submission).unwrap())
             .unwrap();
@@ -343,7 +343,7 @@ mod slice {
         result_id: &str,
         key: &str,
     ) -> integration::IntegrateOutcome {
-        let mut db = herdr_projects::store::SqliteStore::open(db_path).unwrap();
+        let mut db = herdr_farm::store::SqliteStore::open(db_path).unwrap();
         integration::integrate(
             &mut db,
             &integration::IntegrateRequest {
@@ -481,7 +481,7 @@ mod slice {
 
     pub fn run() {
         let (root, project, db_path) = through_d();
-        let mut db = herdr_projects::store::SqliteStore::open(&db_path).unwrap();
+        let mut db = herdr_farm::store::SqliteStore::open(&db_path).unwrap();
         let snapshot = db.read_snapshot(None).unwrap();
         let revision = snapshot
             .tasks
@@ -639,12 +639,12 @@ mod slice {
 
         let repo = repo.canonicalize().unwrap();
         fs::create_dir_all(project.join(".state")).unwrap();
-        let db = herdr_projects::store::SqliteStore::create(&db_path).unwrap();
+        let db = herdr_farm::store::SqliteStore::create(&db_path).unwrap();
         drop(db);
         let db_path = db_path.canonicalize().unwrap();
         let project_store = db_path.to_str().unwrap().to_string();
         let repository = repo.to_str().unwrap().to_string();
-        let mut db = herdr_projects::store::SqliteStore::open(&db_path).unwrap();
+        let mut db = herdr_farm::store::SqliteStore::open(&db_path).unwrap();
         let producers = ["a", "p", "s"];
         let mut mutations: Vec<Mutation> = ["a", "p", "s", "b", "c", "d", "w", "dstale"]
             .into_iter()
@@ -749,7 +749,7 @@ mod slice {
                 &policy_consumer,
             );
         }
-        let mut db = herdr_projects::store::SqliteStore::open(&db_path).unwrap();
+        let mut db = herdr_farm::store::SqliteStore::open(&db_path).unwrap();
         integration::configure_integration_ref(&mut db, &repo, TARGET).unwrap();
         drop(db);
 
@@ -798,7 +798,7 @@ mod slice {
             0
         );
 
-        let mut db = herdr_projects::store::SqliteStore::open(&db_path).unwrap();
+        let mut db = herdr_farm::store::SqliteStore::open(&db_path).unwrap();
         for id in ["b", "c", "d", "dstale"] {
             let snapshot = db.read_snapshot(None).unwrap();
             let revision = snapshot
@@ -859,7 +859,7 @@ mod slice {
         drop(db);
         retain_profile(&db_path);
 
-        let mut db = herdr_projects::store::SqliteStore::open(&db_path).unwrap();
+        let mut db = herdr_farm::store::SqliteStore::open(&db_path).unwrap();
         let snapshot = db.read_snapshot(None).unwrap();
         let revision = snapshot
             .tasks
@@ -901,7 +901,7 @@ mod slice {
                 "CREATE TRIGGER vertical_slice_crash_receipt BEFORE INSERT ON integrated_commits BEGIN SELECT RAISE(ABORT, 'vertical-slice-crash'); END;",
             )
             .unwrap();
-        let mut db = herdr_projects::store::SqliteStore::open(&db_path).unwrap();
+        let mut db = herdr_farm::store::SqliteStore::open(&db_path).unwrap();
         let crashed = integration::integrate(
             &mut db,
             &integration::IntegrateRequest {
@@ -935,7 +935,7 @@ mod slice {
             .unwrap()
             .execute_batch("DROP TRIGGER vertical_slice_crash_receipt;")
             .unwrap();
-        let mut db = herdr_projects::store::SqliteStore::open(&db_path).unwrap();
+        let mut db = herdr_farm::store::SqliteStore::open(&db_path).unwrap();
         let confirmed = integration::reconcile_integration(&mut db, &repo, "integrate-a").unwrap();
         drop(db);
         assert_eq!(confirmed.state, "integrated", "{:?}", confirmed.reason);
@@ -946,7 +946,7 @@ mod slice {
             1
         );
 
-        let mut db = herdr_projects::store::SqliteStore::open(&db_path).unwrap();
+        let mut db = herdr_farm::store::SqliteStore::open(&db_path).unwrap();
         let snapshot = db.read_snapshot(None).unwrap();
         let revision = snapshot
             .tasks
@@ -984,7 +984,7 @@ mod slice {
         assert_eq!(integrated_p.commit_oid.as_deref(), Some(tip.as_str()));
         assert_ne!(tip, moved);
 
-        let mut db = herdr_projects::store::SqliteStore::open(&db_path).unwrap();
+        let mut db = herdr_farm::store::SqliteStore::open(&db_path).unwrap();
         let snapshot = db.read_snapshot(None).unwrap();
         let revision = snapshot
             .tasks
@@ -1034,7 +1034,7 @@ mod slice {
             "verify_then_integrate",
             &policy_consumer,
         );
-        let mut db = herdr_projects::store::SqliteStore::open(&db_path).unwrap();
+        let mut db = herdr_farm::store::SqliteStore::open(&db_path).unwrap();
         let snapshot = db.read_snapshot(None).unwrap();
         let revision = snapshot
             .tasks
@@ -1099,7 +1099,7 @@ fn classification_project(tmp: &Path, task: &str, contract_path: Option<&str>) -
     let repository = fs::canonicalize(&repo).unwrap().display().to_string();
     let config_path = tmp.join("owner.toml");
     fs::write(&config_path, "version = 1\n").unwrap();
-    let config = herdr_projects::migration::config_reference(&config_path).unwrap();
+    let config = herdr_farm::migration::config_reference(&config_path).unwrap();
     let digest = config.digest.clone().unwrap();
     let mut db = SqliteStore::create(&db_path).unwrap();
     let id = TaskId::new(task).unwrap();
@@ -1114,9 +1114,9 @@ fn classification_project(tmp: &Path, task: &str, contract_path: Option<&str>) -
     let now = unix_ms();
     let snapshot = db.read_snapshot(None).unwrap();
     let binding = &snapshot.runtime_bindings[0];
-    db.record_observations(snapshot.head, &[herdr_projects::reconcile::RuntimeObservation { binding: binding.id.clone(), binding_revision: binding.revision,
+    db.record_observations(snapshot.head, &[herdr_farm::reconcile::RuntimeObservation { binding: binding.id.clone(), binding_revision: binding.revision,
         task_revision: Some(snapshot.tasks[0].revision), observed_unix_ms: now, collector: "herdr-git-v1".into(), config_digest: Some(digest.clone()),
-        ..herdr_projects::reconcile::RuntimeObservation::default() }]).unwrap();
+        ..herdr_farm::reconcile::RuntimeObservation::default() }]).unwrap();
     let snapshot = db.read_snapshot(None).unwrap();
     db.set_project_state(snapshot.head, snapshot.control.unwrap().revision, ProjectState::Active, now, Some(&digest)).unwrap();
     drop(db);
@@ -1136,10 +1136,10 @@ fn classification_project(tmp: &Path, task: &str, contract_path: Option<&str>) -
 fn admit_ready(project: &Path) {
     let db_path = project.join(".state/state.db");
     worker_snapshots(project);
-    let inputs = herdr_projects::admission::prepared_admission_inputs(project).unwrap().expect("a ready candidate");
+    let inputs = herdr_farm::admission::prepared_admission_inputs(project).unwrap().expect("a ready candidate");
     insert_grant(&db_path, &inputs);
     let before = sql_count(&db_path, "SELECT count(*) FROM attempts");
-    herdr_projects::admission::admit_once(project).unwrap();
+    herdr_farm::admission::admit_once(project).unwrap();
     assert_eq!(sql_count(&db_path, "SELECT count(*) FROM attempts"), before + 1, "admission did not reserve");
 }
 
@@ -1185,18 +1185,18 @@ fn requeue(db_path: &Path) {
 fn admit_granted(project: &Path, granted: &str) {
     let db_path = project.join(".state/state.db");
     worker_snapshots_for(project, Some(granted));
-    let inputs = herdr_projects::admission::prepared_admission_inputs(project).unwrap().expect("a ready candidate");
+    let inputs = herdr_farm::admission::prepared_admission_inputs(project).unwrap().expect("a ready candidate");
     assert_eq!(inputs.effective_profile.as_ref().unwrap().name, granted);
     insert_grant(&db_path, &inputs);
     worker_snapshots_for(project, None);
     let before = sql_count(&db_path, "SELECT count(*) FROM attempts");
-    herdr_projects::admission::admit_once(project).unwrap();
+    herdr_farm::admission::admit_once(project).unwrap();
     assert_eq!(sql_count(&db_path, "SELECT count(*) FROM attempts"), before + 1, "admission did not reserve");
 }
 
 #[cfg(target_os = "linux")]
 /// A further retained profile with the capability evidence the fixture contract requires.
-fn plant_arm(db_path: &Path, config: &herdr_projects::migration::ConfigReference, name: &str, version: &str) -> FrozenProfile {
+fn plant_arm(db_path: &Path, config: &herdr_farm::migration::ConfigReference, name: &str, version: &str) -> FrozenProfile {
     let profile = plant_profile_as(db_path, sim_profile(config, name, version));
     SqliteStore::open(db_path).unwrap().record_native_capability_evidence(unix_ms(), unix_ms() + 3_600_000).unwrap();
     profile
@@ -1241,7 +1241,7 @@ fn automatic_admission_logs_eligible_profiles() {
     let tmp = tempfile::tempdir().unwrap();
     let project = classification_project(tmp.path(), "pick", Some("src/pick.rs"));
     let db_path = project.join(".state/state.db");
-    let config = herdr_projects::migration::config_reference(&tmp.path().join("owner.toml")).unwrap();
+    let config = herdr_farm::migration::config_reference(&tmp.path().join("owner.toml")).unwrap();
     let sim = sim_profile(&config, "sim", "1.0.0");
     let next = plant_arm(&db_path, &config, "sim-next", "0.154.1");
     // Admission evaluates retained profiles in profile-digest order; the second holds the only grant.
@@ -1277,7 +1277,7 @@ fn configuration_identity_is_stable_and_versioned() {
     // The same profile on two attempts is one arm, stored as the exact canonical bytes.
     assert_eq!(configurations(&db_path), [(sha256_id(&current), current.clone())]);
     requeue(&db_path);
-    let config = herdr_projects::migration::config_reference(&tmp.path().join("owner.toml")).unwrap();
+    let config = herdr_farm::migration::config_reference(&tmp.path().join("owner.toml")).unwrap();
     plant_arm(&db_path, &config, "sim-next", "0.154.1");
     admit_granted(&project, "sim-next");
     let upgraded = sim_configuration("0.154.1");
@@ -1321,11 +1321,11 @@ fn task_without_contract_is_unscoped() {
     assert_eq!(rows[0].0, format!("sha256:{:x}", Sha256::digest(record.as_bytes())));
 }
 
-/// `herdr-projects telemetry <project> attempts --json`, the project under its parent root.
+/// `herdr-farm telemetry <project> attempts --json`, the project under its parent root.
 #[cfg(target_os = "linux")]
 fn telemetry_attempts(project: &Path) -> serde_json::Value {
     let root = project.parent().unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_herdr-projects")).env_clear().env("HOME", root)
+    let out = Command::new(env!("CARGO_BIN_EXE_herdr-farm")).env_clear().env("HOME", root)
         .args(["--root", root.to_str().unwrap(), "telemetry", project.file_name().unwrap().to_str().unwrap(), "attempts", "--json"]).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     serde_json::from_slice(&out.stdout).unwrap()
@@ -1413,8 +1413,8 @@ fn outcome_rejected_verification_reason_is_excerpted() {
         "artifact_manifest": [{"path": "README", "oid": oid}], "claimed_checks": ["worker prose is not evidence"],
         "objects": [{"oid": oid, "relative_path": format!("{}/{}", &oid[..2], &oid[2..])}]});
     let submitted = db.submit_result(&serde_json::to_vec(&submission).unwrap()).unwrap().submission_id;
-    let request = herdr_projects::verification::VerifyRequest::new(submitted.clone(), "builds", &policy, "verify-rej", Duration::from_secs(5), &work);
-    let outcome = herdr_projects::verification::verify(&mut db, &request).unwrap();
+    let request = herdr_farm::verification::VerifyRequest::new(submitted.clone(), "builds", &policy, "verify-rej", Duration::from_secs(5), &work);
+    let outcome = herdr_farm::verification::verify(&mut db, &request).unwrap();
     assert_eq!((outcome.state.as_str(), outcome.reason.as_deref()), ("rejected", Some("policy_digest_mismatch")));
     let submitted_ms: i64 = conn.query_row("SELECT created_unix_ms FROM result_submissions", [], |r| r.get(0)).unwrap();
     let report = telemetry_attempts(&project);
@@ -1447,7 +1447,7 @@ fn pre_0051_attempt_reports_predates_lifecycle_log() {
     admit_ready(&project);
     assert_eq!(sql_count(&db_path, "SELECT count(*) FROM dispatch_decisions"), 1);
     SqliteStore::open(&db_path).unwrap().upgrade_v1().unwrap();
-    assert_eq!(sql_count(&db_path, "PRAGMA user_version"), herdr_projects::store::SCHEMA as i64);
+    assert_eq!(sql_count(&db_path, "PRAGMA user_version"), herdr_farm::store::SCHEMA as i64);
     let attempt = cancel_reserved(&db_path);
     let marks = lifecycle_marks(&db_path);
     assert_eq!(marks.iter().map(|(s, r, _, source)| (s.as_str(), *r, source.as_str())).collect::<Vec<_>>(),
@@ -1575,7 +1575,7 @@ fn worker_snapshots_for(project: &Path, only: Option<&str>) {
             let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM memory_snapshots WHERE task_id=?1 AND task_revision=?2 AND profile_name=?3 AND profile_digest=?4)",
                 rusqlite::params![task, revision, profile.name, profile.definition_digest], |row| row.get(0)).unwrap();
             if exists { continue; }
-            let memory = memory.get_or_insert_with(|| herdr_projects::memory::MemoryStore::from_sqlite(SqliteStore::open(&db_path).unwrap(), project.join(".state/objects")));
+            let memory = memory.get_or_insert_with(|| herdr_farm::memory::MemoryStore::from_sqlite(SqliteStore::open(&db_path).unwrap(), project.join(".state/objects")));
             memory.create_worker_snapshot(SnapshotRequest { schema_version: 1, task_id: task.clone(), profile: profile.name.clone(), domains: vec![], paths: vec![], pinned_keys: vec![], sensitivity: "default".into() },
                 &profile.name, &profile.definition_digest, profile.config.digest.as_deref(), 32000, "Factory fixture instructions", unix_ms(), None).unwrap();
         }
@@ -1585,14 +1585,14 @@ fn worker_snapshots_for(project: &Path, only: Option<&str>) {
 #[cfg(target_os = "linux")]
 fn plant_profile(
     db_path: &Path,
-    config: &herdr_projects::migration::ConfigReference,
+    config: &herdr_farm::migration::ConfigReference,
 ) -> FrozenProfile {
     plant_profile_as(db_path, sim_profile(config, "sim", "1.0.0"))
 }
 
 /// The retained `sim` fixture profile under another name and agent version.
 #[cfg(target_os = "linux")]
-fn sim_profile(config: &herdr_projects::migration::ConfigReference, name: &str, version: &str) -> FrozenProfile {
+fn sim_profile(config: &herdr_farm::migration::ConfigReference, name: &str, version: &str) -> FrozenProfile {
     let evidence = VersionedReference {
         id: "sim-evidence".into(),
         revision: 1,
@@ -1723,11 +1723,11 @@ fn planning_gate_ten_logical_workers() {
 
     let config_path = tmp.path().join("owner.toml");
     fs::write(&config_path, "version = 1\n").unwrap();
-    let config = herdr_projects::migration::config_reference(&config_path).unwrap();
+    let config = herdr_farm::migration::config_reference(&config_path).unwrap();
     let digest = config.digest.clone().unwrap();
 
     let mut db = SqliteStore::create(&db_path).unwrap();
-    assert_eq!(db.read_snapshot(None).unwrap().schema_version, herdr_projects::store::SCHEMA);
+    assert_eq!(db.read_snapshot(None).unwrap().schema_version, herdr_farm::store::SCHEMA);
     let workers: Vec<String> = (0..10).map(|index| format!("w-{index:02}")).collect();
     db.commit(Commit {
         expected_head: 0,
@@ -1803,14 +1803,14 @@ fn planning_gate_ten_logical_workers() {
                     .find(|task| &task.id == id)
                     .map(|task| task.revision)
             });
-            herdr_projects::reconcile::RuntimeObservation {
+            herdr_farm::reconcile::RuntimeObservation {
                 binding: binding.id.clone(),
                 binding_revision: binding.revision,
                 task_revision,
                 observed_unix_ms: now,
                 collector: "herdr-git-v1".into(),
                 config_digest: Some(digest.clone()),
-                ..herdr_projects::reconcile::RuntimeObservation::default()
+                ..herdr_farm::reconcile::RuntimeObservation::default()
             }
         })
         .collect::<Vec<_>>();
@@ -1861,7 +1861,7 @@ fn planning_gate_ten_logical_workers() {
         }
         tx.commit().unwrap();
     }
-    assert!(!herdr_projects::admission::wake_enabled(&project));
+    assert!(!herdr_farm::admission::wake_enabled(&project));
     {
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         let flag: String = conn
@@ -1879,12 +1879,12 @@ fn planning_gate_ten_logical_workers() {
         )
         .unwrap();
     }
-    assert!(herdr_projects::admission::wake_enabled(&project));
+    assert!(herdr_farm::admission::wake_enabled(&project));
 
     // Compare actual public admission SQL work before/after retained evidence
     // grows. Repeated observations must not multiply capability lookup work.
-    herdr_projects::admission::admit_decision_observed(&project).result.unwrap();
-    let baseline=herdr_projects::admission::admit_decision_observed(&project);
+    herdr_farm::admission::admit_decision_observed(&project).result.unwrap();
+    let baseline=herdr_farm::admission::admit_decision_observed(&project);
     let baseline_reason=baseline.result.unwrap().reason;
     {
         let mut conn=rusqlite::Connection::open(&db_path).unwrap();
@@ -1896,7 +1896,7 @@ fn planning_gate_ten_logical_workers() {
         }
         tx.commit().unwrap();
     }
-    let retained=herdr_projects::admission::admit_decision_observed(&project);
+    let retained=herdr_farm::admission::admit_decision_observed(&project);
     assert_eq!(retained.result.unwrap().reason,baseline_reason);
     assert!(baseline.sql.connection_observed && retained.sql.connection_observed);
     println!("capability history SQL VM steps: baseline={}, retained={}",baseline.sql.sqlite_vm_steps,retained.sql.sqlite_vm_steps);
@@ -1906,25 +1906,25 @@ fn planning_gate_ten_logical_workers() {
     let mut reserved = Vec::new();
     for _ in 0..workers.len() {
         worker_snapshots(&project);
-        let Some(inputs) = herdr_projects::admission::prepared_admission_inputs(&project).unwrap()
+        let Some(inputs) = herdr_farm::admission::prepared_admission_inputs(&project).unwrap()
         else {
             break;
         };
         let task = inputs.task.as_str().to_string();
         insert_grant(&db_path, &inputs);
         let before = sql_count(&db_path, "SELECT count(*) FROM attempts");
-        herdr_projects::admission::admit_once(&project).unwrap();
+        herdr_farm::admission::admit_once(&project).unwrap();
         let after = sql_count(&db_path, "SELECT count(*) FROM attempts");
         assert_eq!(after, before + 1, "admission did not reserve {task}");
         reserved.push(task);
     }
     assert!(
-        herdr_projects::admission::prepared_admission_inputs(&project)
+        herdr_farm::admission::prepared_admission_inputs(&project)
             .unwrap()
             .is_none(),
         "a blocked worker was still ready"
     );
-    herdr_projects::admission::admit_once(&project).unwrap();
+    herdr_farm::admission::admit_once(&project).unwrap();
     assert_eq!(
         reserved.len(),
         9,
@@ -1982,7 +1982,7 @@ fn planning_gate_ten_logical_workers() {
             .submit_result(&serde_json::to_vec(&submission).unwrap())
             .unwrap();
         assert!(!receipt.replayed);
-        let request = herdr_projects::verification::VerifyRequest::new(
+        let request = herdr_farm::verification::VerifyRequest::new(
             receipt.submission_id,
             "builds",
             &mismatch,
@@ -1990,7 +1990,7 @@ fn planning_gate_ten_logical_workers() {
             Duration::from_secs(5),
             &work,
         );
-        let outcome = herdr_projects::verification::verify(&mut db, &request).unwrap();
+        let outcome = herdr_farm::verification::verify(&mut db, &request).unwrap();
         assert_eq!(outcome.state, "rejected", "{:?}", outcome.reason);
         assert_eq!(outcome.reason.as_deref(), Some("policy_digest_mismatch"));
         assert!(outcome.receipt.is_none());
@@ -2257,10 +2257,10 @@ fn memory_project() -> MemoryProject {
         r#"{"status":"paused"}"#,
     )
     .unwrap();
-    let plan = herdr_projects::migration::inspect_with_config(&project, &config).unwrap();
-    herdr_projects::migration::apply(&project, &plan, true).unwrap();
-    let state = herdr_projects::runtime::snapshot(&project).unwrap();
-    herdr_projects::runtime::set_state(
+    let plan = herdr_farm::migration::inspect_with_config(&project, &config).unwrap();
+    herdr_farm::migration::apply(&project, &plan, true).unwrap();
+    let state = herdr_farm::runtime::snapshot(&project).unwrap();
+    herdr_farm::runtime::set_state(
         &project,
         state.head,
         state.control.unwrap().revision,
@@ -2269,10 +2269,10 @@ fn memory_project() -> MemoryProject {
     )
     .unwrap();
     assert_eq!(
-        herdr_projects::runtime::snapshot(&project)
+        herdr_farm::runtime::snapshot(&project)
             .unwrap()
             .schema_version,
-        herdr_projects::store::SCHEMA
+        herdr_farm::store::SCHEMA
     );
     MemoryProject { tmp, project, key }
 }
@@ -2304,7 +2304,7 @@ fn sign_review(key: &Path, path: &Path, bytes: &[u8]) -> PathBuf {
         Command::new("/usr/bin/ssh-keygen")
             .args(["-Y", "sign", "-f"])
             .arg(key)
-            .args(["-n", herdr_projects::authority::MEMORY_REVIEW_NAMESPACE])
+            .args(["-n", herdr_farm::authority::MEMORY_REVIEW_NAMESPACE])
             .arg(path)
             .status()
             .unwrap()
@@ -2385,11 +2385,11 @@ fn memory_read_set(project: &Path) -> MemoryReadSet {
 
 #[cfg(target_os = "linux")]
 fn add_task_snapshot(project: &Path, task: &str, domains: &[&str], instructions: &str) -> String {
-    let head = herdr_projects::runtime::snapshot(project).unwrap().head;
-    herdr_projects::runtime::add_task(project, TaskId::new(task).unwrap(), task.into(), head)
+    let head = herdr_farm::runtime::snapshot(project).unwrap().head;
+    herdr_farm::runtime::add_task(project, TaskId::new(task).unwrap(), task.into(), head)
         .unwrap();
-    let mut memory = herdr_projects::memory::MemoryStore::from_sqlite(
-        herdr_projects::migration::open_active(project).unwrap(),
+    let mut memory = herdr_farm::memory::MemoryStore::from_sqlite(
+        herdr_farm::migration::open_active(project).unwrap(),
         project.join(".state/objects"),
     );
     let snap = memory
@@ -2417,7 +2417,7 @@ fn add_task_snapshot(project: &Path, task: &str, domains: &[&str], instructions:
 
 #[cfg(target_os = "linux")]
 fn bind_attempt(project: &Path, task: &str, attempt: &str, snapshot: &str) {
-    let mut db = herdr_projects::migration::open_active(project).unwrap();
+    let mut db = herdr_farm::migration::open_active(project).unwrap();
     let head = db.read_snapshot(None).unwrap().head;
     db.commit(Commit {
         expected_head: head,
@@ -2447,8 +2447,8 @@ fn propose_observation(
     key: &str,
     domain: &str,
 ) -> String {
-    let mut memory = herdr_projects::memory::MemoryStore::from_sqlite(
-        herdr_projects::migration::open_active(project).unwrap(),
+    let mut memory = herdr_farm::memory::MemoryStore::from_sqlite(
+        herdr_farm::migration::open_active(project).unwrap(),
         project.join(".state/objects"),
     );
     let body = memory.ingest_object(key.as_bytes()).unwrap();
@@ -2492,7 +2492,7 @@ fn review_proposal(
     key: &str,
     read_set_version: Option<u32>,
 ) -> ReviewDecision {
-    let head = herdr_projects::runtime::snapshot(&fixture.project)
+    let head = herdr_farm::runtime::snapshot(&fixture.project)
         .unwrap()
         .head;
     let doc = MemoryReviewAuthorization {
@@ -2502,7 +2502,7 @@ fn review_proposal(
             .unwrap()
             .display()
             .to_string(),
-        authority: herdr_projects::authority::policy_reference(&fixture.project).unwrap(),
+        authority: herdr_farm::authority::policy_reference(&fixture.project).unwrap(),
         expected_head: head,
         expires_unix_ms: jiff::Timestamp::now().as_millisecond() + 60_000,
         proposal_digest: digest.into(),
@@ -2520,7 +2520,7 @@ fn review_proposal(
     };
     let path = fixture.tmp.path().join(format!("{proposal}.json"));
     let sig = sign_review(&fixture.key, &path, &serde_json::to_vec(&doc).unwrap());
-    herdr_projects::authority::review_memory_proposal(&fixture.project, proposal, &path, &sig, head)
+    herdr_farm::authority::review_memory_proposal(&fixture.project, proposal, &path, &sig, head)
         .unwrap()
 }
 
@@ -2578,10 +2578,10 @@ fn memory_two_domains_promote_and_same_head_conflicts() {
     );
     let ui_review = review_proposal(&fixture, "mp-ui", &ui_digest, "ui.copy", Some(2));
     let api_promoted =
-        herdr_projects::authority::promote_memory_proposal(project, "mp-api", &api_review.id)
+        herdr_farm::authority::promote_memory_proposal(project, "mp-api", &api_review.id)
             .unwrap();
     let ui_promoted =
-        herdr_projects::authority::promote_memory_proposal(project, "mp-ui", &ui_review.id)
+        herdr_farm::authority::promote_memory_proposal(project, "mp-ui", &ui_review.id)
             .unwrap();
     assert!(!api_promoted.reused);
     assert!(!ui_promoted.reused);
@@ -2591,7 +2591,7 @@ fn memory_two_domains_promote_and_same_head_conflicts() {
             .iter()
             .all(|id| !ui_promoted.change_ids.contains(id))
     );
-    let mut db = herdr_projects::migration::open_active(project).unwrap();
+    let mut db = herdr_farm::migration::open_active(project).unwrap();
     let api = db
         .memory_record_by_key("api.error-envelope")
         .unwrap()
@@ -2646,20 +2646,20 @@ fn memory_two_domains_promote_and_same_head_conflicts() {
         .unwrap();
     }
     let stored = {
-        let mut db = herdr_projects::migration::open_active(project).unwrap();
+        let mut db = herdr_farm::migration::open_active(project).unwrap();
         db.review_decision("rev-same-b").unwrap().unwrap()
     };
     assert_eq!(event_head(&stored), shared_head);
     let promoted =
-        herdr_projects::authority::promote_memory_proposal(project, "mp-same-a", &first_review.id)
+        herdr_farm::authority::promote_memory_proposal(project, "mp-same-a", &first_review.id)
             .unwrap();
     assert!(!promoted.reused);
     let conflict =
-        herdr_projects::authority::promote_memory_proposal(project, "mp-same-b", "rev-same-b")
+        herdr_farm::authority::promote_memory_proposal(project, "mp-same-b", "rev-same-b")
             .unwrap_err();
     let text = format!("{conflict:#}").to_ascii_lowercase();
     assert!(text.contains("conflict"), "{conflict:#}");
-    let mut db = herdr_projects::migration::open_active(project).unwrap();
+    let mut db = herdr_farm::migration::open_active(project).unwrap();
     assert!(db.memory_promotion("mp-same-a").unwrap().is_some());
     assert!(db.memory_promotion("mp-same-b").unwrap().is_none());
     assert!(db.memory_record_by_key("api.same-b").unwrap().is_none());
@@ -2688,11 +2688,11 @@ fn memory_retired_subscription_keeps_the_pending_obligation() {
         "notes",
     );
     let first_review = review_proposal(&fixture, "mp-note-1", &first_digest, "notes.one", None);
-    herdr_projects::authority::promote_memory_proposal(project, "mp-note-1", &first_review.id)
+    herdr_farm::authority::promote_memory_proposal(project, "mp-note-1", &first_review.id)
         .unwrap();
     let successor = {
-        let mut memory = herdr_projects::memory::MemoryStore::from_sqlite(
-            herdr_projects::migration::open_active(project).unwrap(),
+        let mut memory = herdr_farm::memory::MemoryStore::from_sqlite(
+            herdr_farm::migration::open_active(project).unwrap(),
             project.join(".state/objects"),
         );
         memory
@@ -2719,7 +2719,7 @@ fn memory_retired_subscription_keeps_the_pending_obligation() {
             .as_str()
             .to_string()
     };
-    let mut db = herdr_projects::migration::open_active(project).unwrap();
+    let mut db = herdr_farm::migration::open_active(project).unwrap();
     let pending = intents_for(&mut db, "mp-note-1");
     let delivery = pending
         .iter()
@@ -2776,9 +2776,9 @@ fn memory_retired_subscription_keeps_the_pending_obligation() {
         "notes",
     );
     let second_review = review_proposal(&fixture, "mp-note-2", &second_digest, "notes.two", None);
-    herdr_projects::authority::promote_memory_proposal(project, "mp-note-2", &second_review.id)
+    herdr_farm::authority::promote_memory_proposal(project, "mp-note-2", &second_review.id)
         .unwrap();
-    let mut db = herdr_projects::migration::open_active(project).unwrap();
+    let mut db = herdr_farm::migration::open_active(project).unwrap();
     let fresh = intents_for(&mut db, "mp-note-2");
     assert!(fresh.iter().all(|row| row["snapshot_id"] != reader));
     assert!(fresh.iter().any(|row| row["snapshot_id"] == successor));
@@ -2813,8 +2813,8 @@ fn memory_package_gap_and_coordinator_ack_without_an_attempt() {
     let writer = add_task_snapshot(project, "writer", &["pkg"], "writer instructions");
     bind_attempt(project, "writer", "writer-attempt", &writer);
     let coordinator = {
-        let mut memory = herdr_projects::memory::MemoryStore::from_sqlite(
-            herdr_projects::migration::open_active(project).unwrap(),
+        let mut memory = herdr_farm::memory::MemoryStore::from_sqlite(
+            herdr_farm::migration::open_active(project).unwrap(),
             project.join(".state/objects"),
         );
         memory
@@ -2842,9 +2842,9 @@ fn memory_package_gap_and_coordinator_ack_without_an_attempt() {
         "pkg",
     );
     let first_review = review_proposal(&fixture, "mp-pkg-a", &first_digest, "pkg.a", None);
-    herdr_projects::authority::promote_memory_proposal(project, "mp-pkg-a", &first_review.id)
+    herdr_farm::authority::promote_memory_proposal(project, "mp-pkg-a", &first_review.id)
         .unwrap();
-    let mut db = herdr_projects::migration::open_active(project).unwrap();
+    let mut db = herdr_farm::migration::open_active(project).unwrap();
     let binding = db
         .consumer_binding_for_snapshot(&coordinator)
         .unwrap()
@@ -2865,9 +2865,9 @@ fn memory_package_gap_and_coordinator_ack_without_an_attempt() {
         "pkg",
     );
     let second_review = review_proposal(&fixture, "mp-pkg-b", &second_digest, "pkg.b", None);
-    herdr_projects::authority::promote_memory_proposal(project, "mp-pkg-b", &second_review.id)
+    herdr_farm::authority::promote_memory_proposal(project, "mp-pkg-b", &second_review.id)
         .unwrap();
-    let mut db = herdr_projects::migration::open_active(project).unwrap();
+    let mut db = herdr_farm::migration::open_active(project).unwrap();
     let new_id = intents_for(&mut db, "mp-pkg-b")
         .iter()
         .find(|row| row["snapshot_id"] == coordinator)
@@ -2878,7 +2878,7 @@ fn memory_package_gap_and_coordinator_ack_without_an_attempt() {
     assert!(!first.change_ids.contains(&new_id));
     let attempts = sql_count(&state_db(project), "SELECT count(*) FROM attempts");
     assert_eq!(attempts, 1);
-    let seen = herdr_projects::store::UpdatePackageAck {
+    let seen = herdr_farm::store::UpdatePackageAck {
         schema_version: 1,
         package_id: first.package_id.clone(),
         manifest_hash: first.manifest_hash.clone(),
@@ -3025,8 +3025,8 @@ fn seed_barrier_member(path: &Path, task: &str) -> BarrierSeed {
 }
 
 #[cfg(target_os = "linux")]
-fn barrier_member(seed: &BarrierSeed) -> herdr_projects::store::BarrierMember {
-    herdr_projects::store::BarrierMember {
+fn barrier_member(seed: &BarrierSeed) -> herdr_farm::store::BarrierMember {
+    herdr_farm::store::BarrierMember {
         task_id: seed.task.clone(),
         contract_revision: 1,
         attempt_id: seed.attempt.clone(),
@@ -3108,7 +3108,7 @@ fn scale_case(history_events: usize, workers: usize, additional_attempts: usize)
     assert_eq!(db.current_head().unwrap(), history_events as u64);
     assert_eq!(
         db.read_targeted_hot_path(0, true).unwrap(),
-        herdr_projects::store::SCHEMA
+        herdr_farm::store::SCHEMA
     );
 
     let ids: Vec<TaskId> = (0..workers)
@@ -3290,16 +3290,16 @@ fn scale_case(history_events: usize, workers: usize, additional_attempts: usize)
     // One page that does not reach the end is not coverage and cannot release a slot.
     let stopped = db.reconcile_active_work(Some(1)).unwrap();
     assert!(!stopped.capacity_release_allowed, "slot released early");
-    if workers >= herdr_projects::store::ACTIVE_WORK_PAGE {
+    if workers >= herdr_farm::store::ACTIVE_WORK_PAGE {
         assert_eq!(
             stopped.coverage,
-            herdr_projects::store::ActiveCoverage::Incomplete
+            herdr_farm::store::ActiveCoverage::Incomplete
         );
     }
     let covered = db.reconcile_active_work(None).unwrap();
     assert_eq!(
         covered.coverage,
-        herdr_projects::store::ActiveCoverage::Complete
+        herdr_farm::store::ActiveCoverage::Complete
     );
     assert_eq!(covered.items.len(), workers);
     assert!(covered.items.iter().all(|item| item.retains_capacity));
@@ -3314,7 +3314,7 @@ fn scale_case(history_events: usize, workers: usize, additional_attempts: usize)
     }
     assert_eq!(
         db.read_targeted_hot_path(now, true).unwrap(),
-        herdr_projects::store::SCHEMA
+        herdr_farm::store::SCHEMA
     );
 
     let cancelled = db
@@ -3357,7 +3357,7 @@ fn scale_case(history_events: usize, workers: usize, additional_attempts: usize)
     let after = db.reconcile_active_work(None).unwrap();
     assert_eq!(
         after.coverage,
-        herdr_projects::store::ActiveCoverage::Complete
+        herdr_farm::store::ActiveCoverage::Complete
     );
     assert_eq!(after.items.len(), workers - 1);
     assert!(!after.capacity_release_allowed, "remaining slots released early");
@@ -3397,7 +3397,7 @@ fn scale_case(history_events: usize, workers: usize, additional_attempts: usize)
     let mut measured_work=None;
     for _ in 0..5 {
         let started=std::time::Instant::now();
-        let observation=herdr_projects::admission::admit_decision_observed(tmp.path());
+        let observation=herdr_farm::admission::admit_decision_observed(tmp.path());
         let elapsed_us=started.elapsed().as_micros();
         let decision=observation.result.unwrap();
         assert_ne!(decision.reason,"reserved");
@@ -3422,11 +3422,11 @@ fn scale_case(history_events: usize, workers: usize, additional_attempts: usize)
 #[test]
 fn scale_gate_for_32_and_64_workers() {
     assert_eq!(
-        herdr_projects::store::HOT_PATH_READ,
-        herdr_projects::store::HotPathRead::Targeted
+        herdr_farm::store::HOT_PATH_READ,
+        herdr_farm::store::HotPathRead::Targeted
     );
     assert!(
-        !herdr_projects::store::hot_path_uses_snapshot(),
+        !herdr_farm::store::hot_path_uses_snapshot(),
         "hot path is still shadow / Snapshot"
     );
     let mut work_by_workers=BTreeMap::new();
@@ -3474,7 +3474,7 @@ fn fault_campaign_and_restore_rehearsal() {
     let old_attempt = AttemptId::new("attempt-old").unwrap();
     let due = unix_ms();
     let mut db = SqliteStore::create(&db_path).unwrap();
-    assert_eq!(db.read_snapshot(None).unwrap().schema_version, herdr_projects::store::SCHEMA);
+    assert_eq!(db.read_snapshot(None).unwrap().schema_version, herdr_farm::store::SCHEMA);
     let op = operation("op-1", &task_id, "env-1", due);
     db.commit(Commit {
         expected_head: 0,
@@ -3510,7 +3510,7 @@ fn fault_campaign_and_restore_rehearsal() {
         mutations: vec![Mutation::Enqueue(operation("op-2", &task_id, "env-1", due))],
     });
     assert!(
-        matches!(duplicate, Err(herdr_projects::store::StoreError::Conflict)),
+        matches!(duplicate, Err(herdr_farm::store::StoreError::Conflict)),
         "{duplicate:?}"
     );
     assert_eq!(db.read_snapshot(None).unwrap().operations.len(), 1);
@@ -3558,7 +3558,7 @@ fn fault_campaign_and_restore_rehearsal() {
         due,
     );
     assert!(
-        matches!(conflict, Err(herdr_projects::store::StoreError::Invalid(ref message)) if message.contains("idempotency")),
+        matches!(conflict, Err(herdr_farm::store::StoreError::Invalid(ref message)) if message.contains("idempotency")),
         "{conflict:?}"
     );
     assert_eq!(
@@ -3592,7 +3592,7 @@ fn fault_campaign_and_restore_rehearsal() {
     assert!(db
         .finish_operation(
             &claim,
-            herdr_projects::operations::Outcome::Confirmed {
+            herdr_farm::operations::Outcome::Confirmed {
                 observed_identity: "old-attempt".into(),
             },
             due,
@@ -3608,7 +3608,7 @@ fn fault_campaign_and_restore_rehearsal() {
         .unwrap();
     assert_eq!(
         delivery.state,
-        herdr_projects::operations::DeliveryState::Ambiguous
+        herdr_farm::operations::DeliveryState::Ambiguous
     );
     assert_eq!(delivery.attempts, 1);
     assert!(db
@@ -3709,7 +3709,7 @@ fn fault_campaign_and_restore_rehearsal() {
     conflicting["claimed_checks"] = serde_json::json!(["different payload"]);
     let rejected = db.submit_result(&serde_json::to_vec(&conflicting).unwrap());
     assert!(
-        matches!(rejected, Err(herdr_projects::store::StoreError::Conflict)),
+        matches!(rejected, Err(herdr_farm::store::StoreError::Conflict)),
         "{rejected:?}"
     );
     assert_eq!(
@@ -3722,7 +3722,7 @@ fn fault_campaign_and_restore_rehearsal() {
     fs::write(&mismatch, b"{\"version\":1,\"checks\":[\"/bin/false\"]}").unwrap();
     let other = work.join("other-policy.json");
     fs::write(&other, b"{\"version\":1,\"checks\":[\"/bin/true\"]}").unwrap();
-    let request = herdr_projects::verification::VerifyRequest::new(
+    let request = herdr_farm::verification::VerifyRequest::new(
         stored.submission_id.clone(),
         "builds",
         &mismatch,
@@ -3730,15 +3730,15 @@ fn fault_campaign_and_restore_rehearsal() {
         Duration::from_secs(5),
         &work,
     );
-    let outcome = herdr_projects::verification::verify(&mut db, &request).unwrap();
+    let outcome = herdr_farm::verification::verify(&mut db, &request).unwrap();
     assert_eq!(outcome.state, "rejected");
     assert!(!outcome.replayed);
-    let replay = herdr_projects::verification::verify(&mut db, &request).unwrap();
+    let replay = herdr_farm::verification::verify(&mut db, &request).unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.run_id, outcome.run_id);
     let mut changed = request;
     changed.policy_path = other;
-    match herdr_projects::verification::verify(&mut db, &changed) {
+    match herdr_farm::verification::verify(&mut db, &changed) {
         Err(conflict) => assert!(
             conflict.to_string().contains("idempotency conflict"),
             "{conflict}"
@@ -3755,11 +3755,11 @@ fn fault_campaign_and_restore_rehearsal() {
     fs::write(&policy, PLANNING_POLICY).unwrap();
     let verify_receipt = |db: &mut SqliteStore, key: &str| {
         fs::create_dir(tmp.path().join(key)).unwrap();
-        let request = herdr_projects::verification::VerifyRequest::new(
+        let request = herdr_farm::verification::VerifyRequest::new(
             stored.submission_id.clone(), "builds", &policy, key,
             Duration::from_secs(30), tmp.path().join(key),
         );
-        let outcome = herdr_projects::verification::verify(db, &request).unwrap();
+        let outcome = herdr_farm::verification::verify(db, &request).unwrap();
         assert_eq!(outcome.state, "accepted", "{:?}", outcome.reason);
         outcome.receipt.unwrap().result_id().to_string()
     };
@@ -3929,7 +3929,7 @@ fn fault_campaign_and_restore_rehearsal() {
         1,
     );
     assert!(
-        matches!(release, Err(herdr_projects::store::StoreError::Invalid(ref message)) if message.contains("revoked")),
+        matches!(release, Err(herdr_farm::store::StoreError::Invalid(ref message)) if message.contains("revoked")),
         "{release:?}"
     );
     let head = db.read_snapshot(None).unwrap().head;
@@ -3965,22 +3965,22 @@ fn fault_campaign_and_restore_rehearsal() {
     assert_eq!(fs::canonicalize(&alias).unwrap(), git_dir);
     let footprint = |project: &Path| {
         vec![
-            herdr_projects::execution_guard::Resource::new(
+            herdr_farm::execution_guard::Resource::new(
                 "artifact",
                 project.canonicalize().unwrap().to_str().unwrap(),
             )
             .unwrap(),
-            herdr_projects::execution_guard::Resource::new("git", git_dir.to_str().unwrap())
+            herdr_farm::execution_guard::Resource::new("git", git_dir.to_str().unwrap())
                 .unwrap(),
         ]
     };
-    let owner = herdr_projects::execution_guard::ProjectSharedGuard::acquire(
+    let owner = herdr_farm::execution_guard::ProjectSharedGuard::acquire(
         &root.join("a"),
         &footprint(&root.join("a")),
     )
     .unwrap();
     assert!(
-        herdr_projects::execution_guard::ProjectSharedGuard::acquire(
+        herdr_farm::execution_guard::ProjectSharedGuard::acquire(
             &root.join("b"),
             &footprint(&root.join("b"))
         )
@@ -3989,8 +3989,8 @@ fn fault_campaign_and_restore_rehearsal() {
     );
     drop(owner);
     let project_lock =
-        herdr_projects::execution_guard::ProjectGuard::acquire(&root.join("b")).unwrap();
-    herdr_projects::execution_guard::ProjectSharedGuard::acquire(
+        herdr_farm::execution_guard::ProjectGuard::acquire(&root.join("b")).unwrap();
+    herdr_farm::execution_guard::ProjectSharedGuard::acquire(
         &root.join("a"),
         &footprint(&root.join("a")),
     )
@@ -3998,9 +3998,9 @@ fn fault_campaign_and_restore_rehearsal() {
     drop(project_lock);
     fs::remove_dir_all(root.join("sneaky/.state")).unwrap();
     std::os::unix::fs::symlink(root.join("a/.state"), root.join("sneaky/.state")).unwrap();
-    assert!(herdr_projects::execution_guard::ProjectGuard::acquire(&root.join("sneaky")).is_err());
+    assert!(herdr_farm::execution_guard::ProjectGuard::acquire(&root.join("sneaky")).is_err());
     assert!(
-        herdr_projects::execution_guard::ProjectSharedGuard::acquire(
+        herdr_farm::execution_guard::ProjectSharedGuard::acquire(
             &root.join("sneaky"),
             &footprint(&root.join("sneaky"))
         )
@@ -4060,19 +4060,19 @@ fn fault_campaign_and_restore_rehearsal() {
     });
     assert!(started.elapsed() < Duration::from_secs(3));
     assert!(
-        matches!(busy, Err(herdr_projects::store::StoreError::Busy)),
+        matches!(busy, Err(herdr_farm::store::StoreError::Busy)),
         "{busy:?}"
     );
     assert_eq!(db.read_snapshot(None).unwrap().tasks, before.tasks);
     raw.execute_batch("ROLLBACK").unwrap();
     drop(raw);
-    assert!(herdr_projects::watchdog::note(
+    assert!(herdr_farm::watchdog::note(
         &busy_project,
-        &herdr_projects::store::StoreError::Busy
+        &herdr_farm::store::StoreError::Busy
     )
     .unwrap());
     assert_eq!(
-        herdr_projects::watchdog::pause_reason(&busy_project),
+        herdr_farm::watchdog::pause_reason(&busy_project),
         Some("database_busy")
     );
     assert_eq!(sql_count(&busy_path, "SELECT count(*) FROM attempts"), 1);
@@ -4097,16 +4097,16 @@ fn fault_campaign_and_restore_rehearsal() {
     assert!(Command::new("/usr/bin/ssh-keygen")
         .args(["-Y", "sign", "-f"])
         .arg(&published.key)
-        .args(["-n", herdr_projects::authority::SIGNATURE_NAMESPACE])
+        .args(["-n", herdr_farm::authority::SIGNATURE_NAMESPACE])
         .arg(&bad)
         .status()
         .unwrap()
         .success());
     let signature = PathBuf::from(format!("{}.sig", bad.display()));
     assert!(
-        herdr_projects::authority::import_contract(&published.project, &bad, &signature).is_err()
+        herdr_farm::authority::import_contract(&published.project, &bad, &signature).is_err()
     );
-    let denials = herdr_projects::authority::denials(&published.project).unwrap();
+    let denials = herdr_farm::authority::denials(&published.project).unwrap();
     assert!(denials.iter().any(|denial| {
         denial.class == "contract"
             && denial.command == "put"
@@ -4120,18 +4120,18 @@ fn fault_campaign_and_restore_rehearsal() {
     let live_bytes = fs::read(&published_db).unwrap();
 
     let destination = published.tmp.path().join("restored");
-    herdr_projects::migration::restore_backup(&published.project, &destination).unwrap();
+    herdr_farm::migration::restore_backup(&published.project, &destination).unwrap();
     assert!(!destination.join(".state/state.db").exists());
     assert!(!destination.join(".state/format.json").exists());
     assert_eq!(fs::read(&published_db).unwrap(), live_bytes);
-    assert!(herdr_projects::migration::restore_backup(&published.project, &destination).is_err());
+    assert!(herdr_farm::migration::restore_backup(&published.project, &destination).is_err());
     let new_store = destination.join(".state/state.db");
     assert!(new_store.is_absolute());
     assert!(!new_store.exists());
     assert_ne!(new_store.display().to_string(), old_store);
     let config_path = tmp.path().join("grant-owner.toml");
     fs::write(&config_path, "version = 1\n").unwrap();
-    let config = herdr_projects::migration::config_reference(&config_path).unwrap();
+    let config = herdr_farm::migration::config_reference(&config_path).unwrap();
     let profile = plant_profile(&db_path, &config);
     let mut inputs: LaunchInputs =
         serde_json::from_str(include_str!("fixtures/launch-inputs-v1.json")).unwrap();
@@ -4167,21 +4167,21 @@ fn fault_campaign_and_restore_rehearsal() {
     );
 
     fs::remove_file(published.project.join(".state/format.json")).unwrap();
-    assert!(herdr_projects::migration::open_active(&published.project).is_err());
-    assert!(herdr_projects::migration::recover(&published.project, true).is_err());
+    assert!(herdr_farm::migration::open_active(&published.project).is_err());
+    assert!(herdr_farm::migration::recover(&published.project, true).is_err());
     assert_eq!(fs::read(&published_db).unwrap(), live_bytes);
     assert!(published_db.is_file());
     assert_eq!(
-        herdr_projects::migration::status(&published.project)
+        herdr_farm::migration::status(&published.project)
             .unwrap()
             .phase,
-        herdr_projects::migration::Phase::Active
+        herdr_farm::migration::Phase::Active
     );
     assert!(published
         .project
         .join(".state/migration/journal.json")
         .is_file());
-    assert!(herdr_projects::migration::abort(&published.project).is_err());
+    assert!(herdr_farm::migration::abort(&published.project).is_err());
 }
 
 /// Real verifier public ingress: Git emits fixture test output from the retained
@@ -4222,8 +4222,8 @@ fn verification_receipts_capture_load_and_bounded_test_metadata() {
             "attempt_id":attempt,"repository":repo,"base_oid":oid,"candidate_oid":oid,"object_format":"sha1","artifact_manifest":[],"claimed_checks":[],"objects":objects})).unwrap()).unwrap();
         let policy = tmp.path().join("policy.json");fs::write(&policy,body).unwrap();
         let work = tmp.path().join("scratch");fs::create_dir(&work).unwrap();
-        let request = herdr_projects::verification::VerifyRequest::new(submission.submission_id,"builds",&policy,"verify",Duration::from_secs(30),&work);
-        let outcome = herdr_projects::verification::verify(&mut store,&request).unwrap();
+        let request = herdr_farm::verification::VerifyRequest::new(submission.submission_id,"builds",&policy,"verify",Duration::from_secs(30),&work);
+        let outcome = herdr_farm::verification::verify(&mut store,&request).unwrap();
         assert_eq!(outcome.state,"accepted","{case}: {:?}",outcome.reason);
         let metadata:String = raw.query_row("SELECT metadata FROM verification_runs WHERE run_id=?1",[&outcome.run_id],|r|r.get(0)).unwrap();
         let metadata:serde_json::Value=serde_json::from_str(&metadata).unwrap();
@@ -4235,11 +4235,11 @@ fn verification_receipts_capture_load_and_bounded_test_metadata() {
             None => { assert_eq!(metadata["tests"]["status"],"unavailable","{case}");assert_eq!(metadata["tests"]["results"],serde_json::json!([]),"{case}"); }
         }
         assert!(!metadata.to_string().contains("PRIVATE-BODY"));
-        let replay=herdr_projects::verification::verify(&mut store,&request).unwrap();assert!(replay.replayed);
+        let replay=herdr_farm::verification::verify(&mut store,&request).unwrap();assert!(replay.replayed);
         assert_eq!(raw.query_row("SELECT count(*) FROM verification_runs",[],|r|r.get::<_,i64>(0)).unwrap(),1);
         // A fresh run after the first has finished must not count a stale slot.
-        let next = herdr_projects::verification::VerifyRequest::new(request.submission_id.clone(),"builds",&policy,"verify-again",Duration::from_secs(30),&work);
-        let rerun=herdr_projects::verification::verify(&mut store,&next).unwrap();
+        let next = herdr_farm::verification::VerifyRequest::new(request.submission_id.clone(),"builds",&policy,"verify-again",Duration::from_secs(30),&work);
+        let rerun=herdr_farm::verification::verify(&mut store,&next).unwrap();
         let rerun_metadata:String=raw.query_row("SELECT metadata FROM verification_runs WHERE run_id=?1",[rerun.run_id],|r|r.get(0)).unwrap();
         assert_eq!(serde_json::from_str::<serde_json::Value>(&rerun_metadata).unwrap()["load"]["project_concurrent_runs"],1);
     }
@@ -4317,9 +4317,9 @@ fn main() {
             "attempt_id":attempt,"repository":repo,"base_oid":oid,"candidate_oid":oid,"object_format":"sha1","artifact_manifest":[],"claimed_checks":[],"objects":objects})).unwrap()).unwrap();
         let policy_path = tmp.path().join("policy.json"); fs::write(&policy_path,&policy).unwrap();
         fs::create_dir(&work).unwrap();
-        let request = herdr_projects::verification::VerifyRequest::new(submission.submission_id,"builds",&policy_path,"verify",
+        let request = herdr_farm::verification::VerifyRequest::new(submission.submission_id,"builds",&policy_path,"verify",
             Duration::from_secs(if case == "budget" { 1 } else { 30 }),&work);
-        let outcome = herdr_projects::verification::verify(&mut store,&request).unwrap();
+        let outcome = herdr_farm::verification::verify(&mut store,&request).unwrap();
         assert_eq!(outcome.state,"rejected", "{case}: {:?}",outcome.reason);
         assert!(outcome.receipt.is_none());
         assert_eq!(outcome.reason.as_deref(),Some(if case == "budget" {"timeout"} else {"checks_failed"}),"{case}");
@@ -4342,11 +4342,11 @@ fn main() {
                 assert_eq!(observations[1]["outcome"],"pass");
                 assert_eq!(observations[1]["tests"]["results"],serde_json::json!([{"name":"racy","outcome":"pass"}]));
                 for _ in 0..2 {
-                    let collect = Command::new(env!("CARGO_BIN_EXE_herdr-projects")).env_clear().env("HOME",tmp.path())
+                    let collect = Command::new(env!("CARGO_BIN_EXE_herdr-farm")).env_clear().env("HOME",tmp.path())
                         .args(["--root",tmp.path().to_str().unwrap(),"telemetry","project","quality","collect"]).output().unwrap();
                     assert!(collect.status.success(),"{}",String::from_utf8_lossy(&collect.stderr));
                 }
-                let report = Command::new(env!("CARGO_BIN_EXE_herdr-projects")).env_clear().env("HOME",tmp.path())
+                let report = Command::new(env!("CARGO_BIN_EXE_herdr-farm")).env_clear().env("HOME",tmp.path())
                     .args(["--root",tmp.path().to_str().unwrap(),"telemetry","project","quality","flaky"]).output().unwrap();
                 assert!(report.status.success(),"{}",String::from_utf8_lossy(&report.stderr));
                 let report:serde_json::Value=serde_json::from_slice(&report.stdout).unwrap();
@@ -4359,7 +4359,7 @@ fn main() {
                 assert!(observations.iter().any(|row|row["outcome"]=="fail"));
             }
         }
-        assert!(herdr_projects::verification::verify(&mut store,&request).unwrap().replayed);
+        assert!(herdr_farm::verification::verify(&mut store,&request).unwrap().replayed);
         assert!(!work.join("checkout/.fixture-counter").exists(),"private copy escaped namespace");
     }
 }
@@ -4408,9 +4408,9 @@ fn result_verification_refuses_wrong_hash_and_unstaged_candidate_blob() {
         fs::create_dir(&work).unwrap();
         let policy_path = work.join("policy.json");
         fs::write(&policy_path, policy).unwrap();
-        let request = herdr_projects::verification::VerifyRequest::new(submission.submission_id,
+        let request = herdr_farm::verification::VerifyRequest::new(submission.submission_id,
             "builds", &policy_path, "objects", Duration::from_secs(10), &work);
-        let error = match herdr_projects::verification::verify(&mut db, &request) {
+        let error = match herdr_farm::verification::verify(&mut db, &request) {
             Err(error) => error,
             Ok(_) => panic!("untrusted candidate was verified"),
         };

@@ -6,11 +6,11 @@
 //! Attempts are recorded through the public store API because no worker is
 //! launched, and so are the runtime observations a recovery wait reads,
 //! because no Herdr pane exists.
-use herdr_projects::{authority, domain::*, migration, runtime};
+use herdr_farm::{authority, domain::*, migration, runtime};
 use serde_json::{json, Value};
 use std::{fs, path::PathBuf, process::{Command, Output}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 /// Every submission is rejected with `checks_failed`: the output never exists.
 const POLICY: &str = r#"{"version":1,"checks":["/usr/bin/git","cat-file","-e","HEAD:missing-output"]}"#;
 
@@ -487,7 +487,7 @@ fn a_repeated_rejected_verification_records_its_feedback_once() {
 /// a rearmed successor wakes from the same evidence.
 #[test]
 fn a_recovery_wait_wakes_once_the_owned_pane_is_back_and_changes_no_ownership() {
-    use herdr_projects::reconcile::{ResourceState, RuntimeObservation};
+    use herdr_farm::reconcile::{ResourceState, RuntimeObservation};
     let f = Factory::new();
     f.add("waiting");
     // Ownership is recorded while the project is paused, as `runtime adopt` requires.
@@ -500,7 +500,7 @@ fn a_recovery_wait_wakes_once_the_owned_pane_is_back_and_changes_no_ownership() 
         Some(b) => db.rebind_runtime(&b.id, b.revision, snapshot.head, &route).unwrap().binding,
         None => db.create_runtime(None, None, snapshot.head, &route).unwrap().binding,
     };
-    let observe = |db: &mut herdr_projects::store::SqliteStore, present: bool| {
+    let observe = |db: &mut herdr_farm::store::SqliteStore, present: bool| {
         let snapshot = db.read_snapshot(None).unwrap();
         let now = jiff::Timestamp::now().as_millisecond();
         let observations: Vec<_> = snapshot.runtime_bindings.iter().map(|b| {

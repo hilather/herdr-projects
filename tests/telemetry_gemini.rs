@@ -2,7 +2,7 @@
 #![cfg(all(feature = "state-store", target_os = "linux"))]
 #![allow(clippy::disallowed_methods)]
 mod support;
-use herdr_projects::telemetry::otlp;
+use herdr_farm::telemetry::otlp;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{fs, path::PathBuf};

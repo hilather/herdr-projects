@@ -1,5 +1,5 @@
 //! TM4.2 operator views end to end (docs/telemetry/operator-views.md): the
-//! project, models, reviews, cost and health views of `herdr-projects
+//! project, models, reviews, cost and health views of `herdr-farm
 //! telemetry <slug> view`, their JSON, the fleet pane's view sections and the
 //! query service behind them, over planted canonical rows and collected
 //! fixture rollouts. Expected values are hand-computed from plan docs 07,
@@ -11,7 +11,7 @@
 
 mod support;
 
-use herdr_projects::store::SqliteStore;
+use herdr_farm::store::SqliteStore;
 use serde_json::{Value, json};
 use std::os::unix::fs::MetadataExt;
 use std::{fs, path::{Path, PathBuf}, process::{Command, Output}, time::Duration};
@@ -387,7 +387,7 @@ fn reviews_view_separates_verified_integrated_and_resolved() {
     let opened = fixes(&["open", finding, "--assign", "fast"]);
     let repair = opened["event"]["subject"]["repair_seq"].as_i64().unwrap().to_string();
     let factory = Factory::open(&f);
-    let fast_id = herdr_projects::domain::agent_configuration(&fast).id;
+    let fast_id = herdr_farm::domain::agent_configuration(&fast).id;
     factory.attempt("fix-a1", &fast_id);
     fixes(&["bind", &repair, "--attempt", "fix-a1"]);
     factory.submission(&rep('4'), "fix-a1", &oid('4'), 6_000);
@@ -471,7 +471,7 @@ fn views_and_pane_never_read_another_project() {
 
     // Pane handoffs: bound to the root and session, and to the named project's store.
     let (state, socket) = (r.home.join("plugin-state"), r.home.join("herdr.sock"));
-    let pane = |id: &str| r.pane(&[("HERDR_PLUGIN_STATE_DIR", state.to_str().unwrap()), ("HERDR_SOCKET_PATH", socket.to_str().unwrap()), ("HERDR_PROJECTS_HANDOFF", id)]);
+    let pane = |id: &str| r.pane(&[("HERDR_PLUGIN_STATE_DIR", state.to_str().unwrap()), ("HERDR_SOCKET_PATH", socket.to_str().unwrap()), ("HERDR_FARM_HANDOFF", id)]);
     let demo_store = identity(&r.root.join("demo/.state/state.db"));
     for (n, slug, store, error) in [(1, "other", demo_store.as_str(), "the handoff names project `other` but was not issued for its store"),
         (2, "../other", demo_store.as_str(), "`../other` is not a valid project slug"),
@@ -510,7 +510,7 @@ fn ticker_pass(f: &Fixture, done: &dyn Fn() -> bool) {
 }
 
 fn switch(f: &Fixture, on: bool) {
-    let dir = home(f).join(".config/herdr-projects");
+    let dir = home(f).join(".config/herdr-farm");
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("config.toml"), format!("[telemetry]\nviews = {on}\n")).unwrap();
 }
@@ -560,7 +560,7 @@ fn switching_views_off_leaves_collection_ticker_authority_and_budgets_alone() {
     let models: Value = serde_json::from_str(&f.text(&["view", "models", "--json"])).unwrap();
     assert_eq!(row(&models, "M08")["value"], q("M08")["value"]);
     // An invalid switch is refused, not read as on or off.
-    fs::write(home(&f).join(".config/herdr-projects/config.toml"), "[telemetry]\nviews = \"sometimes\"\n").unwrap();
+    fs::write(home(&f).join(".config/herdr-farm/config.toml"), "[telemetry]\nviews = \"sometimes\"\n").unwrap();
     let err = String::from_utf8(run(&home(&f), &f.root, &["telemetry", "demo", "view", "cost"], &[]).stderr).unwrap();
     assert!(err.contains("[telemetry] views in ") && err.contains("must be true or false"), "{err}");
 }

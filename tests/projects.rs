@@ -4,7 +4,7 @@
 //! `safety show`, asserting what they print and the files they leave.
 use std::{fs, path::PathBuf, process::{Command, Output}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 struct Home(tempfile::TempDir);
 
@@ -151,7 +151,7 @@ fn safety_overrides_are_keyed_by_canonical_project_path() {
     assert!(home.ok(&["safety", "show", "demo"]).contains(defaults));
 
     let canonical = fs::canonicalize(home.root().join("demo")).unwrap();
-    let config = home.0.path().join(".config/herdr-projects");
+    let config = home.0.path().join(".config/herdr-farm");
     fs::create_dir_all(&config).unwrap();
     fs::write(config.join("config.toml"), format!("[safety.{:?}]\nstart_threads = \"auto\"\nthread_agent_args = [\"--x\"]\n", canonical.to_str().unwrap())).unwrap();
     let shown = home.ok(&["safety", "show", "demo"]);

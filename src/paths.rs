@@ -46,14 +46,15 @@ impl Env {
         }
     }
 
-    /// A variable's value; an empty value counts as unset.
+    /// A variable's value, preferring the new product prefix. Empty values
+    /// are unusable and do not fall back to the legacy name.
     pub fn var(&self, key: &str) -> Option<&str> {
-        self.vars.get(key).map(String::as_str).filter(|v| !v.is_empty())
+        herdr_farm::product_environment::product_env(key, |name| self.vars.get(name).map(String::as_str)).filter(|v| !v.is_empty())
     }
 
-    /// The fixed user-level config directory, `~/.config/herdr-projects`.
+    /// Prefer the new config file, falling back to the legacy installation.
     pub fn config_dir(&self) -> PathBuf {
-        self.home.join(".config").join("herdr-projects")
+        herdr_farm::product_environment::config_dir_for_home(&self.home)
     }
 
     /// `HERDR_BIN_PATH` when set, else `herdr` on `PATH`.
@@ -88,13 +89,13 @@ struct RootConfig {
     root: Option<String>,
 }
 
-/// Projects root: `--root`, then `HERDR_PROJECTS_ROOT`, then `root` in
-/// `<config_dir>/config.toml`, then `~/.herdr-projects`.
+/// Projects root: flag, new/legacy environment, selected config, then
+/// existing new/legacy installation (a fresh installation uses the new path).
 pub fn resolve_root(flag: Option<&Path>, env: &Env, config_dir: &Path) -> Result<PathBuf> {
     if let Some(flag) = flag {
         return absolute(flag);
     }
-    if let Some(var) = env.var("HERDR_PROJECTS_ROOT") {
+    if let Some(var) = env.var("HERDR_FARM_ROOT") {
         return absolute(&env.expand_tilde(var));
     }
     let config_file = config_dir.join("config.toml");
@@ -105,7 +106,9 @@ pub fn resolve_root(flag: Option<&Path>, env: &Env, config_dir: &Path) -> Result
             return absolute(&env.expand_tilde(&root));
         }
     }
-    Ok(env.home.join(".herdr-projects"))
+    let new = env.home.join(".herdr-farm");
+    let old = env.home.join(".herdr-projects");
+    Ok(if new.exists() || !old.exists() { new } else { old })
 }
 
 // Root resolution runs before migration's own reader. Bound this read as well,

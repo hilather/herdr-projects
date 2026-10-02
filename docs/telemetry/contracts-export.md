@@ -111,7 +111,7 @@ source.
 "analytics-drill", kid, project, iat, exp, request, snapshot, revision,
 bucket, next}`; `mac` = HMAC-SHA256(key, payload bytes). The key is 32 random
 bytes as 64 hex digits in `<config_dir>/telemetry-cursor.key`
-(`~/.config/herdr-projects`), created on first issue with mode 0600 (its
+(`~/.config/herdr-farm`), created on first issue with mode 0600 (its
 directory 0700 when created), checked on every use (regular file, this user,
 one link, mode 0600) and never exported. `project` is
 `sha256("herdr-projects/project:" + canonical project path)`: the path itself

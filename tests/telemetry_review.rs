@@ -1,6 +1,6 @@
 //! Lane D review capture end to end (contracts-review.md): opportunities bound
 //! to exact candidates, blind assignment, sessions and completions through
-//! `herdr-projects telemetry <slug> review ...`, over a real reserved attempt
+//! `herdr-farm telemetry <slug> review ...`, over a real reserved attempt
 //! with planted submissions and reviewer attempts.
 
 #![cfg(all(feature = "state-store", target_os = "linux"))]
@@ -8,7 +8,7 @@
 
 mod support;
 
-use herdr_projects::{domain::agent_configuration, store::{FindingTarget, RepairAssignment, SqliteStore, TriageOutcome, TriageRequest}};
+use herdr_farm::{domain::agent_configuration, store::{FindingTarget, RepairAssignment, SqliteStore, TriageOutcome, TriageRequest}};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -424,7 +424,7 @@ impl Factory {
             INSERT OR IGNORE INTO integration_target_leases(repository,ref_name,operation_id,generation) VALUES('/repo','refs/heads/main',NULL,0);").unwrap();
         Factory(db)
     }
-    fn configuration(&self, profile: &herdr_projects::domain::FrozenProfile) -> String {
+    fn configuration(&self, profile: &herdr_farm::domain::FrozenProfile) -> String {
         let c = agent_configuration(profile);
         self.0.execute("INSERT OR IGNORE INTO agent_configurations VALUES(?1,?2,1)", rusqlite::params![c.id, c.canonical_json]).unwrap();
         c.id
@@ -472,7 +472,7 @@ fn hex(c: char) -> String { c.to_string().repeat(64) }
 fn oid(c: char) -> String { c.to_string().repeat(40) }
 
 /// The retained `fast` profile `review_world` plants (configuration A).
-fn fast_profile(f: &Fixture) -> herdr_projects::domain::FrozenProfile {
+fn fast_profile(f: &Fixture) -> herdr_farm::domain::FrozenProfile {
     let mut fast = codex_profile(&f.config, "codex", "fast", Some(&f.tmp.path().join("fast-home")));
     fast.arguments_digest = "1".repeat(64);
     fast
@@ -1091,7 +1091,7 @@ struct IntegrationLab { home: tempfile::TempDir, root: std::path::PathBuf, proje
 
 impl IntegrationLab {
     fn new() -> Self {
-        use herdr_projects::{domain::ProjectState, migration, runtime};
+        use herdr_farm::{domain::ProjectState, migration, runtime};
         let home = tempfile::tempdir().unwrap();
         let root = home.path().join("root");
         let lab = |args: &[&str]| std::process::Command::new(BIN).env_clear().env("HOME", home.path()).args(args).output().unwrap();
@@ -1100,7 +1100,7 @@ impl IntegrationLab {
         assert!(std::process::Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).output().unwrap().status.success());
         let public = fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
         let project = root.join("demo");
-        let config = home.path().join(".config/herdr-projects/config.toml");
+        let config = home.path().join(".config/herdr-farm/config.toml");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         fs::write(&config, format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[profiles.worker]\nkind='claude'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=60\nunknown_usage='allow_with_warning'\n")).unwrap();
         let plan = migration::inspect_with_config(&project, &config).unwrap();
@@ -1161,7 +1161,7 @@ impl IntegrationLab {
     /// Task `task` with its signed verify-then-integrate contract (revision 1);
     /// returns the contract digest.
     fn contract(&self, task: &str) -> String {
-        use herdr_projects::{authority::CONTRACT_SIGNATURE_NAMESPACE, domain::TaskId, runtime};
+        use herdr_farm::{authority::CONTRACT_SIGNATURE_NAMESPACE, domain::TaskId, runtime};
         let head = runtime::add_task(&self.project, TaskId::new(task).unwrap(), "work".into(), runtime::snapshot(&self.project).unwrap().head).unwrap();
         let repository = self.repo.canonicalize().unwrap().display().to_string();
         let mut document = serde_json::to_vec_pretty(&json!({
@@ -1169,7 +1169,7 @@ impl IntegrationLab {
             "project_store": self.store, "expected_head": head, "task_id": task, "contract_revision": 1, "deliverable": "ship", "non_goals": "no launch",
             "acceptance_policies": [{"id": "clean", "text": POLICY}], "repository": repository, "base_oid": self.base, "object_format": "sha256",
             "dependencies": [], "capability_flags": [], "profile_kind": "codex", "retry_class": "none", "result_schema_id": "result-v1",
-            "route": "verify_then_integrate", "authority": herdr_projects::authority::policy_reference(&self.project).unwrap()})).unwrap();
+            "route": "verify_then_integrate", "authority": herdr_farm::authority::policy_reference(&self.project).unwrap()})).unwrap();
         document.push(b'\n');
         let doc = self.home.path().join(format!("{task}-contract.json"));
         fs::write(&doc, &document).unwrap();
@@ -1228,7 +1228,7 @@ impl IntegrationLab {
     /// Retained native profiles `codex` and `fast` (distinct configurations,
     /// as `profile prepare` would retain them); returns their configuration ids.
     fn arm_profiles(&self) -> (String, String) {
-        let config = herdr_projects::migration::config_reference(&self.home.path().join(".config/herdr-projects/config.toml")).unwrap();
+        let config = herdr_farm::migration::config_reference(&self.home.path().join(".config/herdr-farm/config.toml")).unwrap();
         let db_path = self.project.join(".state/state.db");
         let codex = codex_profile(&config, "codex", "codex", Some(&self.home.path().join("codex-home")));
         let mut fast = codex_profile(&config, "codex", "fast", Some(&self.home.path().join("fast-home")));
@@ -1240,7 +1240,7 @@ impl IntegrationLab {
     }
     /// Queue `consumer` behind `predecessor`'s `verified_result` through `task queue`.
     fn queue_dependent(&self, consumer: &str, predecessor: &str) {
-        use herdr_projects::{domain::TaskId, runtime};
+        use herdr_farm::{domain::TaskId, runtime};
         let head = runtime::add_task(&self.project, TaskId::new(consumer).unwrap(), format!("consumer {consumer}"), runtime::snapshot(&self.project).unwrap().head).unwrap();
         let request = self.home.path().join(format!("{consumer}-queue.json"));
         fs::write(&request, json!({"priority": 0, "dependencies": [{"predecessor": predecessor, "requirement": "verified_result"}]}).to_string()).unwrap();
@@ -1302,19 +1302,19 @@ fn seeded_candidate_never_integrates_and_reviewers_stay_blind() {
 
     lab.git(&["branch", "integration", &lab.base]);
     lab.ok(&["result", "demo", "configure-integration", "--repository", lab.repo.to_str().unwrap(), "--reference", "refs/heads/integration"]);
-    let head = herdr_projects::runtime::snapshot(&lab.project).unwrap().head.to_string();
+    let head = herdr_farm::runtime::snapshot(&lab.project).unwrap().head.to_string();
     assert_eq!(lab.ok(&["result", "demo", "auto", "--integrate", "on", "--expected-head", &head])["integrate"], json!(true));
     let pending = |db: &rusqlite::Connection| db.query_row("SELECT count(*) FROM pending_integration_work", [], |r| r.get::<_, i64>(0)).unwrap();
     assert_eq!(pending(&lab.db()), 2, "both verified submissions enter the pending projection");
     // The producer (the ticker's integration pass): X was submitted first, yet only C is enqueued.
-    let turn = herdr_projects::store::service_project_integration_jobs(&lab.project).unwrap();
+    let turn = herdr_farm::store::service_project_integration_jobs(&lab.project).unwrap();
     assert_eq!((turn.enqueued, turn.pending), (1, false));
     let db = lab.db();
     let jobs: Vec<String> = db.prepare("SELECT json_extract(payload,'$.submission_id') FROM operations WHERE kind='integration.run'").unwrap()
         .query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
     assert_eq!((jobs, pending(&db)), (vec![c.clone()], 0));
     // A later turn re-adds nothing for X.
-    assert_eq!(herdr_projects::store::service_project_integration_jobs(&lab.project).unwrap().enqueued, 0);
+    assert_eq!(herdr_farm::store::service_project_integration_jobs(&lab.project).unwrap().enqueued, 0);
 
     // The operator path reaches begin_integration, which refuses before any write.
     let target = lab.git(&["rev-parse", "refs/heads/integration"]);
@@ -1403,14 +1403,14 @@ fn unselected_arm_does_not_integrate_until_selection_and_winner_is_queued() {
 
     lab.git(&["branch", "integration", &lab.base]);
     lab.ok(&["result", "demo", "configure-integration", "--repository", lab.repo.to_str().unwrap(), "--reference", "refs/heads/integration"]);
-    let head = herdr_projects::runtime::snapshot(&lab.project).unwrap().head.to_string();
+    let head = herdr_farm::runtime::snapshot(&lab.project).unwrap().head.to_string();
     assert_eq!(lab.ok(&["result", "demo", "auto", "--integrate", "on", "--expected-head", &head])["integrate"], json!(true));
     let sorted = |mut v: Vec<String>| { v.sort(); v };
     let pending = || sorted(lab.db().prepare("SELECT submission_id FROM pending_integration_work").unwrap().query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap());
     let jobs = || lab.db().prepare("SELECT json_extract(payload,'$.submission_id') FROM operations WHERE kind='integration.run'").unwrap()
         .query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<String>, _>>().unwrap();
     assert_eq!(pending(), sorted(vec![s1.clone(), s2.clone(), s3.clone()]), "every verified arm enters the pending projection");
-    let turn = herdr_projects::store::service_project_integration_jobs(&lab.project).unwrap();
+    let turn = herdr_farm::store::service_project_integration_jobs(&lab.project).unwrap();
     assert_eq!((turn.enqueued, turn.pending), (0, false));
     assert_eq!((jobs(), pending()), (vec![], vec![]), "no arm is eligible before its group's selection names it");
 
@@ -1439,10 +1439,10 @@ fn unselected_arm_does_not_integrate_until_selection_and_winner_is_queued() {
     let selection = lab.telemetry(&["quality", "groups", "select", &g, "--rule"])["selection"].clone();
     assert_eq!((&selection["arm"], &selection["submission_id"], &selection["reason"]), (&json!(1), &json!(s1), &json!("first_passing_verification")));
     assert_eq!(pending(), vec![s1.clone()]);
-    let turn = herdr_projects::store::service_project_integration_jobs(&lab.project).unwrap();
+    let turn = herdr_farm::store::service_project_integration_jobs(&lab.project).unwrap();
     assert_eq!((turn.enqueued, turn.pending), (1, false));
     assert_eq!((jobs(), pending()), (vec![s1.clone()], vec![]));
-    assert_eq!(herdr_projects::store::service_project_integration_jobs(&lab.project).unwrap().enqueued, 0, "the loser is never re-added");
+    assert_eq!(herdr_farm::store::service_project_integration_jobs(&lab.project).unwrap().enqueued, 0, "the loser is never re-added");
 
     // Losers never integrate: G's arm 2, and N's only arm (closed with no selection).
     refused(&r2, "integrate-2");
@@ -1706,7 +1706,7 @@ fn seeded_recall_and_clean_control_false_alarms_match_fixture() {
 
     // Only the evaluation authority registers; a reproducer is a reference, never the seed.
     let mut store = SqliteStore::open(&db_path).unwrap();
-    let arm = herdr_projects::store::EvaluationArm::Seeded(vec![herdr_projects::store::SeedSpec { seed_class: "logic".into(), reproducer_ref: reproducer_ref(&seeds[0]) }]);
+    let arm = herdr_farm::store::EvaluationArm::Seeded(vec![herdr_farm::store::SeedSpec { seed_class: "logic".into(), reproducer_ref: reproducer_ref(&seeds[0]) }]);
     for worker in ["worker:rev-a1", "rev-a1", f.attempt.as_str()] {
         assert!(format!("{:?}", store.register_evaluation_candidate(&s[0].0, &arm, None, worker, 1).unwrap_err()).contains("a worker cannot register"), "{worker}");
     }
@@ -2092,7 +2092,7 @@ fn review_ledger_upgrade_backfills_sessions_in_completion_order() {
     assert_eq!((version(), f.cli_args(&["review", "findings", "show"]).0["findings"]["head_seq"].clone()), (58, json!(4)));
 
     SqliteStore::open(&db_path).unwrap().upgrade_v1().unwrap();
-    assert_eq!(version(), i64::from(herdr_projects::store::SCHEMA));
+    assert_eq!(version(), i64::from(herdr_farm::store::SCHEMA));
     let sessions: Vec<String> = raw.prepare("SELECT session_id FROM review_sessions ORDER BY started_unix_ms").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
     let events = || raw.prepare("SELECT e.seq,e.session_id,e.event,e.backfilled,l.kind,l.authority FROM review_session_events e JOIN review_log l ON l.seq=e.seq ORDER BY e.seq").unwrap()
         .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?)))
@@ -2159,11 +2159,11 @@ struct AuthorityWorld { lab: IntegrationLab, carol: std::path::PathBuf, fast: St
 
 impl AuthorityWorld {
     fn new(reviewers: &[&str]) -> Self {
-        use herdr_projects::{domain::TaskId, runtime};
+        use herdr_farm::{domain::TaskId, runtime};
         let lab = IntegrationLab::new();
         let mut head = runtime::snapshot(&lab.project).unwrap().head;
         for task in ["work", "other"] { head = runtime::add_task(&lab.project, TaskId::new(task).unwrap(), task.into(), head).unwrap(); }
-        let config = herdr_projects::migration::config_reference(&lab.home.path().join(".config/herdr-projects/config.toml")).unwrap();
+        let config = herdr_farm::migration::config_reference(&lab.home.path().join(".config/herdr-farm/config.toml")).unwrap();
         let author_profile = codex_profile(&config, "codex", "codex", Some(&lab.home.path().join("codex-home")));
         let mut fast_profile = codex_profile(&config, "codex", "fast", Some(&lab.home.path().join("fast-home")));
         fast_profile.arguments_digest = "1".repeat(64);
@@ -2210,7 +2210,7 @@ impl AuthorityWorld {
             "subject_public_key": Self::public(&self.carol), "subject_configurations": [], "project_store": self.lab.store, "repositories": ["/repo"],
             "tasks": [{"task_id": "work", "contract_revision": 1}], "kinds": ["code"], "review_configurations": [], "actions": ["accept_review_completion"],
             "max_decisions": 2, "valid_from_unix_ms": unix_ms() - 60_000, "expires_unix_ms": unix_ms() + 3_600_000, "prohibited_effects": PROHIBITED,
-            "authority": herdr_projects::authority::policy_reference(&self.lab.project).unwrap()});
+            "authority": herdr_farm::authority::policy_reference(&self.lab.project).unwrap()});
         for (k, v) in changes.as_object().unwrap() { grant[k] = v.clone(); }
         grant
     }
@@ -2385,7 +2385,7 @@ fn revoked_or_expired_grant_cannot_accept_and_workers_cannot_mint() {
     assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("worker execution context"));
     assert_eq!(w.accept(&w.carol, "o1.json", &w.request(&g, &o1, "accepted", None)).unwrap()["decision"], json!("accepted"));
     let revocation = json!({"schema": "code_review_revocation.v1", "grant_id": g, "project_store": w.lab.store, "reason": "reviewer_retired",
-        "authority": herdr_projects::authority::policy_reference(&w.lab.project).unwrap()});
+        "authority": herdr_farm::authority::policy_reference(&w.lab.project).unwrap()});
     let (doc, sig, _) = w.sign(&w.carol, REVOKE_NS, "revoke.json", &revocation);
     assert!(w.lab.fail(&["telemetry", "demo", "review", "authority", "revoke", &doc, &sig]).contains("signature verification failed"));
     let (doc, sig, _) = w.sign(&w.lab.key, REVOKE_NS, "revoke.json", &revocation);

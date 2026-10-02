@@ -39,7 +39,7 @@ pub(crate) fn task_evidence(db: &Connection) -> Result<Vec<(String, String, bool
         FROM tasks t ORDER BY t.id")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?)
 }
 
-/// `herdr-projects telemetry <slug> report`. `since` bounds the activity window (Unix ms).
+/// `herdr-farm telemetry <slug> report`. `since` bounds the activity window (Unix ms).
 /// Assembled by the query service (`super::analytics::query::report`), the one
 /// read path shared with `telemetry query`, the fleet pane and exports.
 pub fn report(project: &Path, since: Option<i64>) -> Result<Value> { super::analytics::query::report(project, since) }

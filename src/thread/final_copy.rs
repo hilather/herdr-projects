@@ -1,6 +1,6 @@
 //! Atomic final-copy acknowledgement. Publication callers own project effects.
 use super::*;
-use herdr_projects::{execution_guard::ProjectEffect,final_copy_intent::{FinalCopyIntent,Notice,Purpose}};
+use herdr_farm::{execution_guard::ProjectEffect,final_copy_intent::{FinalCopyIntent,Notice,Purpose}};
 use crate::source_tree::Control;
 
 pub fn check(t:&Thread,intent:&FinalCopyIntent)->Result<()> {
@@ -41,7 +41,7 @@ pub fn commit(project:&Project,guard:&dyn ProjectEffect,id:&str,intent:&FinalCop
     if let Some(hash)=&intent.report_hash {
         let receipt=match &t.copy_receipt {
             Some(receipt) if receipt.execution==intent.execution&&receipt.report_hash==*hash&&receipt.notes==notes=>receipt.clone(),
-            _=>herdr_projects::copy_receipt::CopyReceipt{sequence:t.copy_receipt.as_ref().map_or(0,|r|r.sequence).checked_add(1).context("copy sequence exhausted")?,execution:intent.execution.clone(),report_hash:hash.clone(),notes},
+            _=>herdr_farm::copy_receipt::CopyReceipt{sequence:t.copy_receipt.as_ref().map_or(0,|r|r.sequence).checked_add(1).context("copy sequence exhausted")?,execution:intent.execution.clone(),report_hash:hash.clone(),notes},
         };
         receipt.validate()?;t.copy_receipt=Some(receipt);
         if t.report_hash!=*hash {t.last_report_change=project::now();}

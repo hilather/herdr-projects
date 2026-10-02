@@ -2,7 +2,7 @@
 use std::{path::{Path,PathBuf},time::Duration};
 use anyhow::{Context,Result,ensure};
 use crate::{cleanup,herdr::{self,Herdr},paths::Ctx,project};
-use herdr_projects::{domain::{Operation,OperationId,TaskId},migration::{self,ConfigReference},operations::{Claim,Outcome,dispatch::{self,DeliveryAdapter,PreparedDelivery,DispatchRequest,DispatchResult},notification::Notification},runtime};
+use herdr_farm::{domain::{Operation,OperationId,TaskId},migration::{self,ConfigReference},operations::{Claim,Outcome,dispatch::{self,DeliveryAdapter,PreparedDelivery,DispatchRequest,DispatchResult},notification::Notification},runtime};
 
 pub(crate) fn config(ctx:&Ctx,project:&Path)->Result<ConfigReference> {
     let path=std::path::absolute(ctx.config_dir.join("config.toml"))?;
@@ -64,7 +64,7 @@ pub fn deliver(ctx:&Ctx,project:&Path,id:&OperationId,revision:u64)->Result<Disp
 pub(crate) mod tests {
     use super::*;
     use crate::{scenarios::World,runner::fake::{ok,fail}};
-    use herdr_projects::{domain::{ProjectState,RuntimeRoute},operations::DeliveryState};
+    use herdr_farm::{domain::{ProjectState,RuntimeRoute},operations::DeliveryState};
     pub(crate) fn fixture()->(World,PathBuf,TaskId) {
         fixture_with_items(1)
     }

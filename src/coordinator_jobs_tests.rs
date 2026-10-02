@@ -91,7 +91,7 @@ fn coordinator_prime_checks_same_project_threads_and_neighbor_aliases() {
             if mode=="corrupt" {fs::write(other.state_dir().join("coordinator.json"),"corrupt").unwrap();}
             if mode=="canonical" {
                 #[cfg(feature="state-store")]
-                {other.set_status(project::Status::Paused).unwrap();project::write_json(&other.state_dir().join("coordinator.json"),&Coordinator::default()).unwrap();let plan=herdr_projects::migration::inspect(&other.dir()).unwrap();herdr_projects::migration::apply(&other.dir(),&plan,true).unwrap();let snapshot=herdr_projects::runtime::snapshot(&other.dir()).unwrap();herdr_projects::runtime::rebind(&other.dir(),"coordinator",1,snapshot.head,&herdr_projects::domain::RuntimeRoute{socket:socket.display().to_string(),pane_id:"p".into(),workspace_id:"w".into(),tab_id:"tab".into(),cwd:"/fixture".into(),..Default::default()}).unwrap();}
+                {other.set_status(project::Status::Paused).unwrap();project::write_json(&other.state_dir().join("coordinator.json"),&Coordinator::default()).unwrap();let plan=herdr_farm::migration::inspect(&other.dir()).unwrap();herdr_farm::migration::apply(&other.dir(),&plan,true).unwrap();let snapshot=herdr_farm::runtime::snapshot(&other.dir()).unwrap();herdr_farm::runtime::rebind(&other.dir(),"coordinator",1,snapshot.head,&herdr_farm::domain::RuntimeRoute{socket:socket.display().to_string(),pane_id:"p".into(),workspace_id:"w".into(),tab_id:"tab".into(),cwd:"/fixture".into(),..Default::default()}).unwrap();}
                 #[cfg(not(feature="state-store"))]
                 fs::write(other.state_dir().join("format.json"),"{}").unwrap();
             }
@@ -128,7 +128,7 @@ fn ticker_queues_prime_without_a_synchronous_send_or_forged_receipt() {
 fn coordinator_update_preserves_previous_bytes_when_claim_exceeds_record_limit() {
     let f=Fixture::new();let mut c=f.record();c.session="s".repeat(16*1024*1024-serde_json::to_string_pretty(&c).unwrap().len()-16);
     let path=f.project.state_dir().join("coordinator.json");project::write_json(&path,&c).unwrap();let before=fs::read(&path).unwrap();assert!(f.project.try_coordinator().is_ok());
-    assert!(f.project.update_coordinator(|c|{c.prime_sequence=1;c.prime_claim=Some(Claim{request:1,delivery:herdr_projects::prompt_claim::Claim{sequence:1,execution:"a".repeat(64),prompt:"prime".into(),phase:Phase::Pending,error:String::new(),notified:false}});}).is_err());
+    assert!(f.project.update_coordinator(|c|{c.prime_sequence=1;c.prime_claim=Some(Claim{request:1,delivery:herdr_farm::prompt_claim::Claim{sequence:1,execution:"a".repeat(64),prompt:"prime".into(),phase:Phase::Pending,error:String::new(),notified:false}});}).is_err());
     assert_eq!(fs::read(path).unwrap(),before);assert!(f.project.try_coordinator().is_ok());
 }
 #[test]

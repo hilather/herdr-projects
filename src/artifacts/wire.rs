@@ -110,7 +110,7 @@ fn receive_into(project:&Project,record:&Thread,staging:Staging,archive:&Path,co
 }
 
 pub fn capture_remote(ctx: &Ctx, project: &Project, record: &Thread, target: &str) -> Result<Snapshot> {
-    let binary = ctx.env.var("HERDR_PROJECTS_REMOTE_BIN").unwrap_or("herdr-projects");
+    let binary = ctx.env.var("HERDR_FARM_REMOTE_BIN").unwrap_or("herdr-farm");
     let command = format!("{} artifact-stream", remote::quote(binary));
     let capability = remote::ssh(ctx.runner, target, &format!("{command} --probe"), None, remote::SSH_TIMEOUT)?;
     if capability.code == Some(255) || capability.timed_out || capability.cancelled {
@@ -118,7 +118,7 @@ pub fn capture_remote(ctx: &Ctx, project: &Project, record: &Thread, target: &st
     }
     let version = serde_json::from_slice::<serde_json::Value>(&capability.stdout_bytes).ok();
     if !capability.success() || version.as_ref().and_then(|v| v["schema"].as_u64()) != Some(1) {
-        anyhow::bail!("[transport-unsupported] install a compatible herdr-projects artifact-stream helper on {target} (or set HERDR_PROJECTS_REMOTE_BIN), then run `thread resolve {} {}` to retry", project.slug, record.id);
+        anyhow::bail!("[transport-unsupported] install a compatible herdr-farm artifact-stream helper on {target} (or set HERDR_FARM_REMOTE_BIN), then run `thread resolve {} {}` to retry", project.slug, record.id);
     }
     let staging = staging(project, record)?;
     let archive = staging.0.join(".wire");

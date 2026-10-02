@@ -7,11 +7,11 @@
 //! git call reaches the real git. Attempts, queued operations and their
 //! delivery claims have no CLI verb, so they are written with the public
 //! store API, as in tests/scheduling.rs.
-use herdr_projects::{domain::*, migration};
+use herdr_farm::{domain::*, migration};
 use serde_json::{json, Value};
 use std::{fs, os::unix::{fs::PermissionsExt, net::UnixListener}, path::{Path, PathBuf}, process::{Command, Output}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 /// Every session named `S.sock` lists `S.panes` / `S.agents`; a session
 /// without them is unreachable. Calls are logged to `herdr-calls`.
@@ -216,7 +216,7 @@ fn recovery_plans_advise_without_retrying_ambiguous_effects_or_releasing_lost_ca
         Mutation::Enqueue(operation("claimed", "current", "runtime.notification")), Mutation::Enqueue(operation("expired", "current", "runtime.notification")),
         Mutation::Enqueue(operation("pending", "current", "runtime.notification")), Mutation::Enqueue(operation("legacy", "current", "legacy.notification")),
     ] }).unwrap();
-    let revision = |db: &mut herdr_projects::store::SqliteStore, name: &str| db.read_snapshot(None).unwrap().deliveries.iter().find(|d| d.operation.as_str() == name).unwrap().revision;
+    let revision = |db: &mut herdr_farm::store::SqliteStore, name: &str| db.read_snapshot(None).unwrap().deliveries.iter().find(|d| d.operation.as_str() == name).unwrap().revision;
     // A claim whose lease ran out is marked ambiguous by the expiry sweep.
     let r = revision(&mut db, "ambiguous");
     db.claim_operation(&id("ambiguous"), r, "fixture", now(), 1).unwrap();

@@ -87,7 +87,7 @@ pub fn sidebar_suffix(label: &str, coverage: Option<&str>, wait_secs: Option<i64
 /// Dispatch reason codes `thread start --reason` accepts (doc 15 §6): the
 /// canonical dispatch log's operator reasons.
 #[cfg(feature = "state-store")]
-const DISPATCH_REASONS: &[&str] = &herdr_projects::domain::OPERATOR_REASONS;
+const DISPATCH_REASONS: &[&str] = &herdr_farm::domain::OPERATOR_REASONS;
 #[cfg(not(feature = "state-store"))]
 const DISPATCH_REASONS: &[&str] = &["operator_selected", "recommended", "operator_preference", "availability", "exploration", "replay", "continuation", "unspecified"];
 const MAX_NOTE: usize = 160;

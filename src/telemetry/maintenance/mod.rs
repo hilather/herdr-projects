@@ -162,7 +162,7 @@ BEGIN SELECT RAISE(ABORT, 'analytics revision is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS analytics_lineage_no_delete INSTEAD OF DELETE ON analytics_lineage
 BEGIN SELECT RAISE(ABORT, 'analytics lineage is immutable'); END;";
 
-/// `herdr-projects telemetry <slug> maintenance ...`
+/// `herdr-farm telemetry <slug> maintenance ...`
 #[derive(clap::Subcommand, Clone, Debug)]
 pub enum Command {
     /// The declared retention classes (`retention.v1`) with this deployment's overrides. Read-only.

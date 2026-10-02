@@ -2,7 +2,7 @@
 use std::{fs,path::{Path,PathBuf}};
 use anyhow::{Context,Result,ensure};
 use crate::{paths::Ctx,project::{self,Coordinator},thread::Thread};
-use herdr_projects::{domain::RuntimeIdentity,migration,runtime};
+use herdr_farm::{domain::RuntimeIdentity,migration,runtime};
 
 fn exists(path:&Path)->Result<bool> {match fs::symlink_metadata(path){Ok(_)=>Ok(true),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>Ok(false),Err(e)=>Err(e.into())}}
 fn optional_json<T:serde::de::DeserializeOwned>(path:&Path)->Result<Option<T>> {if !exists(path)?{return Ok(None);}Ok(Some(serde_json::from_slice(&migration::read_plan_file(path)?)?))}
@@ -71,7 +71,7 @@ pub(crate) fn check_worktree_references(ctx:&Ctx,current:&Path,id:&str,path:&Pat
 fn check_references(ctx:&Ctx,current:&Path,skip:Option<&str>,conflicts:impl Fn(&RuntimeIdentity)->Result<bool>)->Result<()> {
     if !exists(&ctx.root)? { return Ok(()); }
     let current=current.canonicalize()?;let mut projects=0;let mut records=0;
-    let mut target_budget=herdr_projects::store::identity_inventory::Budget::new(50*1024*1024,1024,std::time::Instant::now()+std::time::Duration::from_secs(10),Default::default())?;
+    let mut target_budget=herdr_farm::store::identity_inventory::Budget::new(50*1024*1024,1024,std::time::Instant::now()+std::time::Duration::from_secs(10),Default::default())?;
     for entry in fs::read_dir(&ctx.root)?.take(1025) {
         let entry=entry?;projects+=1;ensure!(projects<=1024,"root enumeration exceeds 1024 entries");
         let kind=entry.file_type()?;if !kind.is_dir()&&!kind.is_symlink(){continue;}
@@ -111,7 +111,7 @@ fn check_references(ctx:&Ctx,current:&Path,skip:Option<&str>,conflicts:impl Fn(&
     Ok(())
 }
 
-pub fn adopt(ctx:&Ctx,path:&Path,id:&str,revision:u64,head:u64)->Result<herdr_projects::store::OwnershipChange> {
+pub fn adopt(ctx:&Ctx,path:&Path,id:&str,revision:u64,head:u64)->Result<herdr_farm::store::OwnershipChange> {
     let path=path.canonicalize()?;let _lease=crate::cleanup::lease(path.parent().context("project has no root")?)?;
     let snapshot=runtime::snapshot(&path)?;ensure!(snapshot.head==head,"project head changed");
     let binding=snapshot.runtime_bindings.iter().find(|b|b.id==id&&b.revision==revision).context("binding revision changed")?;
@@ -128,7 +128,7 @@ pub(crate) mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
     use crate::{scenarios::World,runner::fake::ok};
-    use herdr_projects::domain::{ProjectState,RuntimeRoute};
+    use herdr_farm::domain::{ProjectState,RuntimeRoute};
     pub(crate) fn fixture()->(World,PathBuf,UnixListener) {
         let world=World::new();let project=project::create(&world.root,"owned","",vec![]).unwrap();project.set_status(project::Status::Paused).unwrap();fs::write(project.dir().join("threads/t-0001.toml"),"id='t-0001'\nstatus='resolved'\n").unwrap();let path=project.dir().canonicalize().unwrap();let plan=migration::inspect(&path).unwrap();migration::apply(&path,&plan,true).unwrap();
         let socket=world.home.path().join("session.sock");let listener=UnixListener::bind(&socket).unwrap();let cwd=world.home.path().join("work");fs::create_dir(&cwd).unwrap();let snapshot=runtime::snapshot(&path).unwrap();runtime::rebind(&path,"thread:t-0001",1,snapshot.head,&RuntimeRoute{socket:socket.to_str().unwrap().into(),workspace_id:"w".into(),tab_id:"t".into(),pane_id:"p".into(),cwd:cwd.to_str().unwrap().into(),..Default::default()}).unwrap();
@@ -140,11 +140,11 @@ pub(crate) mod tests {
         let config=world.ctx().config_dir.join("config.toml");assert!(runtime::set_state(&path,after.head,after.control.unwrap().revision,ProjectState::Active,&config).is_err());
         let mut db=migration::open_active(&path).unwrap();
         let wait=db.register_wait_with_trigger(after.tasks.iter().find(|task|task.active_attempt.is_some()).unwrap().id.as_str(),None,"adapter_recovery",None,
-            Some(&herdr_projects::domain::WaitTrigger::OwnedRuntimeRecovered{binding_id:"thread:t-0001".into(),binding_revision:2,ownership_revision:change.ownership.revision})).unwrap();
+            Some(&herdr_farm::domain::WaitTrigger::OwnedRuntimeRecovered{binding_id:"thread:t-0001".into(),binding_revision:2,ownership_revision:change.ownership.revision})).unwrap();
         assert!(!db.replay_wait(&wait.wait_id).unwrap().wake_requested);drop(db);
         crate::reconcile_live::run(&world.ctx(),&path,true).unwrap();
-        assert_eq!(herdr_projects::store::service_project_waits(&path).unwrap().notified,1);
-        assert_eq!(herdr_projects::store::service_project_waits(&path).unwrap().notified,0);
+        assert_eq!(herdr_farm::store::service_project_waits(&path).unwrap().notified,1);
+        assert_eq!(herdr_farm::store::service_project_waits(&path).unwrap().notified,0);
         let before=runtime::snapshot(&path).unwrap();assert!(runtime::admission(&path,&config).unwrap().blockers.is_empty());let active=runtime::set_state(&path,before.head,before.control.unwrap().revision,ProjectState::Active,&config).unwrap();assert_eq!(active.control.state,ProjectState::Active);
         let head=runtime::snapshot(&path).unwrap().head;let again=adopt(&world.ctx(),&path,"thread:t-0001",2,head).unwrap();assert_eq!(again.ownership,change.ownership);assert_eq!(runtime::snapshot(&path).unwrap().attempts.len(),1);assert_eq!(world.runner.count("agent prompt"),0);
     }
@@ -191,8 +191,8 @@ pub(crate) mod tests {
     fn relinquishment_retains_worker_and_uncertain_attempt_capacity() {
         let(world,path,_listener)=fixture();let head=runtime::snapshot(&path).unwrap().head;adopt(&world.ctx(),&path,"thread:t-0001",2,head).unwrap();
         let before=runtime::snapshot(&path).unwrap();assert!(runtime::relinquish(&path,"thread:t-0001",1,before.head,"hand back resources").is_err());assert_eq!(runtime::snapshot(&path).unwrap(),before);
-        let mut db=migration::open_active(&path).unwrap();let mut attempt=before.attempts[0].clone();attempt.state=herdr_projects::domain::AttemptState::Lost;attempt.revision+=1;let mut task=before.tasks.iter().find(|t|t.id==attempt.task).unwrap().clone();let rev=task.revision;task.revision+=1;task.state=herdr_projects::domain::TaskState::Blocked;task.active_attempt=None;
-        db.commit(herdr_projects::domain::Commit{expected_head:before.head,mutations:vec![herdr_projects::domain::Mutation::Attempt{expected:Some(1),next:attempt},herdr_projects::domain::Mutation::Task{expected:Some(rev),next:task}]}).unwrap();
+        let mut db=migration::open_active(&path).unwrap();let mut attempt=before.attempts[0].clone();attempt.state=herdr_farm::domain::AttemptState::Lost;attempt.revision+=1;let mut task=before.tasks.iter().find(|t|t.id==attempt.task).unwrap().clone();let rev=task.revision;task.revision+=1;task.state=herdr_farm::domain::TaskState::Blocked;task.active_attempt=None;
+        db.commit(herdr_farm::domain::Commit{expected_head:before.head,mutations:vec![herdr_farm::domain::Mutation::Attempt{expected:Some(1),next:attempt},herdr_farm::domain::Mutation::Task{expected:Some(rev),next:task}]}).unwrap();
         let before=runtime::snapshot(&path).unwrap();assert!(runtime::relinquish(&path,"thread:t-0001",1,before.head,"uncertain worker").is_err());assert_eq!(runtime::snapshot(&path).unwrap(),before);
     }
     #[test]
@@ -205,19 +205,19 @@ pub(crate) mod tests {
     }
     #[test]
     fn recovery_plan_is_read_only_and_keeps_live_or_changed_workers_reserved() {
-        use herdr_projects::reconcile::plan::RepairAction;
+        use herdr_farm::reconcile::plan::RepairAction;
         let(world,path,_listener)=fixture();let before=runtime::snapshot(&path).unwrap();let report=crate::reconcile_live::plan(&world.ctx(),&path).unwrap();assert!(report.items.iter().any(|i|i.entity=="thread:t-0001"&&i.action==RepairAction::AdoptResources));assert_eq!(runtime::snapshot(&path).unwrap(),before);
         adopt(&world.ctx(),&path,"thread:t-0001",2,before.head).unwrap();let before=runtime::snapshot(&path).unwrap();let report=crate::reconcile_live::plan(&world.ctx(),&path).unwrap();assert_eq!(report.retained_attempts,1);assert!(report.items.iter().any(|i|i.entity_kind=="attempt"&&i.action==RepairAction::None));assert_eq!(runtime::snapshot(&path).unwrap(),before);
         *world.agents.borrow_mut()="[]".into();let report=crate::reconcile_live::plan(&world.ctx(),&path).unwrap();assert_eq!(report.retained_attempts,1);assert!(!report.dispatch_allowed);assert!(report.items.iter().any(|i|i.entity_kind=="attempt"&&i.action==RepairAction::InspectTerminationEvidence));assert_eq!(runtime::snapshot(&path).unwrap(),before);assert_eq!(world.runner.count("agent prompt"),0);
     }
     #[test]
     fn remote_outage_remains_unknown_and_retains_lost_capacity_across_repeated_polling() {
-        use herdr_projects::domain::{Attempt,AttemptId,AttemptState,Commit,Mutation};
+        use herdr_farm::domain::{Attempt,AttemptId,AttemptState,Commit,Mutation};
         let(world,path,_socket)=fixture();let before=runtime::snapshot(&path).unwrap();let mut route=RuntimeRoute::from_identity(&before.runtime_bindings[0].identity);route.machine="offline-host".into();runtime::rebind(&path,"thread:t-0001",2,before.head,&route).unwrap();let before=runtime::snapshot(&path).unwrap();let task=before.runtime_bindings[0].task.clone().unwrap();
         let attempt=Attempt{id:AttemptId::new("remote-lost").unwrap(),task,revision:1,state:AttemptState::Lost,snapshot:None,reservation:"remote-slot".into(),termination_observed:false};migration::open_active(&path).unwrap().commit(Commit{expected_head:before.head,mutations:vec![Mutation::Attempt{expected:None,next:attempt}]}).unwrap();
         let remote_runner=crate::runner::fake::FakeRunner::new();remote_runner.on("--version",ok("herdr 0.9.1"));remote_runner.on("--machine offline-host",crate::runner::fake::fail(255,"fixture remote unavailable"));let ctx=Ctx{runner:&remote_runner,..world.ctx()};
         let before=runtime::snapshot(&path).unwrap();for _ in 0..2 {
-            let batch=crate::reconcile_live::collect(&ctx,&path).unwrap();assert_eq!(batch.observations[0].pane,herdr_projects::reconcile::ResourceState::Unknown);assert!(!batch.observations[0].agent_present);assert!(batch.observations[0].session_identity.is_none());assert!(!crate::canonical_controller::poll(&ctx,&path,0).unwrap().reachable);
+            let batch=crate::reconcile_live::collect(&ctx,&path).unwrap();assert_eq!(batch.observations[0].pane,herdr_farm::reconcile::ResourceState::Unknown);assert!(!batch.observations[0].agent_present);assert!(batch.observations[0].session_identity.is_none());assert!(!crate::canonical_controller::poll(&ctx,&path,0).unwrap().reachable);
             let after=runtime::snapshot(&path).unwrap();assert_eq!(after.attempts,before.attempts);assert_eq!(after.runtime_bindings,before.runtime_bindings);assert_eq!(after.tasks,before.tasks);assert!(after.ownership.is_empty());let plan=crate::reconcile_live::plan(&ctx,&path).unwrap();assert_eq!(plan.retained_attempts,1);assert!(!plan.dispatch_allowed);
         }
         assert!(remote_runner.calls.borrow().iter().any(|c|c.args.windows(2).any(|a|a==["--machine","offline-host"])));assert_eq!(remote_runner.count("agent prompt"),0);assert_eq!(remote_runner.count("agent start"),0);

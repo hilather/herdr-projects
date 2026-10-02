@@ -17,7 +17,7 @@ use std::{
 /// Only the native verifier constructs this evidence. JSON is a report, not an
 /// importable capability grant.
 /// ```compile_fail
-/// use herdr_projects::profile_preparation::NativePreparation;
+/// use herdr_farm::profile_preparation::NativePreparation;
 /// let _: NativePreparation = serde_json::from_str("{}").unwrap();
 /// ```
 #[derive(Serialize)]

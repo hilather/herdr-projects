@@ -13,7 +13,7 @@ fn execute_with(input:&Input,control:&Control,after_claim:impl FnOnce()->Result<
     check_route(input,control,&locks)?;if let Some(remote)=&input.remote {crate::remote_api::probe(&remote.route,&remote.binary,control,&locks)?;}
     let herdr=crate::herdr::Herdr::new(&input.herdr,&input.socket,&crate::runner::RealRunner);
     if input.remote.is_none() {
-        let out=herdr_projects::supervision::run(herdr.cmd(crate::herdr::CALL_TIMEOUT).args(["remote-api-bridge","--check"]),control.deadline,control.cancellation.clone(),&locks)?;
+        let out=herdr_farm::supervision::run(herdr.cmd(crate::herdr::CALL_TIMEOUT).args(["remote-api-bridge","--check"]),control.deadline,control.cancellation.clone(),&locks)?;
         control.check()?;ensure!(out.success()&&out.stdout.trim()=="herdr-api-bridge-v1","local Herdr JSON API bridge unavailable");
     }
     let agents:Vec<crate::herdr::Agent>=serde_json::from_value(call(input,&herdr,"agent.list",None,control,&locks)?["agents"].clone())?;
@@ -39,7 +39,7 @@ fn execute_with(input:&Input,control:&Control,after_claim:impl FnOnce()->Result<
         // Raw JSON bridge acknowledges submission. Unlike the CLI's start/wait
         // wrapper, it does not reinterpret a later trust dialog as a lost start.
         let payload=serde_json::to_string(&serde_json::json!({"id":id,"method":"agent.start","params":params}))?+"\n";
-        let out=herdr_projects::supervision::run(herdr.cmd(crate::herdr::CALL_TIMEOUT).arg("remote-api-bridge").stdin(payload),control.deadline,control.cancellation.clone(),&locks)?;control.check()?;
+        let out=herdr_farm::supervision::run(herdr.cmd(crate::herdr::CALL_TIMEOUT).arg("remote-api-bridge").stdin(payload),control.deadline,control.cancellation.clone(),&locks)?;control.check()?;
         ensure!(out.success(),"local launch API bridge failed");let reply:serde_json::Value=serde_json::from_str(&out.stdout)?;
         ensure!(reply["id"].as_str()==Some(&id)&&reply.get("error").is_none(),"local launch acknowledgement mismatch or rejection");reply.get("result").cloned().context("local launch reply lacks result")?
     };

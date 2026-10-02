@@ -13,7 +13,7 @@
 //! start unless their login is shared and their directory trusted, as the real
 //! ones do. Tests marked "socket" bind Unix sockets and cannot run in a
 //! sandbox that forbids it.
-use herdr_projects::{domain::*, worker_supervision::{ProcessIncarnation, SupervisorIdentity}};
+use herdr_farm::{domain::*, worker_supervision::{ProcessIncarnation, SupervisorIdentity}};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
@@ -23,7 +23,7 @@ use std::{
     process::{Command, Output},
 };
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 /// The stand-in Herdr: `--version`, probes and the API bridge as in the other
 /// suites, plus `server`, which serves one native workspace backed by a real
@@ -185,7 +185,7 @@ impl Lab {
         let key = home.join("owner");
         assert!(Command::new("/usr/bin/ssh-keygen").args(["-q", "-t", "ed25519", "-N", "", "-f"]).arg(&key).output().unwrap().status.success());
         let public = fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
-        let config = home.join(".config/herdr-projects/config.toml");
+        let config = home.join(".config/herdr-farm/config.toml");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         let budget = "max_wall_seconds=600\nunknown_usage='allow_with_warning'\n";
         fs::write(&config, format!(
@@ -199,7 +199,7 @@ impl Lab {
         for command in ["new", "pause"] {
             lab.ok(&[command, "demo"]);
         }
-        herdr_projects::migration::apply(&lab.project, &herdr_projects::migration::inspect_with_config(&lab.project, &config).unwrap(), true).unwrap();
+        herdr_farm::migration::apply(&lab.project, &herdr_farm::migration::inspect_with_config(&lab.project, &config).unwrap(), true).unwrap();
         fs::write(lab.home.join("bin/herdr"), herdr).unwrap();
         for (name, version, login, trust) in [("codex", "codex-cli 0.154.0", ".codex/auth.json", ".codex/config.toml"), ("claude", "2.1.0 (Claude Code)", "", ".claude.json")] {
             let source = lab.home.join(format!("bin/{name}.rs"));
@@ -304,7 +304,7 @@ impl Lab {
     }
     /// Follow the closing script of the attempt's retained brief as the worker
     /// would: edit the deliverable in a worktree of the repository and run the
-    /// script. `herdr-projects` resolves to the product CLI with the spool
+    /// script. `herdr-farm` resolves to the product CLI with the spool
     /// variable removed, so outside any sandbox it records the submission
     /// directly (inside the sandbox the same command goes through the spool).
     fn follow_brief(&self, attempt: &str, output: &str, branch: &str) -> Output {
@@ -317,13 +317,13 @@ impl Lab {
         fs::write(worktree.join(output), "The plan.\n").unwrap();
         let shim = self.home.join("shim");
         fs::create_dir_all(&shim).unwrap();
-        fs::write(shim.join("herdr-projects"), format!("#!/bin/sh\nunset HERDR_PROJECTS_SUBMISSION_SPOOL\nexec {BIN} \"$@\"\n")).unwrap();
-        fs::set_permissions(shim.join("herdr-projects"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(shim.join("herdr-farm"), format!("#!/bin/sh\nunset HERDR_FARM_SUBMISSION_SPOOL\nexec {BIN} \"$@\"\n")).unwrap();
+        fs::set_permissions(shim.join("herdr-farm"), fs::Permissions::from_mode(0o700)).unwrap();
         Command::new("/bin/sh").arg("-c").arg(script).current_dir(&worktree).env_clear()
             .env("HOME", &self.home).env("HERDR_PROJECTS_OWNER_HOME", &self.home).env("PATH", format!("{}:/usr/bin:/bin", shim.display()))
             .env("TMPDIR", std::env::var_os("TMPDIR").unwrap_or("/tmp".into())).env("XDG_RUNTIME_DIR", self.runtime.path())
             .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("HERDR_PROJECTS_SUBMISSION_SPOOL", self.project.join(".state/spool").join(attempt)).output().unwrap()
+            .env("HERDR_FARM_SUBMISSION_SPOOL", self.project.join(".state/spool").join(attempt)).output().unwrap()
     }
     fn run_args<'a>(&'a self, task: &'a str, profile: &'a str, output: &'a str, prompt: &'a str) -> Vec<&'a str> {
         vec!["launch", "demo", "run", "--task", task, "--profile", profile, "--repository", self.repo.to_str().unwrap(), "--plan-output", output,
@@ -337,12 +337,12 @@ impl Lab {
 #[test]
 fn launch_run_refuses_loudly_at_the_first_failing_step_and_changes_nothing() {
     let lab = Lab::new();
-    let before = herdr_projects::runtime::snapshot(&lab.project).unwrap();
+    let before = herdr_farm::runtime::snapshot(&lab.project).unwrap();
     let prompt = lab.home.join("prompt.txt");
     fs::write(&prompt, "Plan the next milestone.").unwrap();
     let error = lab.fail(&lab.run_args("plan-codex", "codex-sol", "docs/plan-codex.md", prompt.to_str().unwrap()));
     assert!(error.contains("stopped at step 1") && error.contains("no launchable evidence retained for profile codex-sol") && error.contains("verify-interaction"), "{error}");
-    assert_eq!(herdr_projects::runtime::snapshot(&lab.project).unwrap(), before, "a refused run must not write");
+    assert_eq!(herdr_farm::runtime::snapshot(&lab.project).unwrap(), before, "a refused run must not write");
     assert!(!lab.root.join(".herdr-run").exists(), "no Herdr server directory before the first step passes");
     // HERDR_BIN_PATH must name the verified Herdr by absolute path.
     let out = Command::new(BIN).env_clear().env("HOME", &lab.home).env("HERDR_PROJECTS_OWNER_HOME", &lab.home).env("PATH", "/usr/bin:/bin").env("HERDR_BIN_PATH", "herdr")
@@ -427,7 +427,7 @@ fn launch_run_reserves_a_planning_task_for_each_kind_and_reruns_safely() {
         for step in ["profile_evidence", "project_control", "task", "contract", "queue", "scheduler_capacity", "integration_target", "herdr_server", "binding", "reconcile_and_activate", "knowledge_snapshot", "draft", "approval_import", "reserve"] {
             assert!(names.contains(&step), "{step} missing from {names:?}");
         }
-        let state = herdr_projects::runtime::snapshot(&lab.project).unwrap();
+        let state = herdr_farm::runtime::snapshot(&lab.project).unwrap();
         let record = state.tasks.iter().find(|t| t.id.as_str() == task).unwrap();
         assert_eq!(record.active_attempt.as_ref().map(|a| a.as_str()), Some(attempt.as_str()));
         // The retained brief carries the project instructions, the task text and the deliverable.
@@ -436,7 +436,7 @@ fn launch_run_reserves_a_planning_task_for_each_kind_and_reruns_safely() {
         // The brief ends with the exact submission the worker must make; following
         // it records one submission bound to this attempt's contract.
         let brief_text = lab.ok(&["memory", "demo", "attempt-brief", "--attempt", &attempt])["text"].as_str().unwrap().to_owned();
-        assert!(brief_text.contains("submission_id") && brief_text.contains("result demo submit"), "{brief_text}");
+        assert!(brief_text.contains("herdr-farm --root") && brief_text.contains("submission_id") && brief_text.contains("result demo submit"), "{brief_text}");
         let branch = format!("worker-{task}");
         let followed = lab.follow_brief(&attempt, &output, &branch);
         assert!(followed.status.success() && String::from_utf8_lossy(&followed.stdout).contains("submission_id"), "{}{}", String::from_utf8_lossy(&followed.stdout), String::from_utf8_lossy(&followed.stderr));
@@ -454,7 +454,7 @@ fn launch_run_reserves_a_planning_task_for_each_kind_and_reruns_safely() {
                 assert_eq!(step["outcome"], "already_done", "{again}");
             }
         }
-        assert_eq!(herdr_projects::runtime::snapshot(&lab.project).unwrap().attempts.len(), attempts.len() + 1);
+        assert_eq!(herdr_farm::runtime::snapshot(&lab.project).unwrap().attempts.len(), attempts.len() + 1);
         attempts.push(attempt);
     }
     assert_ne!(attempts[0], attempts[1]);
@@ -462,13 +462,13 @@ fn launch_run_reserves_a_planning_task_for_each_kind_and_reruns_safely() {
     assert_eq!(queue["policy"]["max_active_workers"], 2, "{queue}");
     // A task needing a new binding is refused before anything changes while
     // attempts are unfinished (the binding would pause the project).
-    let before = herdr_projects::runtime::snapshot(&lab.project).unwrap();
+    let before = herdr_farm::runtime::snapshot(&lab.project).unwrap();
     let mut third = lab.run_args("plan-third", "codex-sol", "docs/plan-third.md", prompt.to_str().unwrap()).into_iter().map(str::to_owned).collect::<Vec<_>>();
     let socket = lab.socket_inode_once("plan-third.sock");
     third.extend(["--herdr-socket".into(), socket.display().to_string()]);
     let error = lab.fail(&third.iter().map(String::as_str).collect::<Vec<_>>());
     assert!(error.contains("--prepare-only") && error.contains("pauses the project"), "{error}");
-    let after = herdr_projects::runtime::snapshot(&lab.project).unwrap();
+    let after = herdr_farm::runtime::snapshot(&lab.project).unwrap();
     assert_eq!(after.control.as_ref().unwrap().state, ProjectState::Active, "the project must stay active");
     assert_eq!(after.runtime_bindings.len(), before.runtime_bindings.len(), "no binding was created");
 }
@@ -480,7 +480,7 @@ fn launch_run_reserves_a_planning_task_for_each_kind_and_reruns_safely() {
 #[test]
 fn a_claude_profile_without_a_setup_token_file_is_refused_by_verification_and_launch_run() {
     let lab = Lab::with_herdr(STATIC_HERDR);
-    let config = lab.home.join(".config/herdr-projects/config.toml");
+    let config = lab.home.join(".config/herdr-farm/config.toml");
     let token = lab.home.join("claude-setup-token");
     let with_token = fs::read_to_string(&config).unwrap();
     let without = with_token.replace(&format!("[worker_isolation.login]\nclaude_token_file={token:?}\n"), "");
@@ -493,10 +493,10 @@ fn a_claude_profile_without_a_setup_token_file_is_refused_by_verification_and_la
     let mut args: Vec<String> = lab.run_args("plan-claude", "claude-sonnet", "docs/plan-claude.md", prompt.to_str().unwrap()).into_iter().map(str::to_owned).collect();
     args.extend(["--herdr-socket".into(), socket.display().to_string()]);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let before = herdr_projects::runtime::snapshot(&lab.project).unwrap();
+    let before = herdr_farm::runtime::snapshot(&lab.project).unwrap();
     let error = lab.fail(&args);
     assert!(error.contains("stopped at step 1") && error.contains("claude_token_file") && error.contains("claude setup-token"), "{error}");
-    assert_eq!(herdr_projects::runtime::snapshot(&lab.project).unwrap(), before, "a refused run must not write");
+    assert_eq!(herdr_farm::runtime::snapshot(&lab.project).unwrap(), before, "a refused run must not write");
     // Verification refuses the same profile before it starts any server.
     let (herdr, agent, home) = (lab.home.join("bin/herdr"), lab.home.join("bin/claude"), lab.home.join("agent-home-claude"));
     let verify = ["profile", "verify-interaction", "demo", "claude-sonnet", "--herdr-executable", herdr.to_str().unwrap(),
@@ -521,7 +521,7 @@ fn launch_run_reacknowledges_an_owner_configuration_edited_since_control_was_act
         lab.ok(&args.iter().map(String::as_str).collect::<Vec<_>>())
     };
     let step = |report: &Value, name: &str| report["steps"].as_array().unwrap().iter().find(|s| s["step"] == name).cloned().unwrap();
-    let acknowledged = |lab: &Lab| herdr_projects::runtime::snapshot(&lab.project).unwrap().control.unwrap().config_digest;
+    let acknowledged = |lab: &Lab| herdr_farm::runtime::snapshot(&lab.project).unwrap().control.unwrap().config_digest;
     lab.plant_launchable("codex-sol", "codex", "gpt-6.1-sol");
     let first = prepare(&lab, "plan-one");
     assert_eq!(step(&first, "project_control")["outcome"], "done", "{first}");
@@ -529,7 +529,7 @@ fn launch_run_reacknowledges_an_owner_configuration_edited_since_control_was_act
     assert!(before.is_some());
 
     // The owner edits the configuration; the profile is prepared against the new bytes.
-    let config = lab.home.join(".config/herdr-projects/config.toml");
+    let config = lab.home.join(".config/herdr-farm/config.toml");
     let mut text = fs::read_to_string(&config).unwrap();
     text.push_str("\n# edited by the owner after the project was activated\n");
     fs::write(&config, text).unwrap();
@@ -540,7 +540,7 @@ fn launch_run_reacknowledges_an_owner_configuration_edited_since_control_was_act
     assert_eq!(step(&second, "contract")["outcome"], "done", "{second}");
     let after = acknowledged(&lab);
     assert_ne!(after, before, "control acknowledges the edited configuration");
-    assert_eq!(after, herdr_projects::migration::config_reference(&config).unwrap().digest);
+    assert_eq!(after, herdr_farm::migration::config_reference(&config).unwrap().digest);
     // Repeating changes nothing: the configuration is acknowledged now.
     let again = prepare(&lab, "plan-two");
     assert_eq!(step(&again, "project_control")["outcome"], "already_done", "{again}");
@@ -572,17 +572,17 @@ fn launch_run_retries_after_termination_but_refuses_an_unobserved_live_worker() 
         while !done() {
             assert!(std::time::Instant::now() < until,
                 "timed out waiting for {stage}\nattempt states: {:?}\nticker log:\n{}",
-                herdr_projects::runtime::snapshot(&lab.project).map(|s| s.attempts),
+                herdr_farm::runtime::snapshot(&lab.project).map(|s| s.attempts),
                 fs::read_to_string(lab.root.join(".ticker.log")).unwrap_or_default());
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     };
-    wait("first attempt Running", &|| herdr_projects::runtime::snapshot(&lab.project).is_ok_and(|s|
+    wait("first attempt Running", &|| herdr_farm::runtime::snapshot(&lab.project).is_ok_and(|s|
         s.attempts.iter().any(|a| a.id.as_str() == attempt && a.state == AttemptState::Running)));
     // Stop only this fixture's ticker: the worker remains alive and its old
     // observation cannot acknowledge edited owner configuration.
     ticker.0.kill().unwrap();ticker.0.wait().unwrap();
-    let config = lab.home.join(".config/herdr-projects/config.toml");
+    let config = lab.home.join(".config/herdr-farm/config.toml");
     let original = fs::read_to_string(&config).unwrap();
     fs::write(&config, format!("{original}\n# owner edit\n")).unwrap();
     lab.plant_launchable("codex-sol", "codex", "gpt-6.1-sol");
@@ -608,13 +608,13 @@ fn launch_run_retries_after_termination_but_refuses_an_unobserved_live_worker() 
         }
     }
     assert_eq!(killed, 1, "exactly the fixture's worker agent is killed");
-    wait("first attempt termination observed after the worker died", &|| herdr_projects::runtime::snapshot(&lab.project).is_ok_and(|s|
+    wait("first attempt termination observed after the worker died", &|| herdr_farm::runtime::snapshot(&lab.project).is_ok_and(|s|
         s.attempts.iter().any(|a| a.id.as_str() == attempt && a.termination_observed)));
     ticker.0.kill().unwrap();ticker.0.wait().unwrap();
     lab.ok(&["launch", "demo", "stop", "--task", "plan-retry"]);
     let old_worktree = PathBuf::from(first["worktree"].as_str().unwrap());
     assert!(old_worktree.is_dir());
-    let ended = herdr_projects::runtime::snapshot(&lab.project).unwrap();
+    let ended = herdr_farm::runtime::snapshot(&lab.project).unwrap();
     assert_eq!(ended.attempts.iter().find(|a| a.id.as_str() == attempt).unwrap().state, AttemptState::Failed);
     assert_eq!(ended.tasks.iter().find(|t| t.id.as_str() == "plan-retry").unwrap().state, TaskState::Blocked);
     fs::write(&config, format!("{original}\n# owner edit after termination\n")).unwrap();
@@ -623,7 +623,7 @@ fn launch_run_retries_after_termination_but_refuses_an_unobserved_live_worker() 
     assert_ne!(second["attempt"], first["attempt"]);
     assert_ne!(second["worktree"], first["worktree"]);
     assert!(old_worktree.is_dir(), "old attempt worktree remains evidence");
-    let state = herdr_projects::runtime::snapshot(&lab.project).unwrap();
+    let state = herdr_farm::runtime::snapshot(&lab.project).unwrap();
     assert_eq!(state.attempts.len(), 2);
     let binding = state.runtime_bindings.iter().find(|b| b.task.as_ref().is_some_and(|t| t.as_str() == "plan-retry")).unwrap();
     assert!(binding.identity.pane_id.is_empty() && binding.identity.worktree_path.is_empty(), "reservation uses the reset binding");
@@ -677,7 +677,7 @@ fn launch_run_with_a_dedicated_server_after_verify_interaction_reserves_both_kin
         attempts.push(attempt);
     }
     assert_ne!(attempts[0], attempts[1]);
-    let state = herdr_projects::runtime::snapshot(&lab.project).unwrap();
+    let state = herdr_farm::runtime::snapshot(&lab.project).unwrap();
     assert_eq!(state.attempts.len(), 2);
     assert_eq!(state.control.unwrap().state, ProjectState::Active);
 

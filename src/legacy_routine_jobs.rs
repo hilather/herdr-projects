@@ -4,7 +4,7 @@ use std::{path::{Path,PathBuf},os::unix::fs::MetadataExt,sync::Arc,time::{Durati
 use anyhow::{Result,Context,ensure};
 use serde::{Serialize,Deserialize};
 use crate::{executor::{Identity,Lane,Request},paths::Ctx,project::{self,Project},routine::{self,Routine,Ran},runner::{Cmd,Output,Runner},source_tree::Control,steps,thread::sha256_hex};
-use herdr_projects::execution_guard::ProjectGuard;
+use herdr_farm::execution_guard::ProjectGuard;
 const JOB:&str="\0herdr-projects-legacy-routine";
 const BUDGET:Duration=Duration::from_secs(95);
 const INPUT_LIMIT:usize=128*1024;
@@ -82,7 +82,7 @@ fn execute_with(input:&Input,control:&Control,before_run:impl FnOnce()->Result<(
     before_run()?;
     input.current(&project,&guard,control)?;
     let command=Cmd::new("/bin/sh",routine::COMMAND_TIMEOUT).args(["-c",&routine.command]).cwd(project.dir());
-    let output=herdr_projects::supervision::run(command,control.deadline,control.cancellation.clone(),&locks)?;
+    let output=herdr_farm::supervision::run(command,control.deadline,control.cancellation.clone(),&locks)?;
     // Cancellation may end execution, but recording its observation is still
     // required. No output from the caller's injectable Runner reaches here.
     let mut result=routine::render_output(&output);

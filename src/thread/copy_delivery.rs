@@ -1,6 +1,6 @@
 //! Persist copy receipts before delivering independently retryable warnings.
 use super::*;
-use herdr_projects::copy_receipt::{CopyNotice, CopyReceipt};
+use herdr_farm::copy_receipt::{CopyNotice, CopyReceipt};
 
 pub fn validate(t: &Thread) -> Result<()> {
     super::prompt_delivery::validate(t)?;
@@ -19,7 +19,7 @@ pub fn validate(t: &Thread) -> Result<()> {
 pub fn ready(t: &Thread) -> Result<()> {
     ready_for(t,None)
 }
-fn ready_for(t:&Thread,intent:Option<&herdr_projects::live_copy_intent::LiveCopyIntent>)->Result<()> {
+fn ready_for(t:&Thread,intent:Option<&herdr_farm::live_copy_intent::LiveCopyIntent>)->Result<()> {
     validate(t)?;
     anyhow::ensure!(t.launch_claim.as_ref().is_none_or(|c|c.phase!=super::launch_delivery::Phase::Pending),"recover pending agent start first");
     anyhow::ensure!(t.prompt_claim.as_ref().is_none_or(|claim|claim.phase!=super::prompt_delivery::Phase::Pending),"recover pending brief delivery first");
@@ -34,10 +34,10 @@ fn ready_for(t:&Thread,intent:Option<&herdr_projects::live_copy_intent::LiveCopy
 pub fn record(project: &Project, expected: &Thread, copied: &Copied) -> Result<()> {
     record_inner(project,expected,copied,None,None)
 }
-pub(crate) fn record_projection(project:&Project,expected:&Thread,copied:&Copied,intent:&herdr_projects::live_copy_intent::LiveCopyIntent,control:&crate::source_tree::Control)->Result<()> {
+pub(crate) fn record_projection(project:&Project,expected:&Thread,copied:&Copied,intent:&herdr_farm::live_copy_intent::LiveCopyIntent,control:&crate::source_tree::Control)->Result<()> {
     record_inner(project,expected,copied,Some(intent),Some(control))
 }
-fn record_inner(project:&Project,expected:&Thread,copied:&Copied,intent:Option<&herdr_projects::live_copy_intent::LiveCopyIntent>,control:Option<&crate::source_tree::Control>)->Result<()> {
+fn record_inner(project:&Project,expected:&Thread,copied:&Copied,intent:Option<&herdr_farm::live_copy_intent::LiveCopyIntent>,control:Option<&crate::source_tree::Control>)->Result<()> {
     ready_for(expected,intent)?;
     anyhow::ensure!(expected.status == Status::Open && expected.removal.is_none(), "thread is not eligible for a live copy receipt");
     let notes = match &copied.outcome {

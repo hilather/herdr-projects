@@ -4,15 +4,15 @@
 use std::path::Path;
 use std::process::Command;
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 #[cfg(all(feature="state-store",target_os="linux"))]
 #[test]
 fn launch_worker_snapshot_cli_retains_instructions_and_refuses_missing_source() {
-    use herdr_projects::{domain::TaskId,migration,runtime};
+    use herdr_farm::{domain::TaskId,migration,runtime};
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
     for action in ["new","pause"] {assert!(hp(home.path(),&["--root",r,action,"demo"]).status.success());}
-    let config=home.path().join(".config/herdr-projects");std::fs::create_dir_all(&config).unwrap();
+    let config=home.path().join(".config/herdr-farm");std::fs::create_dir_all(&config).unwrap();
     std::fs::write(config.join("config.toml"),"[profiles.worker]\nkind='codex'\npermission_policy='interactive'\n").unwrap();
     let project=root.join("demo");let plan=migration::inspect(&project).unwrap();migration::apply(&project,&plan,true).unwrap();
     runtime::add_task(&project,TaskId::new("task").unwrap(),"Assigned work".into(),runtime::snapshot(&project).unwrap().head).unwrap();
@@ -22,7 +22,7 @@ fn launch_worker_snapshot_cli_retains_instructions_and_refuses_missing_source() 
     let out=hp(home.path(),&args);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
     let snapshot:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();assert_eq!(snapshot["estimator"],"char-count-worker-brief-v2");
     std::fs::remove_file(project.join("PROJECT.md")).unwrap();
-    let retained=herdr_projects::memory::render_knowledge_snapshot(&project,snapshot["id"].as_str().unwrap()).unwrap();
+    let retained=herdr_farm::memory::render_knowledge_snapshot(&project,snapshot["id"].as_str().unwrap()).unwrap();
     assert!(retained["text"].as_str().unwrap().contains("Retained instructions 🔥"));
     let before=runtime::snapshot(&project).unwrap();let out=hp(home.path(),&args);assert!(!out.status.success());assert_eq!(runtime::snapshot(&project).unwrap(),before);
     std::fs::write(project.join("PROJECT.md"),[0xff]).unwrap();let out=hp(home.path(),&args);assert!(!out.status.success());
@@ -37,7 +37,7 @@ fn launch_exec_consumes_one_private_digest_bound_spec_and_execs_the_supervisor()
     let home=tempfile::tempdir().unwrap();let base=home.path().canonicalize().unwrap();
     let dir=base.join("launch-specs");fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
     let marker=base.join("started");
-    let argv=herdr_projects::worker_supervision::command(Path::new("/usr/bin/touch"),&[marker.display().to_string()],5).unwrap();
+    let argv=herdr_farm::worker_supervision::command(Path::new("/usr/bin/touch"),&[marker.display().to_string()],5).unwrap();
     let digest=format!("{:x}",Sha256::digest(serde_json::to_vec(&argv).unwrap()));
     let body=serde_json::to_vec(&serde_json::json!({"version":1,"operation":"cli","cwd":base,"command_digest":digest,"argv":argv})).unwrap();
     let spec=dir.join(format!("{digest}.spec"));let other=dir.join(format!("{}.spec","0".repeat(64)));
@@ -57,7 +57,7 @@ fn launch_exec_consumes_one_private_digest_bound_spec_and_execs_the_supervisor()
 #[test]
 fn ticker_canonical_observations_commit_cancel_and_restart_in_the_shared_pool() {
     use std::{fs,os::unix::{fs::PermissionsExt,net::UnixListener},process::Stdio,time::{Duration,Instant}};
-    use herdr_projects::{migration,runtime,domain::RuntimeRoute,reconcile::ResourceState};
+    use herdr_farm::{migration,runtime,domain::RuntimeRoute,reconcile::ResourceState};
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
     for action in ["new","pause"]{assert!(hp(home.path(),&["--root",r,action,"demo"]).status.success());}
     let project=root.join("demo");let plan=migration::inspect(&project).unwrap();migration::apply(&project,&plan,true).unwrap();
@@ -83,9 +83,9 @@ print(json.dumps({{'result':r}}))
     let mut child=spawn();wait(&mut child,&||runtime::snapshot(&project).unwrap().observations.iter().any(|o|o.pane==ResourceState::Present));stop(&mut child);
     let before=runtime::snapshot(&project).unwrap();fs::remove_file(home.path().join("entered")).unwrap();fs::write(home.path().join("mode"),"blocked").unwrap();
     let mut child=spawn();wait(&mut child,&||home.path().join("entered").exists());
-    assert!(herdr_projects::execution_guard::ProjectGuard::acquire(&project).is_err());stop(&mut child);assert_eq!(runtime::snapshot(&project).unwrap(),before);
+    assert!(herdr_farm::execution_guard::ProjectGuard::acquire(&project).is_err());stop(&mut child);assert_eq!(runtime::snapshot(&project).unwrap(),before);
     fs::write(home.path().join("mode"),"ok").unwrap();let mut child=spawn();wait(&mut child,&||runtime::snapshot(&project).unwrap().head>before.head);stop(&mut child);
-    assert!(herdr_projects::execution_guard::ProjectGuard::acquire(&project).is_ok());
+    assert!(herdr_farm::execution_guard::ProjectGuard::acquire(&project).is_ok());
     let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();
     let observed=||raw.query_row("SELECT coalesce(max(observed_unix_ms),0) FROM runtime_observations",[],|row|row.get::<_,i64>(0)).unwrap();
     let previous=observed();
@@ -101,7 +101,7 @@ print(json.dumps({{'result':r}}))
 #[cfg(feature="state-store")]
 #[test]
 fn signed_routine_cli_records_then_explicitly_executes_once_with_durable_cleanup() {
-    use herdr_projects::{domain::*,authority,migration,runtime};
+    use herdr_farm::{domain::*,authority,migration,runtime};
     use sha2::{Digest,Sha256};
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();
     for action in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,action,"demo"]).status.success());}
@@ -136,7 +136,7 @@ fn signed_routine_cli_records_then_explicitly_executes_once_with_durable_cleanup
         let receipt:RoutineReceipt=serde_json::from_slice(&output.stdout).unwrap();assert!(receipt.cleanup_verified && receipt.succeeded,"{receipt:?}");
         assert_eq!(receipt.stdout,b"result\x1b[31m");
         let completed=runtime::snapshot(&project).unwrap();assert_eq!(completed.routine_receipts,vec![receipt]);
-        assert_eq!(completed.deliveries[0].state,herdr_projects::operations::DeliveryState::Confirmed);
+        assert_eq!(completed.deliveries[0].state,herdr_farm::operations::DeliveryState::Confirmed);
         let result=completed.inbox.iter().find(|i|i.content.kind=="routine-result").unwrap();assert!(!result.content.body.contains('\x1b'));
         let current=completed.head.to_string();
         assert!(!hp(home.path(),&["--root",root_arg,"routine-store","demo","execute",operation,"--expected-head",&current]).status.success());
@@ -161,13 +161,13 @@ fn retire_history(project:&Path) {
         INSERT INTO operations(id,task_id,kind,target,payload_version,payload,payload_hash,expected_revision,due_unix_ms,idempotency_key) VALUES('cold-op','cold-history','runtime.retired','retired',1,'{}',printf('%064d',0),1,0,'cold-op');
         UPDATE operation_delivery SET state='confirmed' WHERE operation_id='cold-op';").unwrap();
     tx.commit().unwrap();
-    assert!(herdr_projects::runtime::snapshot(project).is_err(),"cold history must make whole-history reads fail");
+    assert!(herdr_farm::runtime::snapshot(project).is_err(),"cold history must make whole-history reads fail");
 }
 
 #[cfg(all(feature="state-store",target_os="linux"))]
 #[test]
 fn effect_commands_read_only_their_rows_with_ten_thousand_retired_neighbors() {
-    use herdr_projects::{domain::*,authority,migration,runtime};
+    use herdr_farm::{domain::*,authority,migration,runtime};
     use sha2::{Digest,Sha256};
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
     for project in ["demo","fin","note"] {for action in ["new","pause"] {assert!(hp(home.path(),&["--root",r,action,project]).status.success());}}
@@ -212,7 +212,7 @@ fn effect_commands_read_only_their_rows_with_ten_thousand_retired_neighbors() {
     let note_head=runtime::add_task(&note,TaskId::new("notify").unwrap(),"notify".into(),head_of(&note)).unwrap();
     runtime::create_binding(&note,None,None,note_head,&RuntimeRoute{socket:"/explicit/notification.sock".into(),..Default::default()}).unwrap();
     assert!(hp(home.path(),&["--root",r,"reconcile","note","--record"]).status.success());
-    let s=runtime::snapshot(&note).unwrap();runtime::set_state(&note,s.head,s.control.unwrap().revision,ProjectState::Active,&home.path().join(".config/herdr-projects/config.toml")).unwrap();
+    let s=runtime::snapshot(&note).unwrap();runtime::set_state(&note,s.head,s.control.unwrap().revision,ProjectState::Active,&home.path().join(".config/herdr-farm/config.toml")).unwrap();
 
     // Retain 10,000 unrelated rows plus undecodable cold rows in every store.
     retire_history(&fin);retire_history(&project);retire_history(&note);
@@ -275,7 +275,7 @@ fn effect_commands_read_only_their_rows_with_ten_thousand_retired_neighbors() {
 #[cfg(feature="state-store")]
 #[test]
 fn approval_cli_uses_pinned_policy_and_refuses_unsigned_import() {
-    use herdr_projects::{authority, migration, runtime};
+    use herdr_farm::{authority, migration, runtime};
     let home=tempfile::tempdir().unwrap();
     let caller=tempfile::tempdir().unwrap();
     let root=home.path().join("root");
@@ -324,7 +324,7 @@ fn approval_cli_uses_pinned_policy_and_refuses_unsigned_import() {
 fn profile_probe_binds_explicit_binaries_without_launching_profile_arguments() {
     use std::os::unix::fs::PermissionsExt;
     let home = tempfile::tempdir().unwrap();
-    let config = home.path().join(".config/herdr-projects");
+    let config = home.path().join(".config/herdr-farm");
     std::fs::create_dir_all(&config).unwrap();
     let herdr = home.path().join("herdr-bin");
     let agent = home.path().join("agent-bin");
@@ -353,14 +353,14 @@ fn profile_probe_binds_explicit_binaries_without_launching_profile_arguments() {
         let failed=hp(home.path(),&args);assert!(failed.status.success(),"{}",String::from_utf8_lossy(&failed.stderr));
         let failed:serde_json::Value=serde_json::from_slice(&failed.stdout).unwrap();assert_eq!(failed["agent"]["status"],"probe_failed");assert!(failed["agent"]["version"].is_null());assert_eq!(failed["profile"]["launchable"],false);
         assert_eq!(std::fs::read(config.join("config.toml")).unwrap(), original_config, "probing must not rewrite model, effort, arguments or environment");
-        assert!(!home.path().join(".herdr-projects").exists());
+        assert!(!home.path().join(".herdr-farm").exists());
     }
 }
 
 #[test]
 fn profile_inspection_is_redacted_read_only_and_refuses_malformed_config() {
     let home = tempfile::tempdir().unwrap();
-    let config = home.path().join(".config/herdr-projects");
+    let config = home.path().join(".config/herdr-farm");
     std::fs::create_dir_all(&config).unwrap();
     let path = config.join("config.toml");
     let text = "[profiles.worker]\nkind='codex'\npermission_policy='interactive'\nextra_args=['SECRET_VALUE']\nenvironment=['SECRET_VARIABLE']\n";
@@ -373,7 +373,7 @@ fn profile_inspection_is_redacted_read_only_and_refuses_malformed_config() {
     assert_eq!(value["capabilities"]["resume"], "unknown");
     assert!(!String::from_utf8_lossy(&output.stdout).contains("SECRET"));
     assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
-    assert!(!home.path().join(".herdr-projects").exists());
+    assert!(!home.path().join(".herdr-farm").exists());
     for bad in ["SECRET = [", "[profiles.worker]\nkind='codex'\npermission_policy='interactive'\ncredential='SECRET'"] {
         std::fs::write(&path, bad).unwrap();
         let output = hp(home.path(), &["profile", "inspect", "worker"]);
@@ -385,7 +385,7 @@ fn profile_inspection_is_redacted_read_only_and_refuses_malformed_config() {
 #[test]
 fn profile_resolve_prints_envelope_without_argv_and_selects_unique_kind() {
     let home = tempfile::tempdir().unwrap();
-    let config = home.path().join(".config/herdr-projects");
+    let config = home.path().join(".config/herdr-farm");
     std::fs::create_dir_all(&config).unwrap();
     let path = config.join("config.toml");
     std::fs::write(&path, "[profiles.implementation]\nkind='codex'\npermission_policy='interactive'\nextra_args=['SECRET_ARG']\n[profiles.implementation.budget]\nsoft_input_tokens=80\nunknown_usage='allow_with_warning'\n[profiles.planner]\nkind='claude'\npermission_policy='interactive'\n").unwrap();
@@ -407,7 +407,7 @@ fn profile_resolve_prints_envelope_without_argv_and_selects_unique_kind() {
     let output = hp(home.path(), &["profile", "resolve", "--agent", "codex"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("multiple named profiles"));
-    assert!(!home.path().join(".herdr-projects").exists());
+    assert!(!home.path().join(".herdr-farm").exists());
 }
 
 fn hp(home: &Path, args: &[&str]) -> std::process::Output {
@@ -422,7 +422,7 @@ fn hp(home: &Path, args: &[&str]) -> std::process::Output {
 #[test]
 fn build_info_is_independent_of_config_projects_and_sessions() {
     let home=tempfile::tempdir().unwrap();
-    let config=home.path().join(".config/herdr-projects");
+    let config=home.path().join(".config/herdr-farm");
     std::fs::create_dir_all(&config).unwrap();
     std::fs::write(config.join("config.toml"),"this is deliberately invalid TOML [").unwrap();
     let root=home.path().join("must-not-be-created");
@@ -434,9 +434,9 @@ fn build_info_is_independent_of_config_projects_and_sessions() {
     assert_eq!(value["live_capacity_certified"],false);
     #[cfg(feature="state-store")]
     {
-        assert_eq!(value["schema"],herdr_projects::store::SCHEMA);
+        assert_eq!(value["schema"],herdr_farm::store::SCHEMA);
         assert_eq!(value["sqlite"]["version"],rusqlite::version());
-        assert_eq!(value["sqlite"]["minimum"],herdr_projects::store::MIN_SQLITE_VERSION);
+        assert_eq!(value["sqlite"]["minimum"],herdr_farm::store::MIN_SQLITE_VERSION);
     }
     #[cfg(not(feature="state-store"))]
     {
@@ -487,7 +487,7 @@ fn doctor_reports_compiled_features_without_migrating_a_legacy_project() {
     {
         assert!(text.contains("state-store: compiled\n"), "{text}");
         assert!(
-            text.contains(&format!("schema: {}\n", herdr_projects::store::SCHEMA)),
+            text.contains(&format!("schema: {}\n", herdr_farm::store::SCHEMA)),
             "{text}"
         );
         assert!(
@@ -584,7 +584,7 @@ fn path_like_names_and_slugs_are_refused() {
 fn ticker_start_without_projects_creates_nothing() {
     let home = tempfile::tempdir().unwrap();
     assert!(hp(home.path(), &["ticker", "start"]).status.success());
-    assert!(!home.path().join(".herdr-projects").exists());
+    assert!(!home.path().join(".herdr-farm").exists());
     assert!(!home.path().join(".config").exists());
 }
 
@@ -737,7 +737,7 @@ fn migration_cli_round_trip_keeps_memory_and_blocks_legacy_mutation() {
 }
 #[cfg(feature="state-store")]
 fn configure_checkpoint_profile(home: &std::path::Path) {
-    let config = home.join(".config/herdr-projects");
+    let config = home.join(".config/herdr-farm");
     std::fs::create_dir_all(&config).unwrap();
     std::fs::write(config.join("config.toml"), "[profiles.planner]\nkind='claude'\npermission_policy='interactive'\n").unwrap();
 }
@@ -801,7 +801,7 @@ fn preflight_refuses_fifo_and_oversized_external_config_without_hanging() {
     use std::{ffi::CString,os::unix::ffi::OsStrExt,process::Stdio,time::{Duration,Instant}};
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();
     assert!(hp(home.path(),&["--root",root_arg,"new","demo"]).status.success());assert!(hp(home.path(),&["--root",root_arg,"pause","demo"]).status.success());
-    let config=home.path().join(".config/herdr-projects/config.toml");std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let config=home.path().join(".config/herdr-farm/config.toml");std::fs::create_dir_all(config.parent().unwrap()).unwrap();
     for fifo in [true,false] {
         if fifo {let path=CString::new(config.as_os_str().as_bytes()).unwrap();
             // SAFETY: valid NUL-terminated disposable path, permissions only.
@@ -822,7 +822,7 @@ fn preflight_refuses_fifo_and_oversized_external_config_without_hanging() {
 fn migration_plan_binds_config_and_rejects_legacy_unbound_plans() {
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();
     for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
-    let config=home.path().join(".config/herdr-projects/config.toml");std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let config=home.path().join(".config/herdr-farm/config.toml");std::fs::create_dir_all(config.parent().unwrap()).unwrap();
     let bytes=b"private='do-not-print-this-value'\n";std::fs::write(&config,bytes).unwrap();
     let plan=home.path().join("plan.json");
     let out=hp(home.path(),&["--root",root_arg,"migration","demo","plan","--output",plan.to_str().unwrap()]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
@@ -841,7 +841,7 @@ fn migration_plan_binds_config_and_rejects_legacy_unbound_plans() {
 #[test]
 fn root_config_special_files_fail_promptly_without_an_explicit_root() {
     use std::{ffi::CString,os::unix::ffi::OsStrExt,process::Stdio,time::{Duration,Instant}};
-    let home=tempfile::tempdir().unwrap();let config=home.path().join(".config/herdr-projects/config.toml");
+    let home=tempfile::tempdir().unwrap();let config=home.path().join(".config/herdr-farm/config.toml");
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
     for fifo in [true,false] {
         if fifo {let path=CString::new(config.as_os_str().as_bytes()).unwrap();
@@ -859,11 +859,11 @@ fn root_config_special_files_fail_promptly_without_an_explicit_root() {
 #[test]
 #[cfg(feature="state-store")]
 fn plan_wait_cli_registers_replays_and_keeps_capacity_untouched() {
-    use herdr_projects::{domain::*,migration};
+    use herdr_farm::{domain::*,migration};
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();
     for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
     let project=root.join("demo");
-    let plan=migration::inspect_with_config(&project,&home.path().join(".config/herdr-projects/config.toml")).unwrap();
+    let plan=migration::inspect_with_config(&project,&home.path().join(".config/herdr-farm/config.toml")).unwrap();
     migration::apply(&project,&plan,true).unwrap();
     let mut db=migration::open_active(&project).unwrap();
     db.commit(Commit{expected_head:db.current_head().unwrap(),mutations:vec![Mutation::Task{expected:None,next:Task{id:TaskId::new("parent").unwrap(),revision:1,state:TaskState::Blocked,title:"parent".into(),active_attempt:None}}]}).unwrap();
@@ -924,10 +924,10 @@ fn plan_wait_cli_registers_replays_and_keeps_capacity_untouched() {
 #[test]
 #[cfg(feature="state-store")]
 fn planner_session_cli_retains_inputs_and_replays_bound_proposals() {
-    use herdr_projects::migration;
+    use herdr_farm::migration;
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();
     for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
-    let project=root.join("demo");let plan=migration::inspect_with_config(&project,&home.path().join(".config/herdr-projects/config.toml")).unwrap();migration::apply(&project,&plan,true).unwrap();
+    let project=root.join("demo");let plan=migration::inspect_with_config(&project,&home.path().join(".config/herdr-farm/config.toml")).unwrap();migration::apply(&project,&plan,true).unwrap();
     let before=migration::open_active(&project).unwrap().read_snapshot(None).unwrap();
     let intent=home.path().join("intent.txt");std::fs::write(&intent,"Add an independently verified feature\n").unwrap();
     let args=["--root",root_arg,"plan","session","demo","create","planner-1","--intent-file",intent.to_str().unwrap(),"--expected-head",&before.head.to_string(),"--expected-plan-revision","0"];
@@ -1037,10 +1037,10 @@ fn planner_session_cli_retains_inputs_and_replays_bound_proposals() {
 #[test]
 #[cfg(feature="state-store")]
 fn barrier_revoke_cli_records_refusal_without_releasing_capacity() {
-    use herdr_projects::migration;
+    use herdr_farm::migration;
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();
     for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
-    let project=root.join("demo");let plan=migration::inspect_with_config(&project,&home.path().join(".config/herdr-projects/config.toml")).unwrap();migration::apply(&project,&plan,true).unwrap();
+    let project=root.join("demo");let plan=migration::inspect_with_config(&project,&home.path().join(".config/herdr-farm/config.toml")).unwrap();migration::apply(&project,&plan,true).unwrap();
     let before=migration::open_active(&project).unwrap().read_snapshot(None).unwrap();
     let missing=hp(home.path(),&["--root",root_arg,"memory","demo","barrier","--id",&"a".repeat(64)]);
     assert!(missing.status.success(),"{}",String::from_utf8_lossy(&missing.stderr));
@@ -1061,10 +1061,10 @@ fn barrier_revoke_cli_records_refusal_without_releasing_capacity() {
 #[test]
 #[cfg(feature="state-store")]
 fn auto_replan_cli_requires_current_head_and_preserves_execution_state() {
-    use herdr_projects::migration;
+    use herdr_farm::migration;
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();
     for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
-    let project=root.join("demo");let plan=migration::inspect_with_config(&project,&home.path().join(".config/herdr-projects/config.toml")).unwrap();migration::apply(&project,&plan,true).unwrap();
+    let project=root.join("demo");let plan=migration::inspect_with_config(&project,&home.path().join(".config/herdr-farm/config.toml")).unwrap();migration::apply(&project,&plan,true).unwrap();
     let before=migration::open_active(&project).unwrap().read_snapshot(None).unwrap();
     let on=hp(home.path(),&["--root",root_arg,"plan","auto-replan","demo","on","--expected-head",&before.head.to_string()]);
     assert!(on.status.success(),"{}",String::from_utf8_lossy(&on.stderr));
@@ -1081,10 +1081,10 @@ fn auto_replan_cli_requires_current_head_and_preserves_execution_state() {
 #[test]
 #[cfg(feature="state-store")]
 fn recovery_wait_cli_preserves_owned_resources() {
-    use herdr_projects::{domain::*,migration,reconcile::{RuntimeObservation,ResourceState}};
+    use herdr_farm::{domain::*,migration,reconcile::{RuntimeObservation,ResourceState}};
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();
     for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
-    let project=root.join("demo");let plan=migration::inspect_with_config(&project,&home.path().join(".config/herdr-projects/config.toml")).unwrap();migration::apply(&project,&plan,true).unwrap();
+    let project=root.join("demo");let plan=migration::inspect_with_config(&project,&home.path().join(".config/herdr-farm/config.toml")).unwrap();migration::apply(&project,&plan,true).unwrap();
     let mut db=migration::open_active(&project).unwrap();
     db.commit(Commit{expected_head:db.current_head().unwrap(),mutations:vec![Mutation::Task{expected:None,next:Task{id:TaskId::new("waiting-adapter").unwrap(),revision:1,state:TaskState::Blocked,title:"waiting".into(),active_attempt:None}}]}).unwrap();
     let route=RuntimeRoute{socket:"/tmp/fixture-recovery.sock".into(),workspace_id:"w".into(),tab_id:"t".into(),pane_id:"p".into(),cwd:"/tmp".into(),..Default::default()};
@@ -1115,12 +1115,12 @@ fn recovery_wait_cli_preserves_owned_resources() {
 #[test]
 #[cfg(feature="state-store")]
 fn operation_expiry_is_visible_idempotent_and_never_dispatches() {
-    use herdr_projects::{migration,operations::{Outcome,DeliveryState}};
+    use herdr_farm::{migration,operations::{Outcome,DeliveryState}};
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();
     for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
     let project=root.join("demo");
     std::fs::write(project.join(".state/ticker.json"),br#"{"notification_retry":{"hash":"fixture-hash"}}"#).unwrap();
-    let plan=migration::inspect_with_config(&project,&home.path().join(".config/herdr-projects/config.toml")).unwrap();migration::apply(&project,&plan,true).unwrap();
+    let plan=migration::inspect_with_config(&project,&home.path().join(".config/herdr-farm/config.toml")).unwrap();migration::apply(&project,&plan,true).unwrap();
     let mut db=migration::open_active(&project).unwrap();let imported=db.deliveries().unwrap().remove(0);
     let pending=db.observe_operation(&imported.operation,imported.revision,"test-fixture",Outcome::Retryable{no_effect_evidence:"disposable fake effect never attempted".into()},0).unwrap();
     db.claim_operation(&pending.operation,pending.revision,"crashed-fixture",pending.next_due_ms,1).unwrap();drop(db);
@@ -1137,7 +1137,7 @@ fn imported_receipt_cli_previews_and_confirms_only_matching_completion() {
     for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
     let project=root.join("demo");let bytes=br#"{"nudged":"fixture-hash","notification_retry":{"hash":"fixture-hash"}}"#;
     std::fs::write(project.join(".state/ticker.json"),bytes).unwrap();
-    let plan=herdr_projects::migration::inspect(&project).unwrap();herdr_projects::migration::apply(&project,&plan,true).unwrap();
+    let plan=herdr_farm::migration::inspect(&project).unwrap();herdr_farm::migration::apply(&project,&plan,true).unwrap();
     let out=hp(home.path(),&["--root",root_arg,"operations","demo","receipt-plan"]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
     let report:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();assert_eq!(report["confirmed"],0);assert!(report["observations"][0]["receipt"].is_string());let head=report["head"].to_string();
     let args=["--root",root_arg,"operations","demo","observe-imported","--expected-head",&head];
@@ -1151,7 +1151,7 @@ fn migrated_runtime_bindings_require_explicit_upgrade_and_are_unverified() {
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();
     for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
     let project=root.join("demo");std::fs::write(project.join("threads/t-0001.toml"),"id='t-0001'\nstatus='resolved'\nrepo='/repo'\n").unwrap();
-    let plan=herdr_projects::migration::inspect(&project).unwrap();herdr_projects::migration::apply(&project,&plan,true).unwrap();
+    let plan=herdr_farm::migration::inspect(&project).unwrap();herdr_farm::migration::apply(&project,&plan,true).unwrap();
     let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();test_schema::historical(&raw, 4).unwrap();drop(raw);
     let args=["--root",root_arg,"migration","demo","bindings"];
     let out=hp(home.path(),&args);assert!(!out.status.success());assert!(String::from_utf8_lossy(&out.stderr).contains("upgrade-store"));
@@ -1166,11 +1166,11 @@ fn reconciliation_cli_records_unrecorded_identity_without_authorizing_execution(
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();
     for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
     let project=root.join("demo");std::fs::write(project.join("threads/t-1.toml"),"id='t-1'\nstatus='resolved'\n").unwrap();
-    let plan=herdr_projects::migration::inspect(&project).unwrap();herdr_projects::migration::apply(&project,&plan,true).unwrap();
-    let before=herdr_projects::runtime::snapshot(&project).unwrap();
-    let out=hp(home.path(),&["--root",root_arg,"reconcile","demo"]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));assert_eq!(herdr_projects::runtime::snapshot(&project).unwrap(),before);
+    let plan=herdr_farm::migration::inspect(&project).unwrap();herdr_farm::migration::apply(&project,&plan,true).unwrap();
+    let before=herdr_farm::runtime::snapshot(&project).unwrap();
+    let out=hp(home.path(),&["--root",root_arg,"reconcile","demo"]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));assert_eq!(herdr_farm::runtime::snapshot(&project).unwrap(),before);
     let out=hp(home.path(),&["--root",root_arg,"reconcile","demo","--record"]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));let report:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();assert_eq!(report["dispatch_allowed"],false);assert!(report["recorded_head"].is_number());assert_eq!(report["observations"][0]["pane"],"unrecorded");
-    let after=herdr_projects::runtime::snapshot(&project).unwrap();assert_eq!(after.tasks,before.tasks);assert_eq!(after.observations.len(),1);assert!(!hp(home.path(),&["--root",root_arg,"resume","demo"]).status.success());
+    let after=herdr_farm::runtime::snapshot(&project).unwrap();assert_eq!(after.tasks,before.tasks);assert_eq!(after.observations.len(),1);assert!(!hp(home.path(),&["--root",root_arg,"resume","demo"]).status.success());
 }
 
 #[test]
@@ -1178,7 +1178,7 @@ fn reconciliation_cli_records_unrecorded_identity_without_authorizing_execution(
 fn runtime_rebind_cli_requires_revisions_and_retains_legacy_bytes() {
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();
     for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
-    let project=root.join("demo");let bytes=b"id='t-1'\nstatus='resolved'\n";std::fs::write(project.join("threads/t-1.toml"),bytes).unwrap();let plan=herdr_projects::migration::inspect(&project).unwrap();herdr_projects::migration::apply(&project,&plan,true).unwrap();
+    let project=root.join("demo");let bytes=b"id='t-1'\nstatus='resolved'\n";std::fs::write(project.join("threads/t-1.toml"),bytes).unwrap();let plan=herdr_farm::migration::inspect(&project).unwrap();herdr_farm::migration::apply(&project,&plan,true).unwrap();
     let out=hp(home.path(),&["--root",root_arg,"runtime","demo","inspect"]);assert!(out.status.success());let view:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();let head=view["head"].to_string();
     let path=home.path().join("route.json");std::fs::write(&path,br#"{"socket":"/recorded.sock","workspace_id":"w","tab_id":"t","pane_id":"p","cwd":"/cwd"}"#).unwrap();
     let args=["--root",root_arg,"runtime","demo","rebind","thread:t-1","--route",path.to_str().unwrap(),"--expected-revision","1","--expected-head",&head];
@@ -1190,10 +1190,10 @@ fn runtime_rebind_cli_requires_revisions_and_retains_legacy_bytes() {
 fn canonical_lifecycle_cli_does_not_dual_write_legacy_status() {
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();
     for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
-    let project=root.join("demo");let legacy=std::fs::read(project.join(".state/project.json")).unwrap();let plan=herdr_projects::migration::inspect(&project).unwrap();herdr_projects::migration::apply(&project,&plan,true).unwrap();
+    let project=root.join("demo");let legacy=std::fs::read(project.join(".state/project.json")).unwrap();let plan=herdr_farm::migration::inspect(&project).unwrap();herdr_farm::migration::apply(&project,&plan,true).unwrap();
     for state in ["active","paused","archived"] {
-        if state=="paused" {let config=home.path().join(".config/herdr-projects/config.toml");std::fs::create_dir_all(config.parent().unwrap()).unwrap();std::fs::write(config,"invalid config [").unwrap();}
-        let snapshot=herdr_projects::runtime::snapshot(&project).unwrap();let head=snapshot.head.to_string();let revision=snapshot.control.as_ref().unwrap().revision.to_string();
+        if state=="paused" {let config=home.path().join(".config/herdr-farm/config.toml");std::fs::create_dir_all(config.parent().unwrap()).unwrap();std::fs::write(config,"invalid config [").unwrap();}
+        let snapshot=herdr_farm::runtime::snapshot(&project).unwrap();let head=snapshot.head.to_string();let revision=snapshot.control.as_ref().unwrap().revision.to_string();
         let out=hp(home.path(),&["--root",root_arg,"runtime","demo","state",state,"--expected-head",&head,"--expected-revision",&revision]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));let result:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();assert_eq!(result["control"]["state"],state);
     }
     assert_eq!(std::fs::read(project.join(".state/project.json")).unwrap(),legacy);assert!(hp(home.path(),&["--root",root_arg,"migration","demo","recover","--writers-stopped"]).status.success());
@@ -1204,7 +1204,7 @@ fn canonical_lifecycle_cli_does_not_dual_write_legacy_status() {
 fn canonical_runtime_create_cli_requires_task_fences_and_does_not_forge_legacy_files() {
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();
     for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
-    let project=root.join("demo");let plan=herdr_projects::migration::inspect(&project).unwrap();herdr_projects::migration::apply(&project,&plan,true).unwrap();let task=herdr_projects::domain::TaskId::new("created").unwrap();let before=herdr_projects::runtime::snapshot(&project).unwrap();let head=herdr_projects::runtime::add_task(&project,task,"created task".into(),before.head).unwrap().to_string();
+    let project=root.join("demo");let plan=herdr_farm::migration::inspect(&project).unwrap();herdr_farm::migration::apply(&project,&plan,true).unwrap();let task=herdr_farm::domain::TaskId::new("created").unwrap();let before=herdr_farm::runtime::snapshot(&project).unwrap();let head=herdr_farm::runtime::add_task(&project,task,"created task".into(),before.head).unwrap().to_string();
     let route=home.path().join("route.json");std::fs::write(&route,b"{}").unwrap();
     let args=["--root",root_arg,"runtime","demo","create","--task","created","--task-revision","1","--expected-head",&head,"--route",route.to_str().unwrap()];let out=hp(home.path(),&args);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));let result:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();assert_eq!(result["binding"]["id"],"task:created");assert!(result["binding"]["source_path"].is_null());assert_eq!(result["task_revision"],2);assert!(!hp(home.path(),&args).status.success());assert!(!project.join("threads/created.toml").exists());
     let head=result["head"].to_string();let out=hp(home.path(),&["--root",root_arg,"runtime","demo","create","--expected-head",&head,"--route",route.to_str().unwrap()]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));assert_eq!(serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["binding"]["id"],"coordinator");assert!(!project.join(".state/coordinator.json").exists());
@@ -1214,11 +1214,11 @@ fn canonical_runtime_create_cli_requires_task_fences_and_does_not_forge_legacy_f
 #[cfg(feature="state-store")]
 fn canonical_notification_cli_delivers_once_to_recorded_socket() {
     use std::os::unix::fs::PermissionsExt;
-    use herdr_projects::{domain::{TaskId,RuntimeRoute,ProjectState},migration,runtime};
+    use herdr_farm::{domain::{TaskId,RuntimeRoute,ProjectState},migration,runtime};
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();
     for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
     let project=root.join("demo");std::fs::write(project.join("inbox/message.md"),"+++\nid='message'\nsummary='private text'\n+++\n").unwrap();let plan=migration::inspect(&project).unwrap();migration::apply(&project,&plan,true).unwrap();
-    let head=runtime::snapshot(&project).unwrap().head;let task=TaskId::new("notification").unwrap();let head=runtime::add_task(&project,task.clone(),"notification".into(),head).unwrap();runtime::create_binding(&project,None,None,head,&RuntimeRoute{socket:"/explicit/notification.sock".into(),..Default::default()}).unwrap();assert!(hp(home.path(),&["--root",root_arg,"reconcile","demo","--record"]).status.success());let snapshot=runtime::snapshot(&project).unwrap();runtime::set_state(&project,snapshot.head,snapshot.control.unwrap().revision,ProjectState::Active,&home.path().join(".config/herdr-projects/config.toml")).unwrap();
+    let head=runtime::snapshot(&project).unwrap().head;let task=TaskId::new("notification").unwrap();let head=runtime::add_task(&project,task.clone(),"notification".into(),head).unwrap();runtime::create_binding(&project,None,None,head,&RuntimeRoute{socket:"/explicit/notification.sock".into(),..Default::default()}).unwrap();assert!(hp(home.path(),&["--root",root_arg,"reconcile","demo","--record"]).status.success());let snapshot=runtime::snapshot(&project).unwrap();runtime::set_state(&project,snapshot.head,snapshot.control.unwrap().revision,ProjectState::Active,&home.path().join(".config/herdr-farm/config.toml")).unwrap();
     let head=runtime::snapshot(&project).unwrap().head.to_string();let out=hp(home.path(),&["--root",root_arg,"operations","demo","notify","notification","--expected-head",&head]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));let op:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();let id=op["id"].as_str().unwrap();
     let fake=home.path().join(".local/bin/herdr");std::fs::create_dir_all(fake.parent().unwrap()).unwrap();std::fs::write(&fake,b"#!/bin/sh\nif [ \"$1\" = '--version' ]; then echo 'herdr 0.9.1'; exit 0; fi\n[ \"$HERDR_SOCKET_PATH\" = '/explicit/notification.sock' ] || exit 8\n[ \"$1\" = notification ] && [ \"$2\" = show ] || exit 9\nprintf 'effect\\n' >> \"$HOME/effects\"\nprintf '%s\\n' '{\"result\":{\"shown\":true}}'\n").unwrap();std::fs::set_permissions(&fake,std::fs::Permissions::from_mode(0o700)).unwrap();
     let deliver=|args:&[&str]|Command::new(BIN).env_clear().env("HOME",home.path()).env("HERDR_BIN_PATH",&fake).args(args).output().unwrap();
@@ -1229,12 +1229,12 @@ fn canonical_notification_cli_delivers_once_to_recorded_socket() {
 #[test]
 fn ticker_canonical_notification_confirms_or_retains_ambiguity_after_owner_death() {
     use std::{fs,os::unix::{fs::PermissionsExt,net::UnixListener},process::Stdio,time::{Duration,Instant}};
-    use herdr_projects::{migration,runtime,domain::{TaskId,RuntimeRoute,ProjectState},operations::DeliveryState,execution_guard::{ProjectGuard,RootGuard}};
+    use herdr_farm::{migration,runtime,domain::{TaskId,RuntimeRoute,ProjectState},operations::DeliveryState,execution_guard::{ProjectGuard,RootGuard}};
     for mode in ["ok","lost","death"] {
         let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();for action in ["new","pause"]{assert!(hp(home.path(),&["--root",r,action,"demo"]).status.success());}
         let project=root.join("demo");fs::write(project.join("inbox/message.md"),"+++\nid='message'\nsummary='private text'\n+++\n").unwrap();let plan=migration::inspect(&project).unwrap();migration::apply(&project,&plan,true).unwrap();
         let task=TaskId::new("notification").unwrap();let head=runtime::add_task(&project,task.clone(),"notification".into(),runtime::snapshot(&project).unwrap().head).unwrap();let socket=home.path().join("notification.sock");let _listener=UnixListener::bind(&socket).unwrap();runtime::create_binding(&project,None,None,head,&RuntimeRoute{socket:socket.display().to_string(),..Default::default()}).unwrap();
-        assert!(hp(home.path(),&["--root",r,"reconcile","demo","--record"]).status.success());let snapshot=runtime::snapshot(&project).unwrap();let config=home.path().join(".config/herdr-projects/config.toml");runtime::set_state(&project,snapshot.head,snapshot.control.unwrap().revision,ProjectState::Active,&config).unwrap();
+        assert!(hp(home.path(),&["--root",r,"reconcile","demo","--record"]).status.success());let snapshot=runtime::snapshot(&project).unwrap();let config=home.path().join(".config/herdr-farm/config.toml");runtime::set_state(&project,snapshot.head,snapshot.control.unwrap().revision,ProjectState::Active,&config).unwrap();
         let op=runtime::enqueue_notification(&project,&task,runtime::snapshot(&project).unwrap().head,&migration::config_reference(&config).unwrap()).unwrap();
         let helper=home.path().join("herdr");fs::write(&helper,format!(r#"#!/usr/bin/python3
 import sys,json,pathlib,os,time,fcntl,sqlite3
@@ -1279,28 +1279,28 @@ print(json.dumps({{'id':request['id'],'result':{{'type':'notification_show','sho
 #[cfg(feature="state-store")]
 fn canonical_finalization_cli_preserves_artifacts_and_awaits_review() {
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
-    let project=root.join("demo");let source=home.path().join("source");std::fs::create_dir_all(source.join("library")).unwrap();std::fs::write(source.join("report.md"),"report for review\n").unwrap();std::fs::write(source.join("library/result"),"result bytes").unwrap();let original=format!("id='t-0001'\nstatus='resolved'\nthread_dir={}\n",serde_json::to_string(source.to_str().unwrap()).unwrap());std::fs::write(project.join("threads/t-0001.toml"),&original).unwrap();let plan=herdr_projects::migration::inspect(&project).unwrap();herdr_projects::migration::apply(&project,&plan,true).unwrap();let head=herdr_projects::runtime::snapshot(&project).unwrap().head.to_string();
-    let out=hp(home.path(),&["--root",root_arg,"operations","demo","finalize","thread:t-0001","--reason","operator review","--expected-head",&head]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));let op:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();let id=op["id"].as_str().unwrap();let args=["--root",root_arg,"operations","demo","deliver-finalization",id,"--expected-revision","1"];let out=hp(home.path(),&args);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));assert_eq!(serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["state"],"confirmed");assert!(!hp(home.path(),&args).status.success());let snapshot=herdr_projects::runtime::snapshot(&project).unwrap();let task=snapshot.tasks.iter().find(|t|t.id.as_str()=="legacy-t-0001").unwrap();assert_eq!(task.state,herdr_projects::domain::TaskState::AwaitingReview);assert_eq!(task.revision,2);assert_eq!(std::fs::read_to_string(project.join("threads/t-0001.toml")).unwrap(),original);assert!(source.join("report.md").is_file());
+    let project=root.join("demo");let source=home.path().join("source");std::fs::create_dir_all(source.join("library")).unwrap();std::fs::write(source.join("report.md"),"report for review\n").unwrap();std::fs::write(source.join("library/result"),"result bytes").unwrap();let original=format!("id='t-0001'\nstatus='resolved'\nthread_dir={}\n",serde_json::to_string(source.to_str().unwrap()).unwrap());std::fs::write(project.join("threads/t-0001.toml"),&original).unwrap();let plan=herdr_farm::migration::inspect(&project).unwrap();herdr_farm::migration::apply(&project,&plan,true).unwrap();let head=herdr_farm::runtime::snapshot(&project).unwrap().head.to_string();
+    let out=hp(home.path(),&["--root",root_arg,"operations","demo","finalize","thread:t-0001","--reason","operator review","--expected-head",&head]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));let op:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();let id=op["id"].as_str().unwrap();let args=["--root",root_arg,"operations","demo","deliver-finalization",id,"--expected-revision","1"];let out=hp(home.path(),&args);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));assert_eq!(serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["state"],"confirmed");assert!(!hp(home.path(),&args).status.success());let snapshot=herdr_farm::runtime::snapshot(&project).unwrap();let task=snapshot.tasks.iter().find(|t|t.id.as_str()=="legacy-t-0001").unwrap();assert_eq!(task.state,herdr_farm::domain::TaskState::AwaitingReview);assert_eq!(task.revision,2);assert_eq!(std::fs::read_to_string(project.join("threads/t-0001.toml")).unwrap(),original);assert!(source.join("report.md").is_file());
 }
 
 #[test]
 #[cfg(feature="state-store")]
 fn canonical_ownership_cli_adopts_recorded_coordinator_without_prompting() {
-    use std::os::unix::{fs::PermissionsExt,net::UnixListener};use herdr_projects::{migration,runtime,domain::RuntimeRoute};
+    use std::os::unix::{fs::PermissionsExt,net::UnixListener};use herdr_farm::{migration,runtime,domain::RuntimeRoute};
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
     let project=root.join("demo");let plan=migration::inspect(&project).unwrap();migration::apply(&project,&plan,true).unwrap();let socket=home.path().join("fixture.sock");let _listener=UnixListener::bind(&socket).unwrap();let head=runtime::snapshot(&project).unwrap().head;runtime::create_binding(&project,None,None,head,&RuntimeRoute{socket:socket.to_str().unwrap().into(),workspace_id:"w".into(),tab_id:"t".into(),pane_id:"p".into(),cwd:project.to_str().unwrap().into(),..Default::default()}).unwrap();
     std::fs::write(home.path().join("panes.json"),serde_json::json!({"result":{"panes":[{"pane_id":"p","tab_id":"t","workspace_id":"w","cwd":project}]}}).to_string()).unwrap();std::fs::write(home.path().join("agents.json"),serde_json::json!({"result":{"agents":[{"pane_id":"p","tab_id":"t","workspace_id":"w","cwd":project,"agent":"claude","name":"coordinator","agent_status":"working"}]}}).to_string()).unwrap();let fake=home.path().join("fake-herdr");std::fs::write(&fake,b"#!/bin/sh\ncase \"$1 $2\" in\n'--version ') echo 'herdr 0.9.1';;\n'pane list') cat \"$HOME/panes.json\";;\n'agent list') cat \"$HOME/agents.json\";;\n*) exit 99;;\nesac\n").unwrap();std::fs::set_permissions(&fake,std::fs::Permissions::from_mode(0o700)).unwrap();let command=|args:&[&str]|Command::new(BIN).env_clear().env("HOME",home.path()).env("HERDR_BIN_PATH",&fake).args(args).output().unwrap();
     let before=runtime::snapshot(&project).unwrap();let out=command(&["--root",root_arg,"reconcile","demo","--plan"]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));let plan:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();assert_eq!(plan["dispatch_allowed"],false);assert!(plan["items"].as_array().unwrap().iter().any(|i|i["action"]=="adopt_resources"));assert_eq!(runtime::snapshot(&project).unwrap(),before);assert!(!command(&["--root",root_arg,"reconcile","demo","--plan","--record"]).status.success());
     let head=runtime::snapshot(&project).unwrap().head.to_string();let out=command(&["--root",root_arg,"runtime","demo","adopt","coordinator","--expected-revision","1","--expected-head",&head]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));let change:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();assert_eq!(change["ownership"]["origin"],"adopted");assert!(change["ownership"]["attempt"].is_null());assert!(command(&["--root",root_arg,"reconcile","demo","--record"]).status.success());let snapshot=runtime::snapshot(&project).unwrap();let out=command(&["--root",root_arg,"runtime","demo","state","active","--expected-head",&snapshot.head.to_string(),"--expected-revision",&snapshot.control.unwrap().revision.to_string()]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));assert!(runtime::snapshot(&project).unwrap().attempts.is_empty());
     let before=runtime::snapshot(&project).unwrap();let out=command(&["--root",root_arg,"runtime","demo","relinquish","coordinator","--expected-revision","1","--expected-head",&before.head.to_string(),"--reason","hand back"]);assert!(!out.status.success());assert_eq!(runtime::snapshot(&project).unwrap(),before);
-    runtime::set_state(&project,before.head,before.control.unwrap().revision,herdr_projects::domain::ProjectState::Paused,&home.path().join("config.toml")).unwrap();let head=runtime::snapshot(&project).unwrap().head;let out=command(&["--root",root_arg,"runtime","demo","relinquish","coordinator","--expected-revision","1","--expected-head",&head.to_string(),"--reason","hand back"]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));assert!(runtime::snapshot(&project).unwrap().ownership.is_empty());assert!(socket.exists());
+    runtime::set_state(&project,before.head,before.control.unwrap().revision,herdr_farm::domain::ProjectState::Paused,&home.path().join("config.toml")).unwrap();let head=runtime::snapshot(&project).unwrap().head;let out=command(&["--root",root_arg,"runtime","demo","relinquish","coordinator","--expected-revision","1","--expected-head",&head.to_string(),"--reason","hand back"]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));assert!(runtime::snapshot(&project).unwrap().ownership.is_empty());assert!(socket.exists());
 
 }
 
 #[cfg(feature="state-store")]
 #[test]
 fn scheduler_cli_queues_dependencies_without_launching_or_rewriting_legacy_tasks() {
-    use herdr_projects::{migration,runtime,domain::TaskId};
+    use herdr_farm::{migration,runtime,domain::TaskId};
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
     let project=root.join("demo");let original=std::fs::read(project.join("TASKS.md")).unwrap();let plan=migration::inspect(&project).unwrap();migration::apply(&project,&plan,true).unwrap();for id in ["a","b"] {runtime::add_task(&project,TaskId::new(id).unwrap(),id.into(),runtime::snapshot(&project).unwrap().head).unwrap();}
     let request=home.path().join("queue.json");std::fs::write(&request,r#"{"priority":2,"dependencies":[{"predecessor":"b","requirement":"landed_commit"}]}"#).unwrap();let before=runtime::snapshot(&project).unwrap();let out=hp(home.path(),&["--root",root_arg,"task","demo","queue","a","--input-file",request.to_str().unwrap(),"--expected-revision","1","--expected-head",&before.head.to_string()]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
@@ -1339,7 +1339,7 @@ fn scheduler_cli_queues_dependencies_without_launching_or_rewriting_legacy_tasks
 #[cfg(feature="state-store")]
 #[test]
 fn cancellation_cli_audits_request_without_releasing_an_unproven_worker() {
-    use herdr_projects::{migration,runtime,domain::*};
+    use herdr_farm::{migration,runtime,domain::*};
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let root_arg=root.to_str().unwrap();for command in ["new","pause"] {assert!(hp(home.path(),&["--root",root_arg,command,"demo"]).status.success());}
     let project=root.join("demo");let plan=migration::inspect(&project).unwrap();migration::apply(&project,&plan,true).unwrap();let head=runtime::snapshot(&project).unwrap().head;runtime::add_task(&project,TaskId::new("a").unwrap(),"task".into(),head).unwrap();let head=runtime::snapshot(&project).unwrap().head;let mut db=migration::open_active(&project).unwrap();db.commit(Commit{expected_head:head,mutations:vec![Mutation::Attempt{expected:None,next:Attempt{id:AttemptId::new("adopted").unwrap(),task:TaskId::new("a").unwrap(),revision:1,state:AttemptState::Lost,snapshot:None,reservation:"fixture".into(),termination_observed:false}}]}).unwrap();drop(db);
     let before=runtime::snapshot(&project).unwrap();let args=["--root",root_arg,"task","demo","cancel-attempt","adopted","--expected-revision","1","--expected-head",&before.head.to_string(),"--reason","operator stop request"];let output=hp(home.path(),&args);assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));let result:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();assert_eq!(result["released"],false);let after=runtime::snapshot(&project).unwrap();assert!(after.attempts[0].retains_capacity());assert_eq!(after.cancellations.len(),1);assert!(!hp(home.path(),&args).status.success());assert_eq!(runtime::snapshot(&project).unwrap(),after);
@@ -1431,7 +1431,7 @@ fn native_ticker_claims_legacy_routine_and_restart_delivers_without_rerun() {
     fs::write(project.join(".state/coordinator.json"),serde_json::to_vec(&serde_json::json!({"socket":socket,"workspace_id":"w1","tab_id":"w1:t1","pane_id":"w1:p1","agent_name":"coordinator","cwd":project})).unwrap()).unwrap();
     let command="printf run >> executions; printf routine-result";
     fs::write(project.join("routines/check.md"),format!("+++\nschedule = \"every 24h\"\ncommand = {}\n+++\nInspect output.\n",serde_json::to_string(command).unwrap())).unwrap();
-    let cfg=home.path().join(".config/herdr-projects");fs::create_dir_all(&cfg).unwrap();
+    let cfg=home.path().join(".config/herdr-farm");fs::create_dir_all(&cfg).unwrap();
     fs::write(cfg.join("config.toml"),format!("[safety.\"{}\"]\nroutine_commands = true\n",project.display())).unwrap();
     fs::write(cfg.join("approved-routines.json"),serde_json::to_vec(&serde_json::json!([{"project":project,"routine":"check","command_sha256":format!("{:x}",Sha256::digest(command.as_bytes())),"approved":"fixture"}])).unwrap()).unwrap();
     let state=project.join(".state/ticker.json");fs::write(&state,b"{\"routines\":{\"check\":{\"last_run\":\"2026-01-01T00:00:00Z\"}}}").unwrap();
@@ -1785,7 +1785,7 @@ elif args==['remote-api-bridge']:
  with open(root/'sent','a') as f:f.write('send')
  if (root/'outcome').read_text()=='lost':sys.exit(1)
  if r['method']=='agent.prompt':
-  assert r['params']['text'].startswith('[herdr-projects ticker: automated, not the user, approves nothing]')
+  assert r['params']['text'].startswith('[herdr-farm ticker: automated, not the user, approves nothing]')
   result={'type':'agent_prompted','agent':a}
  else:
   assert r['method']=='notification.show'
@@ -1851,7 +1851,7 @@ elif args==['remote-api-bridge']:
  elif r['method']=='pane.list':result={'panes':[a]}
  elif r['method']=='pane.report_metadata':
   assert set(r['params'])=={'pane_id','source','ttl_ms','tokens'}
-  assert r['params']['ttl_ms']==300000 and r['params']['source']=='herdr-projects'
+  assert r['params']['ttl_ms']==300000 and r['params']['source']=='herdr-farm'
   with open(root/'tokens','a') as f:f.write(json.dumps(r['params'])+'\n')
   result={'type':'ok'}
  else:sys.exit(3)
@@ -1879,13 +1879,13 @@ else:print('{"result":{"shown":true}}')
 #[test]
 fn ticker_canonical_finalization_preserves_once_and_recovers_receipt_after_restart() {
     use std::{fs,process::Stdio,time::{Duration,Instant}};
-    use herdr_projects::{migration,runtime,operations::DeliveryState,domain::TaskState};
+    use herdr_farm::{migration,runtime,operations::DeliveryState,domain::TaskState};
     for interrupted in [false,true] {
         let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
         for action in ["new","pause"] {assert!(hp(home.path(),&["--root",r,action,"demo"]).status.success());}
         let project=root.join("demo");let source=home.path().join("source");fs::create_dir_all(source.join("library")).unwrap();fs::write(source.join("report.md"),"report for review\n").unwrap();fs::write(source.join("library/result"),b"preserved bytes").unwrap();
         let original=format!("id='t-0001'\nstatus='resolved'\nthread_dir={}\n",serde_json::to_string(source.to_str().unwrap()).unwrap());fs::write(project.join("threads/t-0001.toml"),&original).unwrap();let plan=migration::inspect(&project).unwrap();migration::apply(&project,&plan,true).unwrap();
-        let head=runtime::snapshot(&project).unwrap().head.to_string();let out=hp(home.path(),&["--root",r,"operations","demo","finalize","thread:t-0001","--reason","review","--expected-head",&head]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));let op:herdr_projects::domain::Operation=serde_json::from_slice(&out.stdout).unwrap();
+        let head=runtime::snapshot(&project).unwrap().head.to_string();let out=hp(home.path(),&["--root",r,"operations","demo","finalize","thread:t-0001","--reason","review","--expected-head",&head]);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));let op:herdr_farm::domain::Operation=serde_json::from_slice(&out.stdout).unwrap();
         let raw=rusqlite::Connection::open(project.join(".state/state.db")).unwrap();
         if interrupted {raw.execute_batch("CREATE TRIGGER reject_confirmation BEFORE UPDATE ON operation_delivery WHEN NEW.state='confirmed' BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();}
         struct Child(std::process::Child);impl Drop for Child {fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
@@ -1900,7 +1900,7 @@ fn ticker_canonical_finalization_preserves_once_and_recovers_receipt_after_resta
             migration::open_active(&project).unwrap().expire_claims(read().lease_until_ms.unwrap()+1).unwrap();fs::remove_dir_all(&source).unwrap();
             let mut child=spawn();wait(&mut child,&||read().state==DeliveryState::Confirmed);stop(&mut child);
         }else{wait(&mut child,&||read().state==DeliveryState::Confirmed);stop(&mut child);fs::remove_dir_all(&source).unwrap();}
-        let receipt:herdr_projects::operations::finalization::FinalizationReceipt=serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+        let receipt:herdr_farm::operations::finalization::FinalizationReceipt=serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
         assert_eq!(fs::read(project.join(".state/canonical-artifacts").join(&receipt.artifact_key).join(&receipt.snapshot).join("library/result")).unwrap(),b"preserved bytes");
         let before=runtime::snapshot(&project).unwrap();let mut child=spawn();wait(&mut child,&||runtime::snapshot(&project).unwrap().head>before.head);stop(&mut child);
         let after=runtime::snapshot(&project).unwrap();assert_eq!(read().attempts,1);assert_eq!(read().state,DeliveryState::Confirmed);assert_eq!(after.tasks.iter().find(|t|Some(&t.id)==op.task.as_ref()).unwrap().state,TaskState::AwaitingReview);assert_eq!(fs::read_to_string(project.join("threads/t-0001.toml")).unwrap(),original);
@@ -1912,11 +1912,11 @@ fn ticker_canonical_finalization_preserves_once_and_recovers_receipt_after_resta
 #[test]
 fn ticker_canonical_routine_admits_from_hint_and_restart_keeps_one_execution() {
     use std::{fs,process::Stdio,time::{Duration,Instant}};
-    use herdr_projects::{domain::*,authority,migration,runtime,operations::DeliveryState};
+    use herdr_farm::{domain::*,authority,migration,runtime,operations::DeliveryState};
     use sha2::{Digest,Sha256};
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();for action in ["new","pause"]{assert!(hp(home.path(),&["--root",r,action,"demo"]).status.success());}
     let key=home.path().join("owner");assert!(Command::new("/usr/bin/ssh-keygen").args(["-q","-t","ed25519","-N","","-f"]).arg(&key).output().unwrap().status.success());
-    let public=fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");let project=root.join("demo");let config=home.path().join(".config/herdr-projects/config.toml");fs::create_dir_all(config.parent().unwrap()).unwrap();fs::write(&config,format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[safety.{:?}]\nroutine_commands=true\n",project.display().to_string())).unwrap();
+    let public=fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");let project=root.join("demo");let config=home.path().join(".config/herdr-farm/config.toml");fs::create_dir_all(config.parent().unwrap()).unwrap();fs::write(&config,format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[safety.{:?}]\nroutine_commands=true\n",project.display().to_string())).unwrap();
     let plan=migration::inspect_with_config(&project,&config).unwrap();migration::apply(&project,&plan,true).unwrap();let s=runtime::snapshot(&project).unwrap();runtime::set_state(&project,s.head,s.control.unwrap().revision,ProjectState::Active,&config).unwrap();
     let script=project.join("check.sh");let bytes=b"printf once >> ROUTINE_MARKER\n";fs::write(&script,bytes).unwrap();
     let definition=RoutineDefinition{version:1,name:"check".into(),revision:1,project_store:project.join(".state/state.db").canonicalize().unwrap().display().to_string(),authority:authority::policy_reference(&project).unwrap(),config:migration::config_reference(&config).unwrap(),enabled:true,schedule:"every 1h".into(),timezone:"UTC".into(),start_unix_ms:jiff::Timestamp::now().as_millisecond()-1000,missed:MissedRunPolicy::CoalesceLatest,overlap:OverlapPolicy::Skip,script:script.display().to_string(),script_sha256:format!("{:x}",Sha256::digest(bytes)),cwd:project.display().to_string(),deadline_ms:1000,output_cap_bytes:4000};
@@ -1947,12 +1947,12 @@ impl VerifyFixture {
     fn new(files:&[(&str,String)])->Self {Self::with_worker(files,"kind='claude'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=60\nunknown_usage='allow_with_warning'\n")}
     /// `worker` is the body of the `[profiles.worker]` table.
     fn with_worker(files:&[(&str,String)],worker:&str)->Self {
-        use std::fs;use herdr_projects::{domain::ProjectState,migration,runtime};
+        use std::fs;use herdr_farm::{domain::ProjectState,migration,runtime};
         let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
         for action in ["new","pause"]{assert!(hp(home.path(),&["--root",r,action,"demo"]).status.success());}
         let key=home.path().join("owner");assert!(Command::new("/usr/bin/ssh-keygen").args(["-q","-t","ed25519","-N","","-f"]).arg(&key).output().unwrap().status.success());
         let public=fs::read_to_string(key.with_extension("pub")).unwrap().split_whitespace().take(2).collect::<Vec<_>>().join(" ");
-        let project=root.join("demo");let config=home.path().join(".config/herdr-projects/config.toml");fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let project=root.join("demo");let config=home.path().join(".config/herdr-farm/config.toml");fs::create_dir_all(config.parent().unwrap()).unwrap();
         fs::write(&config,format!("[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n[profiles.worker]\n{worker}")).unwrap();
         let plan=migration::inspect_with_config(&project,&config).unwrap();migration::apply(&project,&plan,true).unwrap();
         let s=runtime::snapshot(&project).unwrap();runtime::set_state(&project,s.head,s.control.unwrap().revision,ProjectState::Active,&config).unwrap();
@@ -1976,7 +1976,7 @@ impl VerifyFixture {
     /// A task with a running attempt, a signed contract carrying `policies`, and one submitted result.
     fn submit(&self,task:&str,policies:&[(&str,String)])->String {self.submit_at(task,policies,&self.candidate)}
     fn submit_at(&self,task:&str,policies:&[(&str,String)],candidate:&str)->String {
-        use std::fs;use herdr_projects::{authority::CONTRACT_SIGNATURE_NAMESPACE,domain::TaskId,runtime};
+        use std::fs;use herdr_farm::{authority::CONTRACT_SIGNATURE_NAMESPACE,domain::TaskId,runtime};
         let head=runtime::add_task(&self.project,TaskId::new(task).unwrap(),"work".into(),runtime::snapshot(&self.project).unwrap().head).unwrap();
         self.db().execute("INSERT INTO attempts(id,task_id,revision,state,snapshot,reservation,termination_observed) VALUES(?1,?2,1,'running',NULL,?1,0)",[format!("{task}-attempt"),task.to_owned()]).unwrap();
         let repository=self.repo.canonicalize().unwrap().display().to_string();
@@ -1985,7 +1985,7 @@ impl VerifyFixture {
             "project_store":self.store,"expected_head":head,"task_id":task,"contract_revision":1,"deliverable":"ship","non_goals":"no launch",
             "acceptance_policies":policies.iter().map(|(id,text)|serde_json::json!({"id":id,"text":text})).collect::<Vec<_>>(),
             "repository":repository,"base_oid":self.base,"object_format":"sha256","dependencies":[],"capability_flags":[],
-            "profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_then_integrate","authority":herdr_projects::authority::policy_reference(&self.project).unwrap()
+            "profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_then_integrate","authority":herdr_farm::authority::policy_reference(&self.project).unwrap()
         })).unwrap();document.push(b'\n');
         let doc_path=self.home.path().join(format!("{task}-contract.json"));fs::write(&doc_path,&document).unwrap();
         assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y","sign","-f"]).arg(&self.key).args(["-n",CONTRACT_SIGNATURE_NAMESPACE]).arg(&doc_path).status().unwrap().success());
@@ -2002,13 +2002,13 @@ impl VerifyFixture {
         serde_json::from_slice::<serde_json::Value>(&submitted.stdout).unwrap()["submission_id"].as_str().unwrap().to_owned()
     }
     fn automate(&self) {
-        let head=herdr_projects::runtime::snapshot(&self.project).unwrap().head.to_string();
+        let head=herdr_farm::runtime::snapshot(&self.project).unwrap().head.to_string();
         let enabled=hp(self.home.path(),&["--root",self.r(),"result","demo","auto","--verify","on","--expected-head",&head]);
         assert!(enabled.status.success(),"{}",String::from_utf8_lossy(&enabled.stderr));
         assert_eq!(serde_json::from_slice::<serde_json::Value>(&enabled.stdout).unwrap()["verify"],true);
     }
-    fn jobs(&self)->Vec<(herdr_projects::domain::Operation,herdr_projects::operations::Delivery)> {
-        let snapshot=herdr_projects::runtime::snapshot(&self.project).unwrap();
+    fn jobs(&self)->Vec<(herdr_farm::domain::Operation,herdr_farm::operations::Delivery)> {
+        let snapshot=herdr_farm::runtime::snapshot(&self.project).unwrap();
         snapshot.operations.into_iter().filter(|op|op.kind=="verification.run").map(|op|{let d=snapshot.deliveries.iter().find(|d|d.operation==op.id).unwrap().clone();(op,d)}).collect()
     }
     fn spawn(&self)->Ticker {self.spawn_with("/bin/false")}
@@ -2034,8 +2034,8 @@ impl VerifyFixture {
     /// Retain a launchable `worker` profile over fake Herdr and agent binaries.
     /// Native interaction needs a real agent session, so only that evidence is
     /// planted, in the verifier's exact shape; launch revalidates everything else live.
-    fn launchable_profile(&self)->herdr_projects::domain::VersionedReference {self.fake_launchable_profile("claude","2.1.0 (Claude Code)")}
-    fn fake_launchable_profile(&self,name:&str,version:&str)->herdr_projects::domain::VersionedReference {
+    fn launchable_profile(&self)->herdr_farm::domain::VersionedReference {self.fake_launchable_profile("claude","2.1.0 (Claude Code)")}
+    fn fake_launchable_profile(&self,name:&str,version:&str)->herdr_farm::domain::VersionedReference {
         use std::{fs,os::unix::fs::PermissionsExt};
         let bin=self.home.path().join("bin");let agent_home=self.home.path().join("agent-home");fs::create_dir_all(&bin).unwrap();fs::create_dir_all(&agent_home).unwrap();
         let (herdr,agent)=(bin.join("herdr"),bin.join(name));
@@ -2047,9 +2047,9 @@ impl VerifyFixture {
     }
     /// Prepare `worker` over the given binaries and plant only the native
     /// interaction evidence (the verifier would need its own agent session).
-    fn launchable_profile_with(&self,herdr:&Path,agent:&Path,agent_home:&Path)->herdr_projects::domain::VersionedReference {
+    fn launchable_profile_with(&self,herdr:&Path,agent:&Path,agent_home:&Path)->herdr_farm::domain::VersionedReference {
         use std::{fs,os::unix::fs::MetadataExt};
-        use herdr_projects::{domain::*,worker_supervision::{ProcessIncarnation,SupervisorIdentity}};
+        use herdr_farm::{domain::*,worker_supervision::{ProcessIncarnation,SupervisorIdentity}};
         use sha2::{Digest,Sha256};
         let out=hp(self.home.path(),&["--root",self.r(),"profile","prepare","demo","worker","--herdr-executable",herdr.to_str().unwrap(),
             "--agent-executable",agent.to_str().unwrap(),"--execution-home",agent_home.to_str().unwrap()]);
@@ -2078,7 +2078,7 @@ impl VerifyFixture {
 #[cfg(all(feature="state-store",target_os="linux"))]
 #[test]
 fn ticker_enqueues_one_verification_job_per_policy_across_restart() {
-    use herdr_projects::operations::DeliveryState;
+    use herdr_farm::operations::DeliveryState;
     use sha2::{Digest,Sha256};
     let f=VerifyFixture::new(&[("src/lib.rs","pub fn result() {}\n".into())]);
     let policies=[("builds",r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#.to_owned()),("clean",r#"{"version":1,"checks":["/usr/bin/true"]}"#.to_owned())];
@@ -2099,10 +2099,10 @@ fn ticker_enqueues_one_verification_job_per_policy_across_restart() {
     let jobs=f.jobs();assert_eq!(jobs.iter().map(|(op,_)|op.id.as_str().to_owned()).collect::<Vec<_>>(),expected);
     assert!(jobs.iter().all(|(_,d)|d.state==DeliveryState::Pending&&d.attempts==0));assert_eq!(runs(),0);
     // An operator retires one job before it runs; it never runs until explicitly retried.
-    let (retired,delivery)=jobs[0].clone();let head=herdr_projects::runtime::snapshot(&f.project).unwrap().head.to_string();
+    let (retired,delivery)=jobs[0].clone();let head=herdr_farm::runtime::snapshot(&f.project).unwrap().head.to_string();
     let out=hp(f.home.path(),&["--root",f.r(),"operations","demo","retire",retired.id.as_str(),"--reason","fixture","--expected-revision",&delivery.revision.to_string(),"--expected-head",&head]);
     assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
-    let state=|id:&herdr_projects::domain::OperationId|f.jobs().into_iter().find(|(op,_)|&op.id==id).unwrap().1;
+    let state=|id:&herdr_farm::domain::OperationId|f.jobs().into_iter().find(|(op,_)|&op.id==id).unwrap().1;
     let mut child=f.spawn();f.wait(&mut child,90,&||f.jobs().iter().any(|(op,d)|op.id!=retired.id&&d.state==DeliveryState::Confirmed));f.stop(&mut child);
     assert_eq!(state(&retired.id).state,DeliveryState::PermanentFailure);assert_eq!(runs(),1);
     let out=hp(f.home.path(),&["--root",f.r(),"result","demo","retry-verification",retired.id.as_str(),"--expected-revision",&state(&retired.id).revision.to_string()]);
@@ -2129,7 +2129,7 @@ fn ticker_enqueues_one_verification_job_per_policy_across_restart() {
 #[cfg(all(feature="state-store",target_os="linux"))]
 #[test]
 fn ticker_replaces_result_jobs_bound_to_an_older_task_revision() {
-    use herdr_projects::operations::DeliveryState;
+    use herdr_farm::operations::DeliveryState;
     let f=VerifyFixture::new(&[("src/lib.rs","pub fn result() {}\n".into())]);
     let submission_id=f.submit("task",&[("clean",r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#.to_owned())]);
     let metrics=f.root.join(".ticker-metrics.json");
@@ -2140,7 +2140,7 @@ fn ticker_replaces_result_jobs_bound_to_an_older_task_revision() {
     let jobs=f.jobs();assert_eq!(jobs.len(),1);let (old,delivery)=jobs[0].clone();
     assert_eq!((delivery.state,delivery.attempts),(DeliveryState::Pending,0));
     // The task revision moves before the job runs, so the old job can never be claimed.
-    let snapshot=herdr_projects::runtime::snapshot(&f.project).unwrap();
+    let snapshot=herdr_farm::runtime::snapshot(&f.project).unwrap();
     let revision=snapshot.tasks.iter().find(|t|t.id.as_str()=="task").unwrap().revision;assert_eq!(old.expected_revision,revision);
     let out=hp(f.home.path(),&["--root",f.r(),"task","demo","rename","task","--title","renamed","--expected-revision",&revision.to_string(),"--expected-head",&snapshot.head.to_string()]);
     assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
@@ -2164,14 +2164,14 @@ fn ticker_replaces_result_jobs_bound_to_an_older_task_revision() {
     f.git(&["branch","integration",&f.base]);
     let configured=hp(f.home.path(),&["--root",f.r(),"result","demo","configure-integration","--repository",f.repo.to_str().unwrap(),"--reference","refs/heads/integration"]);
     assert!(configured.status.success(),"{}",String::from_utf8_lossy(&configured.stderr));
-    let head=herdr_projects::runtime::snapshot(&f.project).unwrap().head.to_string();
+    let head=herdr_farm::runtime::snapshot(&f.project).unwrap().head.to_string();
     assert!(hp(f.home.path(),&["--root",f.r(),"result","demo","auto","--integrate","on","--expected-head",&head]).status.success());
-    let integrations=||{let snapshot=herdr_projects::runtime::snapshot(&f.project).unwrap();snapshot.operations.into_iter().filter(|op|op.kind=="integration.run")
+    let integrations=||{let snapshot=herdr_farm::runtime::snapshot(&f.project).unwrap();snapshot.operations.into_iter().filter(|op|op.kind=="integration.run")
         .map(|op|{let d=snapshot.deliveries.iter().find(|d|d.operation==op.id).unwrap().clone();(op,d)}).collect::<Vec<_>>()};
     turn();
     let found=integrations();assert_eq!(found.len(),1);let (old,delivery)=found[0].clone();
     assert_eq!((old.expected_revision,delivery.state,delivery.attempts),(revision+1,DeliveryState::Pending,0));
-    let head=herdr_projects::runtime::snapshot(&f.project).unwrap().head.to_string();
+    let head=herdr_farm::runtime::snapshot(&f.project).unwrap().head.to_string();
     let out=hp(f.home.path(),&["--root",f.r(),"task","demo","rename","task","--title","again","--expected-revision",&(revision+1).to_string(),"--expected-head",&head]);
     assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
     let replaced=||integrations().into_iter().find(|(op,_)|op.id!=old.id);
@@ -2188,7 +2188,7 @@ fn ticker_replaces_result_jobs_bound_to_an_older_task_revision() {
 #[test]
 fn ticker_auto_verifies_once_and_recovers_after_kill() {
     use std::{io::{Read,Write},sync::{Arc,atomic::{AtomicBool,AtomicUsize,Ordering}}};
-    use herdr_projects::{migration,runtime,operations::DeliveryState};
+    use herdr_farm::{migration,runtime,operations::DeliveryState};
     // The check speaks git's native protocol to a local fixture that holds each
     // reply until released, so the ticker can be killed while the check runs.
     let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();let port=listener.local_addr().unwrap().port();
@@ -2203,7 +2203,7 @@ fn ticker_auto_verifies_once_and_recovers_after_kill() {
     let wait_submission=f.submit("wait",&[("waits",format!(r#"{{"version":1,"checks":["/usr/bin/git","ls-remote","git://127.0.0.1:{port}/fixture"]}}"#))]);
     let fail_submission=f.submit("fail",&[("exits-3",r#"{"version":1,"checks":["/usr/bin/git","merge-file","-p","src/m-ours.txt","src/m-base.txt","src/m-theirs.txt"]}"#.to_owned())]);
     for (consumer,predecessor) in [("wait-consumer","wait"),("fail-consumer","fail")] {
-        let head=runtime::add_task(&f.project,herdr_projects::domain::TaskId::new(consumer).unwrap(),consumer.into(),runtime::snapshot(&f.project).unwrap().head).unwrap();
+        let head=runtime::add_task(&f.project,herdr_farm::domain::TaskId::new(consumer).unwrap(),consumer.into(),runtime::snapshot(&f.project).unwrap().head).unwrap();
         let request=f.home.path().join(format!("{consumer}.json"));
         std::fs::write(&request,serde_json::json!({"priority":0,"dependencies":[{"predecessor":predecessor,"requirement":"verified_result"}]}).to_string()).unwrap();
         let queued=hp(f.home.path(),&["--root",f.r(),"task","demo","queue",consumer,"--input-file",request.to_str().unwrap(),"--expected-revision","1","--expected-head",&head.to_string()]);
@@ -2248,7 +2248,7 @@ fn ticker_auto_verifies_once_and_recovers_after_kill() {
 #[test]
 fn ticker_auto_verification_releases_project_ownership_during_the_check() {
     use std::{io::{Read,Write},sync::{Arc,atomic::{AtomicUsize,Ordering}}};
-    use herdr_projects::{migration,runtime,operations::DeliveryState};
+    use herdr_farm::{migration,runtime,operations::DeliveryState};
     // A local git-protocol fixture holds connection `n` until `released > n`.
     let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();let port=listener.local_addr().unwrap().port();
     let released=Arc::new(AtomicUsize::new(0));let connections=Arc::new(AtomicUsize::new(0));
@@ -2259,7 +2259,7 @@ fn ticker_auto_verification_releases_project_ownership_during_the_check() {
     let f=VerifyFixture::new(&[("src/lib.rs","pub fn result() {}\n".into())]);
     let waits=[("waits",format!(r#"{{"version":1,"checks":["/usr/bin/git","ls-remote","git://127.0.0.1:{port}/fixture"]}}"#))];
     let first=f.submit("first",&waits);
-    runtime::add_task(&f.project,herdr_projects::domain::TaskId::new("other").unwrap(),"other".into(),runtime::snapshot(&f.project).unwrap().head).unwrap();
+    runtime::add_task(&f.project,herdr_farm::domain::TaskId::new("other").unwrap(),"other".into(),runtime::snapshot(&f.project).unwrap().head).unwrap();
     f.automate();
     let job=|submission:&str|f.jobs().into_iter().find(|(op,_)|op.payload["submission_id"]==submission);
     let runs=|submission:&str|f.db().query_row("SELECT count(*) FROM verification_runs WHERE submission_id=?1",[submission],|row|row.get::<_,u64>(0)).unwrap();
@@ -2281,7 +2281,7 @@ fn ticker_auto_verification_releases_project_ownership_during_the_check() {
     // While the isolated check runs, another project effect proceeds, but
     // root-exclusive maintenance is still refused.
     rename("other","renamed during the check");
-    assert!(herdr_projects::execution_guard::RootGuard::exclusive(&f.root).is_err(),"the check keeps the root shared");
+    assert!(herdr_farm::execution_guard::RootGuard::exclusive(&f.root).is_err(),"the check keeps the root shared");
     assert_eq!(runs(&first),0);
     released.store(1,Ordering::SeqCst);
     f.wait(&mut child,90,&||job(&first).is_some_and(|(_,d)|d.state==DeliveryState::Confirmed));
@@ -2321,7 +2321,7 @@ fn ticker_auto_verification_releases_project_ownership_during_the_check() {
 #[test]
 fn operator_verify_releases_project_ownership_during_the_check() {
     use std::{io::{Read,Write},sync::{Arc,atomic::{AtomicUsize,Ordering}}};
-    use herdr_projects::runtime;
+    use herdr_farm::runtime;
     // A local git-protocol fixture holds connection `n` until `released > n`.
     let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();let port=listener.local_addr().unwrap().port();
     let released=Arc::new(AtomicUsize::new(0));let connections=Arc::new(AtomicUsize::new(0));
@@ -2333,7 +2333,7 @@ fn operator_verify_releases_project_ownership_during_the_check() {
     let body=format!(r#"{{"version":1,"checks":["/usr/bin/git","ls-remote","git://127.0.0.1:{port}/fixture"]}}"#);
     let policy=f.home.path().join("waits.json");std::fs::write(&policy,&body).unwrap();
     let first=f.submit("first",&[("waits",body.clone())]);
-    runtime::add_task(&f.project,herdr_projects::domain::TaskId::new("other").unwrap(),"other".into(),runtime::snapshot(&f.project).unwrap().head).unwrap();
+    runtime::add_task(&f.project,herdr_farm::domain::TaskId::new("other").unwrap(),"other".into(),runtime::snapshot(&f.project).unwrap().head).unwrap();
     let runs=|submission:&str|f.db().query_row("SELECT count(*) FROM verification_runs WHERE submission_id=?1",[submission],|row|row.get::<_,u64>(0)).unwrap();
     let work=|name:&str|f.home.path().join(format!("work-{name}"));
     let verify=|submission:&str,key:&str,dir:&str|Command::new(BIN).env_clear().env("HOME",f.home.path()).args(["--root",f.r(),"result","demo","verify",submission,"--policy-id","waits",
@@ -2356,7 +2356,7 @@ fn operator_verify_releases_project_ownership_during_the_check() {
     wait_for(1);
     // While the check runs, another project effect proceeds; root-exclusive maintenance is still refused.
     rename("other","renamed during the check");
-    assert!(herdr_projects::execution_guard::RootGuard::exclusive(&f.root).is_err(),"the check keeps the root shared");
+    assert!(herdr_farm::execution_guard::RootGuard::exclusive(&f.root).is_err(),"the check keeps the root shared");
     assert_eq!(runs(&first),0);
     released.store(1,Ordering::SeqCst);
     let out=child.wait_with_output().unwrap();assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
@@ -2393,7 +2393,7 @@ fn operator_verify_releases_project_ownership_during_the_check() {
 #[cfg(all(feature="state-store",target_os="linux"))]
 #[test]
 fn ticker_integrates_two_local_results_and_recovers_lost_reply_without_telemetry() {
-    use herdr_projects::{migration,runtime,operations::DeliveryState};
+    use herdr_farm::{migration,runtime,operations::DeliveryState};
     use std::fs;
     let lib="pub fn result() {}\n";
     let f=VerifyFixture::new(&[("src/lib.rs",lib.into()),("src/one.txt","one\n".into())]);
@@ -2443,7 +2443,7 @@ fn ticker_integrates_two_local_results_and_recovers_lost_reply_without_telemetry
 #[test]
 fn ticker_auto_integrates_two_results_serially_and_recovers_stale_and_crash() {
     use std::{io::{Read,Write},sync::{Arc,atomic::{AtomicBool,AtomicUsize,Ordering}}};
-    use herdr_projects::{migration,runtime,operations::{DeliveryState,Outcome}};
+    use herdr_farm::{migration,runtime,operations::{DeliveryState,Outcome}};
     // A local git-protocol fixture holds only the second connection (the
     // integration candidate check of `two`) until released.
     let listener=std::net::TcpListener::bind("127.0.0.1:0").unwrap();let port=listener.local_addr().unwrap().port();
@@ -2604,7 +2604,7 @@ fn ticker_auto_integrates_two_results_serially_and_recovers_stale_and_crash() {
 #[test]
 fn integration_releases_project_ownership_during_the_candidate_check() {
     use std::{io::{Read,Write},sync::{Arc,atomic::{AtomicUsize,Ordering}}};
-    use herdr_projects::{runtime,operations::{DeliveryState,Outcome}};
+    use herdr_farm::{runtime,operations::{DeliveryState,Outcome}};
     // A local git-protocol fixture holds connection `n` until `released > n`.
     // Each submission's policy connects once to verify and once more to check
     // the integrated candidate.
@@ -2622,7 +2622,7 @@ fn integration_releases_project_ownership_during_the_candidate_check() {
     f.git(&["branch","integration",&f.base]);
     let configured=hp(f.home.path(),&["--root",f.r(),"result","demo","configure-integration","--repository",f.repo.to_str().unwrap(),"--reference",TARGET]);
     assert!(configured.status.success(),"{}",String::from_utf8_lossy(&configured.stderr));
-    runtime::add_task(&f.project,herdr_projects::domain::TaskId::new("other").unwrap(),"other".into(),runtime::snapshot(&f.project).unwrap().head).unwrap();
+    runtime::add_task(&f.project,herdr_farm::domain::TaskId::new("other").unwrap(),"other".into(),runtime::snapshot(&f.project).unwrap().head).unwrap();
     let auto=|args:&[&str]|{let head=runtime::snapshot(&f.project).unwrap().head.to_string();let mut all=vec!["--root",f.r(),"result","demo","auto"];all.extend_from_slice(args);all.extend(["--expected-head",&head]);
         let out=hp(f.home.path(),&all);assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));};
     let job=|submission:&str|{let snapshot=runtime::snapshot(&f.project).unwrap();snapshot.operations.into_iter().find(|op|op.kind=="integration.run"&&op.payload["submission_id"]==submission)
@@ -2650,7 +2650,7 @@ fn integration_releases_project_ownership_during_the_candidate_check() {
     let mut child=f.spawn();
     checking(2);f.wait(&mut child,30,&||job(&one).is_some_and(|(_,d)|d.state==DeliveryState::Claimed));
     rename("renamed during the automatic check");
-    assert!(herdr_projects::execution_guard::RootGuard::exclusive(&f.root).is_err(),"the check keeps the root shared");
+    assert!(herdr_farm::execution_guard::RootGuard::exclusive(&f.root).is_err(),"the check keeps the root shared");
     assert_eq!((integrated(),tip()),(0,f.base.clone()));
     released.store(3,Ordering::SeqCst);
     f.wait(&mut child,90,&||job(&one).is_some_and(|(_,d)|d.state==DeliveryState::Confirmed));
@@ -2695,7 +2695,7 @@ fn integration_releases_project_ownership_during_the_candidate_check() {
 #[test]
 fn ticker_auto_chain_releases_verified_integrated_and_fan_in_dependents() {
     use std::{io::{Read,Write},sync::{Arc,atomic::{AtomicBool,AtomicUsize,Ordering}}};
-    use herdr_projects::{migration,runtime,domain::TaskId,operations::DeliveryState};
+    use herdr_farm::{migration,runtime,domain::TaskId,operations::DeliveryState};
     // Only `a`'s policy speaks git's native protocol to this local fixture: its
     // first connection is verification, its second the integration candidate
     // check, which is held so the ticker can be killed between the two.
@@ -2798,7 +2798,7 @@ fn ticker_auto_chain_releases_verified_integrated_and_fan_in_dependents() {
 
     // Card 5: the operator drafts, signs and reserves a launch of the released
     // dependent `c` on `a`'s integrated SHA, and its worker brief is built.
-    use herdr_projects::domain::RuntimeRoute;
+    use herdr_farm::domain::RuntimeRoute;
     let profile=f.launchable_profile();
     let head=||runtime::snapshot(&f.project).unwrap().head;
     // `g` waits on an integration of `b` that never happens.
@@ -2813,7 +2813,7 @@ fn ticker_auto_chain_releases_verified_integrated_and_fan_in_dependents() {
     let socket=f.home.path().join("native.sock");let _listener=std::os::unix::net::UnixListener::bind(&socket).unwrap();
     let repository=f.repo.canonicalize().unwrap();
     // Unused local routes in the repository for `c` and `g`; recording their observation re-admits the project.
-    let config=f.home.path().join(".config/herdr-projects/config.toml");
+    let config=f.home.path().join(".config/herdr-farm/config.toml");
     let mut bindings=std::collections::BTreeMap::new();
     for task in ["c","d","g"] {
         let revision=runtime::snapshot(&f.project).unwrap().tasks.into_iter().find(|t|t.id.as_str()==task).unwrap().revision;
@@ -2821,14 +2821,14 @@ fn ticker_auto_chain_releases_verified_integrated_and_fan_in_dependents() {
             &RuntimeRoute{socket:socket.display().to_string(),cwd:repository.display().to_string(),..Default::default()}).unwrap();
         bindings.insert(task,(change.binding,change.task_revision));
     }
-    let observations=bindings.values().map(|(binding,task_revision)|herdr_projects::reconcile::RuntimeObservation{binding:binding.id.clone(),binding_revision:binding.revision,
+    let observations=bindings.values().map(|(binding,task_revision)|herdr_farm::reconcile::RuntimeObservation{binding:binding.id.clone(),binding_revision:binding.revision,
         task_revision:*task_revision,observed_unix_ms:jiff::Timestamp::now().as_millisecond(),collector:"herdr-git-v2".into(),
         config_digest:migration::config_reference(&config).unwrap().digest,..Default::default()}).collect::<Vec<_>>();
     migration::open_active(&f.project).unwrap().record_observations(head(),&observations).unwrap();
     // The fixture's submitting workers (raw `running` rows) have exited.
     f.db().execute("UPDATE attempts SET state='completed',termination_observed=1 WHERE id IN ('a-attempt','e-attempt')",[]).unwrap();
     let control=runtime::snapshot(&f.project).unwrap().control.unwrap().revision;
-    runtime::set_state(&f.project,head(),control,herdr_projects::domain::ProjectState::Active,&config).unwrap();
+    runtime::set_state(&f.project,head(),control,herdr_farm::domain::ProjectState::Active,&config).unwrap();
     let selection=|task:&str,knowledge:serde_json::Value|{
         let path=f.home.path().join(format!("{task}-selection.json"));
         std::fs::write(&path,serde_json::json!({"task":task,"binding":bindings[task].0.id,"profile":profile,"knowledge":knowledge,"repositories":[repository]}).to_string()).unwrap();
@@ -2863,7 +2863,7 @@ fn ticker_auto_chain_releases_verified_integrated_and_fan_in_dependents() {
         "evidence":{"id":satisfaction,"revision":1,"digest":satisfaction}}]),"the grant covers the exact dependency binding");
     let brief=drafted["brief"]["text"].as_str().unwrap();assert!(brief.contains("Retained instructions for dependent c"),"{brief}");
     let document=f.home.path().join("c-approval.json");std::fs::write(&document,serde_json::to_vec_pretty(&drafted["approval"]).unwrap()).unwrap();
-    assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y","sign","-f"]).arg(&f.key).args(["-n",herdr_projects::authority::SIGNATURE_NAMESPACE]).arg(&document).output().unwrap().status.success());
+    assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y","sign","-f"]).arg(&f.key).args(["-n",herdr_farm::authority::SIGNATURE_NAMESPACE]).arg(&document).output().unwrap().status.success());
     let out=hp(f.home.path(),&["--root",f.r(),"approval","demo","import",document.to_str().unwrap(),document.with_extension("json.sig").to_str().unwrap(),"--expected-head",&head().to_string()]);
     assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
     let approval:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();assert_eq!(approval,drafted["inputs"]["approval"]);
@@ -2872,10 +2872,10 @@ fn ticker_auto_chain_releases_verified_integrated_and_fan_in_dependents() {
     let reservation:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(reservation["record"]["inputs"],drafted["inputs"]);
     let attempt=reservation["record"]["attempt"].as_str().unwrap();assert_eq!(attempt,drafted["brief"]["attempt_id"]);
-    assert_eq!(herdr_projects::memory::render_attempt_brief(&f.project,attempt).unwrap().text,brief,"the reserved attempt carries the worker prompt");
+    assert_eq!(herdr_farm::memory::render_attempt_brief(&f.project,attempt).unwrap().text,brief,"the reserved attempt carries the worker prompt");
     // The prepared worktree is checked out at a's integrated SHA.
-    let operation=herdr_projects::domain::OperationId::new(reservation["record"]["operation"].as_str().unwrap()).unwrap();
-    let receipts=herdr_projects::worktree_preparation::prepare(&f.project,&operation,1,std::time::Instant::now()+std::time::Duration::from_secs(45),Default::default()).unwrap();
+    let operation=herdr_farm::domain::OperationId::new(reservation["record"]["operation"].as_str().unwrap()).unwrap();
+    let receipts=herdr_farm::worktree_preparation::prepare(&f.project,&operation,1,std::time::Instant::now()+std::time::Duration::from_secs(45),Default::default()).unwrap();
     assert_eq!(receipts.len(),1);
     assert_eq!(f.git(&["-C",&receipts[0].plan.path,"rev-parse","HEAD"]),a_commit);
     // The fan-in dependent `d` reserves only on a base containing both integrated parents.
@@ -2896,7 +2896,7 @@ fn ticker_auto_chain_releases_verified_integrated_and_fan_in_dependents() {
     let edges=drafted["inputs"]["dependencies"].as_array().unwrap().iter().map(|d|(d["task"].as_str().unwrap(),d["requirement"].as_str().unwrap())).collect::<Vec<_>>();
     assert_eq!(edges,[("a","integrated_commit"),("e","integrated_commit")]);
     let document=f.home.path().join("d-approval.json");std::fs::write(&document,serde_json::to_vec_pretty(&drafted["approval"]).unwrap()).unwrap();
-    assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y","sign","-f"]).arg(&f.key).args(["-n",herdr_projects::authority::SIGNATURE_NAMESPACE]).arg(&document).output().unwrap().status.success());
+    assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y","sign","-f"]).arg(&f.key).args(["-n",herdr_farm::authority::SIGNATURE_NAMESPACE]).arg(&document).output().unwrap().status.success());
     let out=hp(f.home.path(),&["--root",f.r(),"approval","demo","import",document.to_str().unwrap(),document.with_extension("json.sig").to_str().unwrap(),"--expected-head",&head().to_string()]);
     assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
     let approval:serde_json::Value=serde_json::from_slice(&out.stdout).unwrap();
@@ -2913,7 +2913,7 @@ fn ticker_auto_chain_releases_verified_integrated_and_fan_in_dependents() {
 #[test]
 fn controller_captures_uncommitted_worker_edits_for_submission_and_verification() {
     use std::{fs,os::unix::fs::PermissionsExt,path::PathBuf};
-    use herdr_projects::{runtime,domain::{TaskId,RuntimeRoute},operations::DeliveryState};
+    use herdr_farm::{runtime,domain::{TaskId,RuntimeRoute},operations::DeliveryState};
     let f=VerifyFixture::with_worker(&[("src/lib.rs","pub fn base() {}\n".into())],
         "kind='codex'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=60\nunknown_usage='allow_with_warning'\n");
     let start=f.candidate.clone();let repository=f.repo.canonicalize().unwrap();
@@ -2929,24 +2929,24 @@ fn controller_captures_uncommitted_worker_edits_for_submission_and_verification(
         "project_store":f.store,"expected_head":added,"task_id":"a","contract_revision":1,"deliverable":"src/a.txt","non_goals":"no other change",
         "acceptance_policies":policies.iter().map(|(id,text)|serde_json::json!({"id":id,"text":text})).collect::<Vec<_>>(),
         "repository":repository,"base_oid":start,"object_format":"sha256","dependencies":[],"capability_flags":[],
-        "profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_then_integrate","authority":herdr_projects::authority::policy_reference(&f.project).unwrap()
+        "profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_then_integrate","authority":herdr_farm::authority::policy_reference(&f.project).unwrap()
     })).unwrap();contract.push(b'\n');
-    let contract_path=f.home.path().join("a-contract.json");fs::write(&contract_path,&contract).unwrap();sign(&contract_path,herdr_projects::authority::CONTRACT_SIGNATURE_NAMESPACE);
+    let contract_path=f.home.path().join("a-contract.json");fs::write(&contract_path,&contract).unwrap();sign(&contract_path,herdr_farm::authority::CONTRACT_SIGNATURE_NAMESPACE);
     let installed=ok(cli(&["task","demo","contract","put","--input-file",contract_path.to_str().unwrap(),"--signature",contract_path.with_extension("json.sig").to_str().unwrap()]));
     let request=f.home.path().join("a-queue.json");fs::write(&request,r#"{"priority":0,"dependencies":[]}"#).unwrap();
     ok(cli(&["task","demo","queue","a","--input-file",request.to_str().unwrap(),"--expected-revision","1","--expected-head",&head().to_string()]));
     let policy=runtime::snapshot(&f.project).unwrap().scheduler.unwrap().policy.revision.to_string();
     ok(cli(&["scheduler","demo","policy","--max-active-workers","4","--max-attempts-per-task","3","--expected-revision",&policy,"--expected-head",&head().to_string()]));
     let socket=f.home.path().join("native.sock");let _listener=std::os::unix::net::UnixListener::bind(&socket).unwrap();
-    let config=f.home.path().join(".config/herdr-projects/config.toml");
+    let config=f.home.path().join(".config/herdr-farm/config.toml");
     let revision=runtime::snapshot(&f.project).unwrap().tasks.into_iter().find(|t|t.id.as_str()=="a").unwrap().revision;
     let binding=runtime::create_binding(&f.project,Some(&TaskId::new("a").unwrap()),Some(revision),head(),
         &RuntimeRoute{socket:socket.display().to_string(),cwd:repository.display().to_string(),..Default::default()}).unwrap();
-    herdr_projects::migration::open_active(&f.project).unwrap().record_observations(head(),&[herdr_projects::reconcile::RuntimeObservation{binding:binding.binding.id.clone(),
+    herdr_farm::migration::open_active(&f.project).unwrap().record_observations(head(),&[herdr_farm::reconcile::RuntimeObservation{binding:binding.binding.id.clone(),
         binding_revision:binding.binding.revision,task_revision:binding.task_revision,observed_unix_ms:jiff::Timestamp::now().as_millisecond(),collector:"herdr-git-v2".into(),
-        config_digest:herdr_projects::migration::config_reference(&config).unwrap().digest,..Default::default()}]).unwrap();
+        config_digest:herdr_farm::migration::config_reference(&config).unwrap().digest,..Default::default()}]).unwrap();
     let control=runtime::snapshot(&f.project).unwrap().control.unwrap().revision;
-    runtime::set_state(&f.project,head(),control,herdr_projects::domain::ProjectState::Active,&config).unwrap();
+    runtime::set_state(&f.project,head(),control,herdr_farm::domain::ProjectState::Active,&config).unwrap();
     let profile=f.fake_launchable_profile("codex","codex-cli 0.154.0");
     fs::write(f.project.join("PROJECT.md"),"Edit files only; never commit.").unwrap();
     let scope=f.home.path().join("a-scope.json");
@@ -2957,7 +2957,7 @@ fn controller_captures_uncommitted_worker_edits_for_submission_and_verification(
         "knowledge":{"id":snapshot["id"],"revision":1,"digest":snapshot["manifest_hash"]},"repositories":[repository]}).to_string()).unwrap();
     let drafted=ok(cli(&["launch","demo","draft","--selection",selection.to_str().unwrap(),"--expected-head",&head().to_string()]));
     let document=f.home.path().join("a-approval.json");fs::write(&document,serde_json::to_vec_pretty(&drafted["approval"]).unwrap()).unwrap();
-    sign(&document,herdr_projects::authority::SIGNATURE_NAMESPACE);
+    sign(&document,herdr_farm::authority::SIGNATURE_NAMESPACE);
     let approval=ok(cli(&["approval","demo","import",document.to_str().unwrap(),document.with_extension("json.sig").to_str().unwrap(),"--expected-head",&head().to_string()]));
     let reservation=ok(cli(&["launch","demo","reserve","--selection",selection.to_str().unwrap(),"--approval-digest",approval["digest"].as_str().unwrap(),"--expected-head",&head().to_string()]));
     // Telemetry: the operator reservation classified `src/` (one uncertain write path): 1 + 2 + 1 = 4.
@@ -2965,8 +2965,8 @@ fn controller_captures_uncommitted_worker_edits_for_submission_and_verification(
         "SELECT class,band,features FROM task_classifications WHERE task_id='a' AND contract_revision=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
     assert_eq!(classified,("code".into(),"medium".into(),r#"{"dependencies":0,"repositories":1,"route":"verify_then_integrate","uncertain_write_paths":1,"write_named_resources":0,"write_paths":1}"#.into()));
     let attempt=reservation["record"]["attempt"].as_str().unwrap().to_owned();
-    let operation=herdr_projects::domain::OperationId::new(reservation["record"]["operation"].as_str().unwrap()).unwrap();
-    let receipts=herdr_projects::worktree_preparation::prepare(&f.project,&operation,1,std::time::Instant::now()+std::time::Duration::from_secs(45),Default::default()).unwrap();
+    let operation=herdr_farm::domain::OperationId::new(reservation["record"]["operation"].as_str().unwrap()).unwrap();
+    let receipts=herdr_farm::worktree_preparation::prepare(&f.project,&operation,1,std::time::Instant::now()+std::time::Duration::from_secs(45),Default::default()).unwrap();
     let worktree=PathBuf::from(&receipts[0].plan.path);let branch=format!("refs/heads/{}",receipts[0].plan.branch);
     let wt=|args:&[&str]|{let mut all=vec!["-C",worktree.to_str().unwrap()];all.extend_from_slice(args);f.git(&all)};
     let capture=|attempt:&str|cli(&["result","demo","capture",attempt]);
@@ -3002,7 +3002,7 @@ fn controller_captures_uncommitted_worker_edits_for_submission_and_verification(
     assert_eq!((first["captured"].as_bool(),first["base_oid"].as_str(),first["branch"].as_str()),(Some(true),Some(start.as_str()),Some(branch.as_str())));
     assert_eq!(f.git(&["rev-parse",&branch]),candidate);assert_eq!(f.git(&["rev-parse",&format!("{candidate}^")]),start);
     assert_eq!(f.git(&["log","-1","--format=%an <%ae>|%cn <%ce>|%s",&candidate]),
-        format!("herdr-projects <capture@herdr-projects.invalid>|herdr-projects <capture@herdr-projects.invalid>|Capture attempt {attempt}"));
+        format!("herdr-farm <capture@herdr-projects.invalid>|herdr-farm <capture@herdr-projects.invalid>|Capture attempt {attempt}"));
     assert_eq!(f.git(&["diff-tree","-r","--name-only","--no-commit-id",&start,&candidate]),"src/.gitignore\nsrc/a.txt","ignored files stay out");
     assert_eq!(wt(&["status","--porcelain"]),"","the worktree index matches the capture");
     let again=ok(capture(&attempt));
@@ -3086,7 +3086,7 @@ sys.stdout.buffer.write(json.dumps({'result':json.loads(reply)['result']}).encod
 #[test]
 fn outcome_success_path() {
     use std::{fs,time::{Duration,Instant}};
-    use herdr_projects::{migration,runtime,domain::{TaskId,RuntimeRoute,AttemptState,TaskState},operations::DeliveryState};
+    use herdr_farm::{migration,runtime,domain::{TaskId,RuntimeRoute,AttemptState,TaskState},operations::DeliveryState};
     let f=VerifyFixture::with_worker(&[("src/start.txt","start\n".into())],
         "kind='claude'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=600\nunknown_usage='allow_with_warning'\n");
     let start=f.candidate.clone();let repository=f.repo.canonicalize().unwrap();
@@ -3115,9 +3115,9 @@ fn outcome_success_path() {
         "project_store":f.store,"expected_head":added,"task_id":"a","contract_revision":1,"deliverable":"src/a.txt","non_goals":"no other change",
         "acceptance_policies":[{"id":"clean","text":r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#}],
         "repository":repository,"base_oid":start,"object_format":"sha256","dependencies":[],"capability_flags":[],
-        "profile_kind":"claude","retry_class":"none","result_schema_id":"result-v1","route":"verify_then_integrate","authority":herdr_projects::authority::policy_reference(&f.project).unwrap()
+        "profile_kind":"claude","retry_class":"none","result_schema_id":"result-v1","route":"verify_then_integrate","authority":herdr_farm::authority::policy_reference(&f.project).unwrap()
     })).unwrap();contract.push(b'\n');
-    let contract_path=f.home.path().join("a-contract.json");fs::write(&contract_path,&contract).unwrap();sign(&contract_path,herdr_projects::authority::CONTRACT_SIGNATURE_NAMESPACE);
+    let contract_path=f.home.path().join("a-contract.json");fs::write(&contract_path,&contract).unwrap();sign(&contract_path,herdr_farm::authority::CONTRACT_SIGNATURE_NAMESPACE);
     let installed=cli(&["task","demo","contract","put","--input-file",contract_path.to_str().unwrap(),"--signature",contract_path.with_extension("json.sig").to_str().unwrap()]);
     runtime::add_task(&f.project,TaskId::new("b").unwrap(),"task b".into(),head()).unwrap();
     for (task,edges) in [("a",serde_json::json!([])),("b",serde_json::json!([{"predecessor":"a","requirement":"integrated_commit"}]))] {
@@ -3126,7 +3126,7 @@ fn outcome_success_path() {
     }
     let policy=runtime::snapshot(&f.project).unwrap().scheduler.unwrap().policy.revision.to_string();
     cli(&["scheduler","demo","policy","--max-active-workers","4","--max-attempts-per-task","3","--expected-revision",&policy,"--expected-head",&head().to_string()]);
-    let config=f.home.path().join(".config/herdr-projects/config.toml");
+    let config=f.home.path().join(".config/herdr-farm/config.toml");
     let mut bindings=std::collections::BTreeMap::new();
     for (task,socket) in ["a","b"].into_iter().zip(&sockets) {
         let revision=runtime::snapshot(&f.project).unwrap().tasks.into_iter().find(|t|t.id.as_str()==task).unwrap().revision;
@@ -3134,12 +3134,12 @@ fn outcome_success_path() {
             &RuntimeRoute{socket:socket.display().to_string(),cwd:repository.display().to_string(),..Default::default()}).unwrap();
         bindings.insert(task,(change.binding,change.task_revision));
     }
-    let observations=bindings.values().map(|(binding,task_revision)|herdr_projects::reconcile::RuntimeObservation{binding:binding.id.clone(),binding_revision:binding.revision,
+    let observations=bindings.values().map(|(binding,task_revision)|herdr_farm::reconcile::RuntimeObservation{binding:binding.id.clone(),binding_revision:binding.revision,
         task_revision:*task_revision,observed_unix_ms:jiff::Timestamp::now().as_millisecond(),collector:"herdr-git-v2".into(),
         config_digest:migration::config_reference(&config).unwrap().digest,..Default::default()}).collect::<Vec<_>>();
     migration::open_active(&f.project).unwrap().record_observations(head(),&observations).unwrap();
     let control=runtime::snapshot(&f.project).unwrap().control.unwrap().revision;
-    runtime::set_state(&f.project,head(),control,herdr_projects::domain::ProjectState::Active,&config).unwrap();
+    runtime::set_state(&f.project,head(),control,herdr_farm::domain::ProjectState::Active,&config).unwrap();
     let profile=f.launchable_profile_with(&herdr,&agent,&agent_home);
     // Draft (and for `a`, sign and reserve) a launch from retained instructions.
     let draft=|task:&str|->std::path::PathBuf {
@@ -3155,7 +3155,7 @@ fn outcome_success_path() {
     let selection=draft("a");
     let drafted=cli(&["launch","demo","draft","--selection",selection.to_str().unwrap(),"--expected-head",&head().to_string()]);
     let document=f.home.path().join("a-approval.json");fs::write(&document,serde_json::to_vec_pretty(&drafted["approval"]).unwrap()).unwrap();
-    sign(&document,herdr_projects::authority::SIGNATURE_NAMESPACE);
+    sign(&document,herdr_farm::authority::SIGNATURE_NAMESPACE);
     let approval=cli(&["approval","demo","import",document.to_str().unwrap(),document.with_extension("json.sig").to_str().unwrap(),"--expected-head",&head().to_string()]);
     let reservation=cli(&["launch","demo","reserve","--selection",selection.to_str().unwrap(),"--approval-digest",approval["digest"].as_str().unwrap(),"--expected-head",&head().to_string()]);
     let attempt=reservation["record"]["attempt"].as_str().unwrap().to_owned();
@@ -3171,9 +3171,9 @@ fn outcome_success_path() {
     let mut child=f.spawn_with(&herdr_path);
     f.wait(&mut child,120,&briefed);
     f.stop(&mut child);
-    let started:herdr_projects::domain::LaunchStartedReceipt=serde_json::from_value(events("runtime.launch_started")[0].payload.clone()).unwrap();
+    let started:herdr_farm::domain::LaunchStartedReceipt=serde_json::from_value(events("runtime.launch_started")[0].payload.clone()).unwrap();
     let supervisor=started.supervisor.clone().unwrap();
-    assert!(!herdr_projects::worker_supervision::SupervisorObservation::recover_exited(&supervisor).unwrap(),"the worker is running");
+    assert!(!herdr_farm::worker_supervision::SupervisorObservation::recover_exited(&supervisor).unwrap(),"the worker is running");
 
     // The harness plays the worker's result; its claims are untrusted.
     f.git(&["checkout","-q","-b","a-result",&start]);fs::write(f.repo.join("src/a.txt"),"a\n").unwrap();f.git(&["add","src"]);f.git(&["commit","-qm","a"]);
@@ -3225,9 +3225,9 @@ fn outcome_success_path() {
     let mut child=f.spawn_with(&herdr_path);
     f.wait(&mut child,120,&||a_attempt().termination_observed);
     f.stop(&mut child);
-    assert!(herdr_projects::worker_supervision::SupervisorObservation::recover_exited(&supervisor).unwrap(),"the worker has exited");
-    let stop:herdr_projects::domain::WorkerTerminationReceipt=serde_json::from_value(events("runtime.worker_terminated")[0].payload.clone()).unwrap();
-    assert_eq!(stop.cause,herdr_projects::domain::WorkerTerminationCause::Completion);
+    assert!(herdr_farm::worker_supervision::SupervisorObservation::recover_exited(&supervisor).unwrap(),"the worker has exited");
+    let stop:herdr_farm::domain::WorkerTerminationReceipt=serde_json::from_value(events("runtime.worker_terminated")[0].payload.clone()).unwrap();
+    assert_eq!(stop.cause,herdr_farm::domain::WorkerTerminationCause::Completion);
     let (finished,a_task)=(a_attempt(),task("a"));
     assert_eq!((finished.state,finished.retains_capacity()),(AttemptState::Completed,false));
     assert_eq!((a_task.state,a_task.active_attempt),(TaskState::Succeeded,None));
@@ -3293,7 +3293,7 @@ fn outcome_success_path() {
 fn live_f1_worker_result_integrates_and_dependent_launches_on_integrated_sha() {
     use std::{fs,io::{Read,Write},os::unix::fs::PermissionsExt,sync::{Arc,atomic::{AtomicBool,AtomicUsize,Ordering}},time::{Duration,Instant}};
     use std::path::PathBuf;
-    use herdr_projects::{migration,runtime,domain::{TaskId,RuntimeRoute},operations::{DeliveryState,Outcome}};
+    use herdr_farm::{migration,runtime,domain::{TaskId,RuntimeRoute},operations::{DeliveryState,Outcome}};
     let live=match std::env::var("HP_LIVE_F1_MODE").as_deref(){Ok("live")=>true,Ok("fixture")=>false,_=>panic!("set HP_LIVE_F1_MODE=fixture or live")};
     let clock=Instant::now();
     let say=|text:&str|eprintln!("[f1.7 +{:>4}s {}] {text}",clock.elapsed().as_secs(),&jiff::Timestamp::now().to_string()[11..19]);
@@ -3394,9 +3394,9 @@ fn live_f1_worker_result_integrates_and_dependent_launches_on_integrated_sha() {
         "project_store":f.store,"expected_head":added,"task_id":"a","contract_revision":1,"deliverable":"src/a.txt holds the marker","non_goals":"no other change",
         "acceptance_policies":policies.iter().map(|(id,text)|serde_json::json!({"id":id,"text":text})).collect::<Vec<_>>(),
         "repository":repository,"base_oid":start,"object_format":"sha256","dependencies":[],"capability_flags":[],
-        "profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_then_integrate","authority":herdr_projects::authority::policy_reference(&f.project).unwrap()
+        "profile_kind":"codex","retry_class":"none","result_schema_id":"result-v1","route":"verify_then_integrate","authority":herdr_farm::authority::policy_reference(&f.project).unwrap()
     })).unwrap();contract.push(b'\n');
-    let contract_path=f.home.path().join("a-contract.json");fs::write(&contract_path,&contract).unwrap();sign(&contract_path,herdr_projects::authority::CONTRACT_SIGNATURE_NAMESPACE);
+    let contract_path=f.home.path().join("a-contract.json");fs::write(&contract_path,&contract).unwrap();sign(&contract_path,herdr_farm::authority::CONTRACT_SIGNATURE_NAMESPACE);
     let installed=cli(&["task","demo","contract","put","--input-file",contract_path.to_str().unwrap(),"--signature",contract_path.with_extension("json.sig").to_str().unwrap()]);
     runtime::add_task(&f.project,TaskId::new("b").unwrap(),"F1.7 live dependent b".into(),head()).unwrap();
     for (task,edges) in [("a",serde_json::json!([])),("b",serde_json::json!([{"predecessor":"a","requirement":"integrated_commit"}]))] {
@@ -3405,7 +3405,7 @@ fn live_f1_worker_result_integrates_and_dependent_launches_on_integrated_sha() {
     }
     let policy=runtime::snapshot(&f.project).unwrap().scheduler.unwrap().policy.revision.to_string();
     cli(&["scheduler","demo","policy","--max-active-workers","4","--max-attempts-per-task","3","--expected-revision",&policy,"--expected-head",&head().to_string()]);
-    let config=f.home.path().join(".config/herdr-projects/config.toml");
+    let config=f.home.path().join(".config/herdr-farm/config.toml");
     let mut bindings=std::collections::BTreeMap::new();
     for (task,socket) in ["a","b"].into_iter().zip(&sockets) {
         let revision=runtime::snapshot(&f.project).unwrap().tasks.into_iter().find(|t|t.id.as_str()==task).unwrap().revision;
@@ -3413,12 +3413,12 @@ fn live_f1_worker_result_integrates_and_dependent_launches_on_integrated_sha() {
             &RuntimeRoute{socket:socket.display().to_string(),cwd:repository.display().to_string(),..Default::default()}).unwrap();
         bindings.insert(task,(change.binding,change.task_revision));
     }
-    let observations=bindings.values().map(|(binding,task_revision)|herdr_projects::reconcile::RuntimeObservation{binding:binding.id.clone(),binding_revision:binding.revision,
+    let observations=bindings.values().map(|(binding,task_revision)|herdr_farm::reconcile::RuntimeObservation{binding:binding.id.clone(),binding_revision:binding.revision,
         task_revision:*task_revision,observed_unix_ms:jiff::Timestamp::now().as_millisecond(),collector:"herdr-git-v2".into(),
         config_digest:migration::config_reference(&config).unwrap().digest,..Default::default()}).collect::<Vec<_>>();
     migration::open_active(&f.project).unwrap().record_observations(head(),&observations).unwrap();
     let control=runtime::snapshot(&f.project).unwrap().control.unwrap().revision;
-    runtime::set_state(&f.project,head(),control,herdr_projects::domain::ProjectState::Active,&config).unwrap();
+    runtime::set_state(&f.project,head(),control,herdr_farm::domain::ProjectState::Active,&config).unwrap();
     let profile=f.launchable_profile_with(&herdr,&agent,&agent_home);
     const TARGET:&str="refs/heads/integration";
     f.git(&["branch","integration",&start]);
@@ -3438,13 +3438,13 @@ fn live_f1_worker_result_integrates_and_dependent_launches_on_integrated_sha() {
         let drafted=cli(&["launch","demo","draft","--selection",selection.to_str().unwrap(),"--expected-head",&head().to_string()]);
         assert!(drafted["brief"]["text"].as_str().unwrap().contains(instructions),"the brief carries the retained instructions");
         let document=f.home.path().join(format!("{task}-approval.json"));fs::write(&document,serde_json::to_vec_pretty(&drafted["approval"]).unwrap()).unwrap();
-        sign(&document,herdr_projects::authority::SIGNATURE_NAMESPACE);
+        sign(&document,herdr_farm::authority::SIGNATURE_NAMESPACE);
         let approval=cli(&["approval","demo","import",document.to_str().unwrap(),document.with_extension("json.sig").to_str().unwrap(),"--expected-head",&head().to_string()]);
         let reservation=cli(&["launch","demo","reserve","--selection",selection.to_str().unwrap(),"--approval-digest",approval["digest"].as_str().unwrap(),"--expected-head",&head().to_string()]);
         assert_eq!(reservation["record"]["inputs"],drafted["inputs"]);
         let attempt=reservation["record"]["attempt"].as_str().unwrap().to_owned();
-        let inputs:herdr_projects::domain::LaunchInputs=serde_json::from_value(drafted["inputs"].clone()).unwrap();
-        let plan=herdr_projects::domain::worktree_plans(&inputs,&herdr_projects::domain::AttemptId::new(attempt.clone()).unwrap()).unwrap().remove(0);
+        let inputs:herdr_farm::domain::LaunchInputs=serde_json::from_value(drafted["inputs"].clone()).unwrap();
+        let plan=herdr_farm::domain::worktree_plans(&inputs,&herdr_farm::domain::AttemptId::new(attempt.clone()).unwrap()).unwrap().remove(0);
         say(&format!("{task}: drafted, signed and reserved attempt {attempt}; worktree base {}",inputs.repositories[0].commit));
         (attempt,PathBuf::from(plan.path))
     };
@@ -3636,7 +3636,7 @@ fn live_f1_worker_result_integrates_and_dependent_launches_on_integrated_sha() {
 #[test]
 fn profile_prepare_uses_pinned_owner_config_and_keeps_unknown_capabilities() {
     use std::{fs, os::unix::fs::PermissionsExt};
-    use herdr_projects::{migration,runtime};
+    use herdr_farm::{migration,runtime};
     let home=tempfile::tempdir().unwrap();
     let caller=tempfile::tempdir().unwrap();
     let root=home.path().join("root");
@@ -3674,7 +3674,7 @@ fn profile_prepare_uses_pinned_owner_config_and_keeps_unknown_capabilities() {
 #[cfg(all(feature = "state-store", target_os = "linux"))]
 #[test]
 fn task_contract_put_and_result_submit_keep_worker_bytes_untrusted() {
-    use herdr_projects::{authority::CONTRACT_SIGNATURE_NAMESPACE, domain::*, migration, runtime};
+    use herdr_farm::{authority::CONTRACT_SIGNATURE_NAMESPACE, domain::*, migration, runtime};
     use std::process::Command;
     let home = tempfile::tempdir().unwrap();
     let root = home.path().join("root");
@@ -3734,7 +3734,7 @@ fn task_contract_put_and_result_submit_keep_worker_bytes_untrusted() {
         serde_json::json!({"oid":oid,"relative_path":format!("{}/{}",&oid[..2],&oid[2..])})
     }).collect::<Vec<_>>();
     let policy = r#"{"version":1,"checks":["/usr/bin/git","diff","--quiet"]}"#;
-    let authority = herdr_projects::authority::policy_reference(&project).unwrap();
+    let authority = herdr_farm::authority::policy_reference(&project).unwrap();
     let mut document = serde_json::to_vec_pretty(&serde_json::json!({
         "version": 3,
         "outputs": [{"path":"src/lib.rs","kind":"git_file"},{"path":"src/required.txt","kind":"git_file"},{"path":"push","kind":"git_file"}],
@@ -4338,7 +4338,7 @@ fn task_contract_put_and_result_submit_keep_worker_bytes_untrusted() {
 #[cfg(all(feature = "state-store", target_os = "linux"))]
 #[test]
 fn signed_factory_admission_command_stores_raw_bytes_or_writes_a_denial() {
-    use herdr_projects::{authority, domain::ProjectState, integration, migration, runtime};
+    use herdr_farm::{authority, domain::ProjectState, integration, migration, runtime};
     use sha2::{Digest, Sha256};
     use std::fs;
     use std::process::Command;
@@ -4406,7 +4406,7 @@ fn signed_factory_admission_command_stores_raw_bytes_or_writes_a_denial() {
     git(&["commit", "-m", "base"]);
     let repo = repo.canonicalize().unwrap();
     {
-        let mut db = herdr_projects::store::SqliteStore::open(&db_path).unwrap();
+        let mut db = herdr_farm::store::SqliteStore::open(&db_path).unwrap();
         integration::configure_integration_ref(&mut db, &repo, "refs/heads/integration").unwrap();
     }
     let authority_ref = serde_json::to_value(authority::policy_reference(&project).unwrap()).unwrap();
@@ -4569,7 +4569,7 @@ mod test_schema;
 #[test]
 #[cfg(feature="state-store")]
 fn factory_status_cli_redacts_history_preserves_capacity_and_refuses_unknown_schema() {
-    use herdr_projects::{domain::*,migration,store::SCHEMA};
+    use herdr_farm::{domain::*,migration,store::SCHEMA};
     fn forbid(value:&serde_json::Value) {
         match value {
             serde_json::Value::Object(map)=>for (key,child) in map {
@@ -4582,7 +4582,7 @@ fn factory_status_cli_redacts_history_preserves_capacity_and_refuses_unknown_sch
     }
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
     for action in ["new","pause"] {assert!(hp(home.path(),&["--root",r,action,"demo"]).status.success());}
-    let project=root.join("demo");let plan=migration::inspect_with_config(&project,&home.path().join(".config/herdr-projects/config.toml")).unwrap();migration::apply(&project,&plan,true).unwrap();
+    let project=root.join("demo");let plan=migration::inspect_with_config(&project,&home.path().join(".config/herdr-farm/config.toml")).unwrap();migration::apply(&project,&plan,true).unwrap();
     let mut db=migration::open_active(&project).unwrap();
         let mut mutations = vec![
             Mutation::Task {
@@ -4673,11 +4673,11 @@ fn factory_status_cli_redacts_history_preserves_capacity_and_refuses_unknown_sch
 #[test]
 #[cfg(feature="state-store")]
 fn historical_store_cli_requires_explicit_upgrade_and_preserves_intent_and_capacity() {
-    use herdr_projects::{domain::*,migration,store::SCHEMA};
+    use herdr_farm::{domain::*,migration,store::SCHEMA};
     for version in 32..=42 {
         let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let r=root.to_str().unwrap();
         for command in ["new","pause"] {assert!(hp(home.path(),&["--root",r,command,"demo"]).status.success());}
-        let project=root.join("demo");let plan=migration::inspect_with_config(&project,&home.path().join(".config/herdr-projects/config.toml")).unwrap();migration::apply(&project,&plan,true).unwrap();
+        let project=root.join("demo");let plan=migration::inspect_with_config(&project,&home.path().join(".config/herdr-farm/config.toml")).unwrap();migration::apply(&project,&plan,true).unwrap();
         let path=project.join(".state/state.db");
         let mut db=migration::open_active(&project).unwrap();
         db.commit(Commit{expected_head:db.current_head().unwrap(),mutations:vec![
@@ -4696,7 +4696,7 @@ fn historical_store_cli_requires_explicit_upgrade_and_preserves_intent_and_capac
         assert_eq!(serde_json::from_slice::<serde_json::Value>(&status.stdout).unwrap()["schema"],version);
         assert_eq!(schema(),version);assert!(!has_projection());
         let inspect=hp(home.path(),&["--root",r,"plan","inspect","demo"]);assert!(!inspect.status.success());assert_eq!(schema(),version);
-        let guard=herdr_projects::execution_guard::ProjectGuard::acquire(&project).unwrap();
+        let guard=herdr_farm::execution_guard::ProjectGuard::acquire(&project).unwrap();
         let upgrade=["--root",r,"migration","demo","upgrade-store"];
         assert!(!hp(home.path(),&upgrade).status.success());assert_eq!(schema(),version);assert!(!has_projection());drop(guard);
         let upgraded=hp(home.path(),&upgrade);assert!(upgraded.status.success(),"schema {version}: {}",String::from_utf8_lossy(&upgraded.stderr));
@@ -4716,7 +4716,7 @@ fn historical_store_cli_requires_explicit_upgrade_and_preserves_intent_and_capac
 #[cfg(all(feature="state-store",target_os="linux"))]
 fn hot_paths_skip_the_whole_store_check_and_the_ticker_checks_off_its_pass_then_pauses_admission_and_effects_on_corruption() {
     use std::{fs, io::{Seek, SeekFrom, Write}, os::unix::{fs::PermissionsExt, net::UnixListener}, process::Stdio, time::{Duration, Instant}};
-    use herdr_projects::{domain::{ProjectState, RuntimeRoute, TaskId}, migration, runtime};
+    use herdr_farm::{domain::{ProjectState, RuntimeRoute, TaskId}, migration, runtime};
     let home = tempfile::tempdir().unwrap();
     let root = home.path().join("root");
     let r = root.to_str().unwrap();
@@ -4800,7 +4800,7 @@ fn hot_paths_skip_the_whole_store_check_and_the_ticker_checks_off_its_pass_then_
     let _listener = UnixListener::bind(&socket).unwrap();
     runtime::create_binding(&project, None, None, head, &RuntimeRoute { socket: socket.display().to_string(), ..Default::default() }).unwrap();
     assert!(hp(h, &["--root", r, "reconcile", "demo", "--record"]).status.success());
-    let config = h.join(".config/herdr-projects/config.toml");
+    let config = h.join(".config/herdr-farm/config.toml");
     let snapshot = runtime::snapshot(&project).unwrap();
     runtime::set_state(&project, snapshot.head, snapshot.control.unwrap().revision, ProjectState::Active, &config).unwrap();
 
@@ -5150,13 +5150,13 @@ fn ticker_delivers_one_memory_review_row_and_a_crash_retry_neither_duplicates_no
     // is, no store write and no error on later passes.
     crash_before_count();
     assert_eq!(memory_review_json(h, r, &["defer", &id, "--reason", "ask the owner"])["status"], "deferred");
-    let head = herdr_projects::runtime::snapshot(&project).unwrap().head;
+    let head = herdr_farm::runtime::snapshot(&project).unwrap().head;
     turn();
     assert!(!log().contains("memory-review remind:"), "{}", log());
     assert_eq!(reminders(), rows);
     assert_eq!(obligation()["notified"], 1);
     assert_eq!(obligation()["status"], "deferred");
-    assert_eq!(herdr_projects::runtime::snapshot(&project).unwrap().head, head);
+    assert_eq!(herdr_farm::runtime::snapshot(&project).unwrap().head, head);
     turn();
     assert!(!log().contains("memory-review remind:"), "{}", log());
     assert_eq!(reminders(), rows);
@@ -5248,7 +5248,7 @@ fn doctor_checks_coordinator_identity_priming_and_memory_owner_without_writing()
 /// task. Returns `(selection, approval digest)` per task and the profile digest.
 #[cfg(all(feature="state-store",target_os="linux"))]
 fn signed_launches(tasks:&[&str])->(VerifyFixture,std::os::unix::net::UnixListener,Vec<(std::path::PathBuf,String)>,String) {
-    use std::fs;use herdr_projects::{runtime,migration,domain::{TaskId,RuntimeRoute,ProjectState}};
+    use std::fs;use herdr_farm::{runtime,migration,domain::{TaskId,RuntimeRoute,ProjectState}};
     let f=VerifyFixture::with_worker(&[("src/lib.rs","pub fn base() {}\n".into())],
         "kind='codex'\npermission_policy='interactive'\n[profiles.worker.budget]\nmax_wall_seconds=60\nunknown_usage='allow_with_warning'\n");
     let repository=f.repo.canonicalize().unwrap();
@@ -5263,13 +5263,13 @@ fn signed_launches(tasks:&[&str])->(VerifyFixture,std::os::unix::net::UnixListen
     let policy=runtime::snapshot(&f.project).unwrap().scheduler.unwrap().policy.revision.to_string();
     cli(&["scheduler","demo","policy","--max-active-workers","4","--max-attempts-per-task","3","--expected-revision",&policy,"--expected-head",&head()]);
     let socket=f.home.path().join("native.sock");let listener=std::os::unix::net::UnixListener::bind(&socket).unwrap();
-    let config=f.home.path().join(".config/herdr-projects/config.toml");
+    let config=f.home.path().join(".config/herdr-farm/config.toml");
     let bindings=tasks.iter().map(|task|{
         let revision=runtime::snapshot(&f.project).unwrap().tasks.into_iter().find(|t|t.id.as_str()==*task).unwrap().revision;
         runtime::create_binding(&f.project,Some(&TaskId::new(*task).unwrap()),Some(revision),runtime::snapshot(&f.project).unwrap().head,
             &RuntimeRoute{socket:socket.display().to_string(),cwd:repository.display().to_string(),..Default::default()}).unwrap()
     }).collect::<Vec<_>>();
-    let observations=bindings.iter().map(|change|herdr_projects::reconcile::RuntimeObservation{binding:change.binding.id.clone(),binding_revision:change.binding.revision,
+    let observations=bindings.iter().map(|change|herdr_farm::reconcile::RuntimeObservation{binding:change.binding.id.clone(),binding_revision:change.binding.revision,
         task_revision:change.task_revision,observed_unix_ms:jiff::Timestamp::now().as_millisecond(),collector:"herdr-git-v2".into(),
         config_digest:migration::config_reference(&config).unwrap().digest,..Default::default()}).collect::<Vec<_>>();
     migration::open_active(&f.project).unwrap().record_observations(runtime::snapshot(&f.project).unwrap().head,&observations).unwrap();
@@ -5286,7 +5286,7 @@ fn signed_launches(tasks:&[&str])->(VerifyFixture,std::os::unix::net::UnixListen
             "knowledge":{"id":snapshot["id"],"revision":1,"digest":snapshot["manifest_hash"]},"repositories":[repository]}).to_string()).unwrap();
         let drafted=cli(&["launch","demo","draft","--selection",selection.to_str().unwrap(),"--expected-head",&head()]);
         let document=f.home.path().join(format!("{task}-approval.json"));fs::write(&document,serde_json::to_vec_pretty(&drafted["approval"]).unwrap()).unwrap();
-        assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y","sign","-f"]).arg(&f.key).args(["-n",herdr_projects::authority::SIGNATURE_NAMESPACE]).arg(&document).output().unwrap().status.success());
+        assert!(Command::new("/usr/bin/ssh-keygen").args(["-Y","sign","-f"]).arg(&f.key).args(["-n",herdr_farm::authority::SIGNATURE_NAMESPACE]).arg(&document).output().unwrap().status.success());
         let approval=cli(&["approval","demo","import",document.to_str().unwrap(),document.with_extension("json.sig").to_str().unwrap(),"--expected-head",&head()]);
         (selection,approval["digest"].as_str().unwrap().to_owned())
     }).collect();
@@ -5298,7 +5298,7 @@ fn signed_launches(tasks:&[&str])->(VerifyFixture,std::os::unix::net::UnixListen
 fn launch_reserve_records_operator_reason() {
     let (f,_listener,launches,profile)=signed_launches(&["a","b"]);
     let reserve=|selection:&Path,approval:&str|{
-        let head=herdr_projects::runtime::snapshot(&f.project).unwrap().head.to_string();
+        let head=herdr_farm::runtime::snapshot(&f.project).unwrap().head.to_string();
         let out=hp(f.home.path(),&["--root",f.r(),"launch","demo","reserve","--selection",selection.to_str().unwrap(),"--approval-digest",approval,"--expected-head",&head]);
         assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
     };
@@ -5327,7 +5327,7 @@ fn rejected_reservation_writes_no_decision() {
     let (f,_listener,launches,_)=signed_launches(&["a"]);
     let (selection,approval)=&launches[0];
     let counts=||f.db().query_row("SELECT (SELECT count(*) FROM attempts),(SELECT count(*) FROM dispatch_decisions)",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?))).unwrap();
-    let head=||herdr_projects::runtime::snapshot(&f.project).unwrap().head;
+    let head=||herdr_farm::runtime::snapshot(&f.project).unwrap().head;
     let launch=|command:&str,head:u64|{let mut args=vec!["--root",f.r(),"launch","demo",command,"--selection",selection.to_str().unwrap()];
         if command=="reserve" {args.extend(["--approval-digest",approval.as_str()]);}
         let head=head.to_string();args.extend(["--expected-head",&head]);hp(f.home.path(),&args)};
@@ -5346,7 +5346,7 @@ fn rejected_reservation_writes_no_decision() {
 fn fleet_fixture() -> (tempfile::TempDir, String, i64) {
     let home=tempfile::tempdir().unwrap();let root=home.path().join("root");let project=root.join("demo");
     std::fs::create_dir_all(project.join(".state")).unwrap();std::fs::write(project.join("PROJECT.md"),"# demo\n").unwrap();std::fs::write(project.join(".state/format.json"),r#"{"memory":"sqlite-v1","runtime":"sqlite-v1"}"#).unwrap();let db_path=project.join(".state/state.db");
-    drop(herdr_projects::store::SqliteStore::create(&db_path).unwrap());
+    drop(herdr_farm::store::SqliteStore::create(&db_path).unwrap());
     let db=rusqlite::Connection::open(&db_path).unwrap();db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
     let now=jiff::Timestamp::now().as_millisecond();let config=format!("sha256:{}","c".repeat(64));
     for (task,state,attempt,attempt_state,done) in [("t1","failed","t1-a1","failed",1),("t2","running","t2-a1","running",0),("t3","queued","t3-a1","reserved",0)] {
@@ -5463,9 +5463,9 @@ fn fleet_action_opens_the_fleet_pane() {
     assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
     let call=std::fs::read_to_string(home.path().join("herdr-call")).unwrap();
     let call:Vec<&str>=call.lines().collect();
-    assert_eq!(call[..7],["plugin","pane","open","--plugin","herdr-projects","--entrypoint","fleet"]);
+    assert_eq!(call[..7],["plugin","pane","open","--plugin","herdr-farm","--entrypoint","fleet"]);
     let envs:Vec<(&str,&str)>=call.windows(2).filter(|pair|pair[0]=="--env").map(|pair|pair[1].split_once('=').unwrap()).collect();
-    assert_eq!(envs.iter().map(|(name,_)|*name).collect::<Vec<_>>(),["HERDR_PROJECTS_HANDOFF","HERDR_PROJECTS_ROOT"]);
+    assert_eq!(envs.iter().map(|(name,_)|*name).collect::<Vec<_>>(),["HERDR_FARM_HANDOFF","HERDR_PROJECTS_ROOT"]);
     assert_eq!(envs[1].1,r);
     let out=Command::new(BIN).env_clear().env("HOME",home.path()).env("PATH","/usr/bin:/bin").env("HERDR_PLUGIN_STATE_DIR",&state)
         .env("HERDR_SOCKET_PATH",home.path().join("herdr.sock")).envs(envs.iter().copied()).args(command("panes")).stdin(std::process::Stdio::null()).output().unwrap();

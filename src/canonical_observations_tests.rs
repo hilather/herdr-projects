@@ -6,7 +6,7 @@ impl Fixture {
         let world=crate::scenarios::World::new();let project=crate::project::create(&world.root,"canonical","",vec![]).unwrap();project.set_status(crate::project::Status::Paused).unwrap();let path=project.dir().canonicalize().unwrap();
         let plan=migration::inspect(&path).unwrap();migration::apply(&path,&plan,true).unwrap();
         let socket=world.home.path().join("canonical.sock");let listener=UnixListener::bind(&socket).unwrap();
-        runtime::create_binding(&path,None,None,runtime::snapshot(&path).unwrap().head,&herdr_projects::domain::RuntimeRoute{socket:socket.display().to_string(),workspace_id:"w".into(),tab_id:"t".into(),pane_id:"p".into(),cwd:"/fixture".into(),..Default::default()}).unwrap();
+        runtime::create_binding(&path,None,None,runtime::snapshot(&path).unwrap().head,&herdr_farm::domain::RuntimeRoute{socket:socket.display().to_string(),workspace_id:"w".into(),tab_id:"t".into(),pane_id:"p".into(),cwd:"/fixture".into(),..Default::default()}).unwrap();
         let helper=world.home.path().join("herdr");let env=Env::for_test(world.home.path(),&[("HERDR_BIN_PATH",helper.to_str().unwrap())]);
         fs::write(world.home.path().join("mode"),mode).unwrap();
         fs::write(&helper,format!(r#"#!/usr/bin/python3
@@ -49,7 +49,7 @@ fn canonical_worker_cancellation_excludes_mutations_and_preserves_snapshot() {
     let f=Fixture::new("blocked");let before=runtime::snapshot(&f.path).unwrap();let pool=f.pool();let mut reads=Reads::new(pool.clone());reads.poll(&f.ctx(),&f.path).unwrap();reads.admit();
     let end=Instant::now()+Duration::from_secs(5);while !f.world.home.path().join("entered").exists(){assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(5));}
     assert!(ProjectGuard::acquire(&f.path).is_err());
-    assert!(runtime::add_task(&f.path,herdr_projects::domain::TaskId::new("refused").unwrap(),"refused".into(),before.head).is_err());
+    assert!(runtime::add_task(&f.path,herdr_farm::domain::TaskId::new("refused").unwrap(),"refused".into(),before.head).is_err());
     let other=crate::project::create(&f.world.root,"other","",vec![]).unwrap();assert!(ProjectGuard::acquire(&other.dir()).is_ok());
     let started=Instant::now();assert!(pool.stop(Duration::from_secs(3)));assert!(started.elapsed()<Duration::from_secs(3));assert_eq!(runtime::snapshot(&f.path).unwrap(),before);assert!(ProjectGuard::acquire(&f.path).is_ok());
 }
@@ -89,7 +89,7 @@ fn canonical_worker_negative_liveness_is_invalidated_by_rebinding() {
     assert!(matches!(reads.poll(&f.ctx(),&f.path).unwrap(),Poll::Ready(Sample{reachable:Some(false),..})));
     reads.begin_pass();assert!(matches!(reads.poll(&f.ctx(),&f.path).unwrap(),Poll::Pending));assert!(!reads.unknown());
     let before=runtime::snapshot(&f.path).unwrap();let binding=before.runtime_bindings.iter().find(|b|!b.identity.pane_id.is_empty()).unwrap();
-    let mut route=herdr_projects::domain::RuntimeRoute::from_identity(&binding.identity);route.pane_id="new-pane".into();
+    let mut route=herdr_farm::domain::RuntimeRoute::from_identity(&binding.identity);route.pane_id="new-pane".into();
     runtime::rebind(&f.path,&binding.id,binding.revision,before.head,&route).unwrap();
     fs::write(f.world.home.path().join("mode"),"blocked").unwrap();reads.admit();
     assert!(matches!(reads.poll(&f.ctx(),&f.path).unwrap(),Poll::Pending));assert!(reads.unknown(),"old absence must not allow idle exit while the changed inventory is pending");
@@ -140,7 +140,7 @@ fn canonical_worker_batches_leave_root_exclusive_notifications_a_turn() {
     let f=Fixture::new("blocked");let(world,path,task)=notification_delivery::tests::fixture_with_items(3);
     world.runner.on("--version",ok("herdr 0.9.1")).on("notification show",ok(r#"{"result":{"shown":true}}"#));
     let slow=crate::project::create(&world.root,"slow","",vec![]).unwrap();slow.set_status(crate::project::Status::Paused).unwrap();let slow=slow.dir();let plan=migration::inspect(&slow).unwrap();migration::apply(&slow,&plan,true).unwrap();
-    let original=runtime::snapshot(&f.path).unwrap();let route=herdr_projects::domain::RuntimeRoute::from_identity(&original.runtime_bindings.iter().find(|b|!b.identity.pane_id.is_empty()).unwrap().identity);
+    let original=runtime::snapshot(&f.path).unwrap();let route=herdr_farm::domain::RuntimeRoute::from_identity(&original.runtime_bindings.iter().find(|b|!b.identity.pane_id.is_empty()).unwrap().identity);
     runtime::create_binding(&slow,None,None,runtime::snapshot(&slow).unwrap().head,&route).unwrap();
     let ctx=Ctx{env:&f.env,root:world.root.clone(),config_dir:world.ctx().config_dir,runner:&world.runner,detached_ticker:false};
     let pool=f.pool();let mut reads=Reads::new(pool.clone());
@@ -160,7 +160,7 @@ fn canonical_worker_batches_leave_root_exclusive_notifications_a_turn() {
         // This is the normal ticker order: effects first, then next admission.
         crate::canonical_controller::poll_queued(&ctx,&path,0,&mut reads).unwrap();
         assert_eq!(world.runner.count("notification show"),round+1);
-        assert_eq!(runtime::snapshot(&path).unwrap().deliveries.iter().find(|d|d.operation==op.id).unwrap().state,herdr_projects::operations::DeliveryState::Confirmed);
+        assert_eq!(runtime::snapshot(&path).unwrap().deliveries.iter().find(|d|d.operation==op.id).unwrap().state,herdr_farm::operations::DeliveryState::Confirmed);
         let snapshot=runtime::snapshot(&path).unwrap();let item=snapshot.inbox.iter().find(|i|!i.seen).unwrap();
         runtime::update_inbox(&path,snapshot.head,&[item.content.id.clone()],false).unwrap();
         fs::remove_file(f.world.home.path().join("entered")).unwrap();
@@ -185,7 +185,7 @@ fn canonical_worker_and_routine_admission_take_separate_project_turns() {
     crate::ticker::tick_for_test(&world.ctx(),&mut memory);assert!(memory.routine_jobs.as_ref().unwrap().pending_project(path.to_str().unwrap()));assert!(!memory.canonical_observations.as_ref().unwrap().pending_project(path.to_str().unwrap()));
     while !path.join("STARTED").exists(){assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(5));}
     crate::ticker::tick_for_test(&world.ctx(),&mut memory);assert!(!memory.canonical_observations.as_ref().unwrap().pending_project(path.to_str().unwrap()));
-    while runtime::snapshot(&path).unwrap().deliveries[0].state!=herdr_projects::operations::DeliveryState::Confirmed{assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(10));}
+    while runtime::snapshot(&path).unwrap().deliveries[0].state!=herdr_farm::operations::DeliveryState::Confirmed{assert!(Instant::now()<end);std::thread::sleep(Duration::from_millis(10));}
     assert!(path.join("COMPLETED").exists());assert!(pool.stop(Duration::from_secs(3)));
 }
 
@@ -242,7 +242,7 @@ fn canonical_observation_pause_replaces_pre_observation_planning_liveness() {
         // Model observation-driven control invalidation inside the retained
         // ownership interval. Runtime wrappers must not reacquire that guard.
         let mut db=migration::open_active(&path)?;let snapshot=db.read_snapshot(None)?;
-        db.set_project_state(snapshot.head,snapshot.control.unwrap().revision,herdr_projects::domain::ProjectState::Paused,jiff::Timestamp::now().as_millisecond(),None)?;
+        db.set_project_state(snapshot.head,snapshot.control.unwrap().revision,herdr_farm::domain::ProjectState::Paused,jiff::Timestamp::now().as_millisecond(),None)?;
         let marker=path.join(".state/format.json");let mut value:serde_json::Value=serde_json::from_slice(&fs::read(&marker)?)?;value["reconciliation_required"]=true.into();fs::write(marker,serde_json::to_vec(&value)?)?;Ok(false)
     }).unwrap();
     assert_eq!(sample.scheduled_work,Some(false));assert_eq!(sample.reachable,Some(false));assert!(sample.head.is_some());assert_eq!(sample.selected_name.as_deref(),Some("first"));
@@ -254,7 +254,7 @@ fn canonical_initial_schema_sql_obeys_original_job_deadline() {
     let f=Fixture::new("ok");let input=f.input();let raw=rusqlite::Connection::open(f.path.join(".state/state.db")).unwrap();
     raw.execute_batch("ALTER TABLE store_meta RENAME TO original_meta; CREATE VIEW store_meta AS SELECT * FROM original_meta WHERE (WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<100000000) SELECT sum(x) FROM n)>0;").unwrap();
     let start=Instant::now();let control=Control{deadline:start+Duration::from_millis(100),cancellation:Default::default()};
-    let error=collect(&input,&control).err().unwrap();assert!(matches!(error.downcast_ref::<herdr_projects::store::StoreError>(),Some(herdr_projects::store::StoreError::Deadline)),"{error:#}");assert!(start.elapsed()<Duration::from_secs(2));assert!(!f.world.home.path().join("entered").exists());assert!(ProjectGuard::acquire(&f.path).is_ok());
+    let error=collect(&input,&control).err().unwrap();assert!(matches!(error.downcast_ref::<herdr_farm::store::StoreError>(),Some(herdr_farm::store::StoreError::Deadline)),"{error:#}");assert!(start.elapsed()<Duration::from_secs(2));assert!(!f.world.home.path().join("entered").exists());assert!(ProjectGuard::acquire(&f.path).is_ok());
 }
 
 #[test]

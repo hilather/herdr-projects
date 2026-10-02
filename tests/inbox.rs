@@ -7,7 +7,7 @@
 use serde_json::{json, Value};
 use std::{collections::BTreeSet, fs, os::unix::fs::PermissionsExt, path::PathBuf, process::{Command, Output, Stdio}, time::{Duration, Instant}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 const FAKE_HERDR: &str = r#"#!/bin/sh
 case "$1 $2" in

@@ -3,7 +3,7 @@
 //! An independent suite over plan doc 10's accounting fixtures (§3 golden
 //! accounting, §4 replay/time/corrections/budget, §5a coordinator and quota),
 //! run end to end: Codex rollouts written here line by line, collected and
-//! reported through the `herdr-projects telemetry` CLI. Every expected value
+//! reported through the `herdr-farm telemetry` CLI. Every expected value
 //! is hand-computed from the plan's numbers in the comment beside it, never
 //! read back from a production aggregate. Where the product disagrees with
 //! the plan the certificate records who was right. Evidence here is
@@ -856,7 +856,7 @@ fn candidate_group_cost_includes_every_arm() {
         plant_profile(&db_path, profile);
     }
     {
-        let mut db = herdr_projects::store::SqliteStore::open(&db_path).unwrap();
+        let mut db = herdr_farm::store::SqliteStore::open(&db_path).unwrap();
         let snapshot = db.read_snapshot(None).unwrap();
         db.set_scheduler_policy(snapshot.head, snapshot.scheduler.unwrap().policy.revision, 1, 5).unwrap();
     }

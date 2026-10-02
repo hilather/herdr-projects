@@ -43,7 +43,7 @@ fn cache_read_share_mixed_adapters_and_configuration_comparison() {
     f.rollout(&f.home, "cache-resume", &[RECORD], &f.worktree(), f.decided + 1000, "0.154.0");
     let mut configurations = std::collections::BTreeMap::new();
     let canonical = f.project.join(".state/state.db");
-    let mut store = herdr_projects::store::SqliteStore::open(&canonical).unwrap();
+    let mut store = herdr_farm::store::SqliteStore::open(&canonical).unwrap();
     let snapshot = store.read_snapshot(None).unwrap();
     store.set_scheduler_policy(snapshot.head, snapshot.scheduler.unwrap().policy.revision, 1, 8).unwrap();
     drop(store);
@@ -1096,7 +1096,7 @@ fn minute(m: f64) -> i64 { T0 + (m * 60_000.0) as i64 }
 /// was launched and cancelled before any pass: `not_observed`, never 0.
 #[test]
 fn attention_intervals_union_and_censor() {
-    use herdr_projects::store::SqliteStore;
+    use herdr_farm::store::SqliteStore;
     let tmp = tempfile::tempdir().unwrap();
     let base = fs::canonicalize(tmp.path()).unwrap();
     let (root, home) = (base.join("root"), base.join("home"));
@@ -1666,7 +1666,7 @@ fn at(hours: i64, minutes: i64) -> i64 { HOUR0 + hours * 3_600_000 + minutes * 6
 /// code, docs)` picks each attempt's classification (`None`: unclassified) and
 /// `config_of(attempt)` its dispatch decision's configuration id.
 fn plant_fleet(project: &Path, class_of: &dyn Fn(&str, &str, &str) -> Option<String>, config_of: &dyn Fn(&str) -> String) -> rusqlite::Connection {
-    use herdr_projects::store::SqliteStore;
+    use herdr_farm::store::SqliteStore;
     fs::create_dir_all(project.join(".state")).unwrap();
     let db_path = project.join(".state/state.db");
     drop(SqliteStore::create(&db_path).unwrap());
@@ -2109,8 +2109,8 @@ fn latest_decision(f: &Fixture) -> (String, i64) {
 
 /// Canonical budget policy `revision` with `limits`, planted as a signed
 /// import would store it (fixture only: the owner signature is not under test).
-fn plant_budget(f: &Fixture, revision: u64, limits: herdr_projects::domain::BudgetLimits) {
-    use herdr_projects::domain::{BudgetPolicy, VersionedReference};
+fn plant_budget(f: &Fixture, revision: u64, limits: herdr_farm::domain::BudgetLimits) {
+    use herdr_farm::domain::{BudgetPolicy, VersionedReference};
     let db_path = f.project.join(".state/state.db");
     let policy = BudgetPolicy { version: 1, project_store: fs::canonicalize(&db_path).unwrap().display().to_string(), revision,
         authority: VersionedReference { id: "owner".into(), revision: 1, digest: "a".repeat(64) }, limits };
@@ -2133,7 +2133,7 @@ fn plant_budget(f: &Fixture, revision: u64, limits: herdr_projects::domain::Budg
 /// never written.
 #[test]
 fn shadow_budget_bridge_matches_doc05_goldens() {
-    use herdr_projects::domain::{BudgetLimits, UnknownUsagePolicy};
+    use herdr_farm::domain::{BudgetLimits, UnknownUsagePolicy};
     let f = Fixture::new();
     let part = |name: &str| format!("{ACCOUNTING}/{name}");
     let a1 = f.attempt.clone();
@@ -2360,10 +2360,10 @@ fn coordinator_overhead_and_overlap_waste_from_accepted_reasons() {
     // A sibling thread's attempt that changed the same area (planted: it has no usage and never ran here).
     raw.execute_batch("INSERT INTO tasks(id,revision,state,title) VALUES('sibling',1,'succeeded','sibling');
         INSERT INTO attempts(id,task_id,revision,state,reservation,termination_observed) VALUES('s1','sibling',2,'completed','s1',1);").unwrap();
-    let request = |attempt: &str, reason: &str, sibling: Option<&str>| herdr_projects::store::SupersessionRequest { attempt: attempt.into(), outcome: "superseded".into(),
+    let request = |attempt: &str, reason: &str, sibling: Option<&str>| herdr_farm::store::SupersessionRequest { attempt: attempt.into(), outcome: "superseded".into(),
         reason: reason.into(), sibling: sibling.map(str::to_owned), evidence: vec!["attempt:s1".into(), "commit:0123abcd".into()] };
     // Workers and imports are refused; so is a forged raw row and any edit.
-    let mut store = herdr_projects::store::SqliteStore::open(&state).unwrap();
+    let mut store = herdr_farm::store::SqliteStore::open(&state).unwrap();
     for principal in ["worker:w1", f.attempt.as_str(), "import:report"] {
         let err = format!("{:?}", store.record_attempt_supersession(&request(&f.attempt, "sibling_changed_same_area", Some("s1")), principal, 1).unwrap_err());
         assert!(err.contains("cannot record a supersession reason"), "{principal}: {err}");
@@ -2482,12 +2482,12 @@ fn deferred_derived_lanes_leave_other_project_ingestion_available() {
     let hot_project = hot.project.clone();
     // Deterministic local service delay; the actual queued work is the public
     // analytics store API over each real collected project, not a fake tally.
-    let mut worker = herdr_projects::telemetry::background::DeferredLanes::new(move |project| {
+    let mut worker = herdr_farm::telemetry::background::DeferredLanes::new(move |project| {
         if project == hot_project {
             started_tx.send(()).unwrap();
             release_rx.recv_timeout(Duration::from_secs(15)).unwrap();
         }
-        let result = herdr_projects::telemetry::analytics::store::refresh(project, None).map_err(|e| format!("{e:#}"));
+        let result = herdr_farm::telemetry::analytics::store::refresh(project, None).map_err(|e| format!("{e:#}"));
         done_tx.send(result).unwrap();
     }).unwrap();
     assert!(worker.submit(&hot.project));
@@ -2582,14 +2582,14 @@ fn incremental_usage_and_quota_append_touches_only_changed_session() {
     drop(db);
     // A real public-store reconciliation advances the canonical head/file
     // identity without changing any dispatch input or blocked span.
-    let mut store = herdr_projects::store::SqliteStore::open(&f.project.join(".state/state.db")).unwrap();
+    let mut store = herdr_farm::store::SqliteStore::open(&f.project.join(".state/state.db")).unwrap();
     let snapshot = store.read_snapshot(None).unwrap();
     let binding = &snapshot.runtime_bindings[0];
-    store.record_observations(snapshot.head, &[herdr_projects::reconcile::RuntimeObservation {
+    store.record_observations(snapshot.head, &[herdr_farm::reconcile::RuntimeObservation {
         binding: binding.id.clone(), binding_revision: binding.revision,
         task_revision: Some(snapshot.tasks[0].revision), observed_unix_ms: unix_ms(),
         collector: "herdr-git-v1".into(), config_digest: f.config.digest.clone(),
-        ..herdr_projects::reconcile::RuntimeObservation::default()
+        ..herdr_farm::reconcile::RuntimeObservation::default()
     }]).unwrap();
     drop(store);
     let timestamp = jiff::Timestamp::from_millisecond(f.decided + 2000).unwrap().to_string();
@@ -2961,8 +2961,8 @@ fn racing_sync_and_refresh_wait_then_revalidate_their_inputs() {
     let mut sync = spawn(&["accounting", "sync"]);
     let mut refresh = spawn(&["analytics", "refresh"]);
     let started = std::time::Instant::now();
-    let tick = herdr_projects::telemetry::accounting::tick_observed(&f.project,
-        herdr_projects::telemetry::codex::Budget::TICK);
+    let tick = herdr_farm::telemetry::accounting::tick_observed(&f.project,
+        herdr_farm::telemetry::codex::Budget::TICK);
     assert_eq!(tick.unwrap()["deferred"], "writer_busy", "a busy ticker turn must defer");
     assert!(started.elapsed() < Duration::from_secs(2), "ticker waited for a writer");
     std::thread::sleep(Duration::from_secs(6));

@@ -1,6 +1,6 @@
 //! TM4.2 operator views (plan doc 08 §2, doc 15 §3): the project, models and
 //! roles, reviews and fixes, cost and operational-health views behind
-//! `herdr-projects telemetry <slug> view ...` and the fleet pane's view
+//! `herdr-farm telemetry <slug> view ...` and the fleet pane's view
 //! sections. Contract: docs/telemetry/operator-views.md.
 //!
 //! Every value is read through the TM4.1 query service
@@ -55,7 +55,7 @@ impl View {
     fn by_agent(self) -> &'static [&'static str] { if self == View::Models { &["M02", "M07"] } else { &[] } }
 }
 
-/// `herdr-projects telemetry <slug> view ...`
+/// `herdr-farm telemetry <slug> view ...`
 #[derive(clap::Args, Clone, Debug)]
 pub struct Args {
     /// Which view: project, models, reviews, cost or health.

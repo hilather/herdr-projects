@@ -115,7 +115,7 @@ fn valid_attempt(attempt: &str) -> bool {
 
 /// The spool this process was started with, if it runs as an isolated worker.
 pub fn worker_spool() -> Option<PathBuf> {
-    std::env::var_os(ENV).map(PathBuf::from).filter(|path| path.is_absolute())
+    crate::product_environment::product_var_os(ENV).map(PathBuf::from).filter(|path| path.is_absolute())
 }
 
 /// `result submit` from inside the sandbox: the document is bounded and

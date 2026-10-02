@@ -11,7 +11,7 @@ if sys.platform != "linux":
 root = Path(__file__).resolve().parent.parent
 build = subprocess.run(
     ["cargo", "test", "--locked", "--offline", "--features", "state-store",
-     "--lib", "--bin", "herdr-projects", "--no-run", "--message-format=json"],
+     "--lib", "--bin", "herdr-farm", "--no-run", "--message-format=json"],
     cwd=root, stdout=subprocess.PIPE, text=True,
 )
 executables = {}

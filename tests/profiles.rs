@@ -4,11 +4,11 @@
 //! CLI: `profile prepare`, `profile verify-native` and `profile retained`
 //! over a disposable migrated project. herdr and the agent are shell
 //! fixtures that only answer `--version` and log every invocation.
-use herdr_projects::{authority, domain::*, migration, runtime};
+use herdr_farm::{authority, domain::*, migration, runtime};
 use serde_json::Value;
 use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::{Command, Output}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 struct Lab { home: tempfile::TempDir, project: PathBuf, config: PathBuf }
 
@@ -18,7 +18,7 @@ impl Lab {
     /// As `new`, with `budget` as the rest of the profile definition.
     fn with_budget(extra_args: &str, budget: &str) -> Self {
         let home = tempfile::tempdir().unwrap();
-        let config = home.path().join(".config/herdr-projects/config.toml");
+        let config = home.path().join(".config/herdr-farm/config.toml");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
         fs::write(&config, format!("[authority]\nversion=1\nrevision=1\napproval_public_key='ssh-ed25519 {}'\n[profiles.worker]\nkind='claude'\n\
 permission_policy='interactive'\nextra_args={extra_args}\n{budget}", "A".repeat(48))).unwrap();
@@ -160,7 +160,7 @@ impl Lab {
         // The kind is part of the pinned configuration: rebuild the project over it.
         drop(lab);
         let home = tempfile::tempdir().unwrap();
-        let config_path = home.path().join(".config/herdr-projects/config.toml");
+        let config_path = home.path().join(".config/herdr-farm/config.toml");
         fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         fs::write(&config_path, config.replace("kind='claude'", &format!("kind='{kind}'"))).unwrap();
         let lab = Lab { project: home.path().join("root/demo"), config: config_path, home };

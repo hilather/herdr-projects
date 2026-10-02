@@ -3,9 +3,9 @@ use std::{path::{Path,PathBuf},os::unix::fs::{MetadataExt,FileTypeExt},sync::Arc
 use anyhow::{Result,Context,ensure};
 use serde::{Serialize,Deserialize};
 use crate::{paths::{Ctx,Env},runner::{Runner,Cmd,Output,InheritedLock},source_tree::Control};
-use herdr_projects::{migration,execution_guard::ProjectGuard,domain::{Operation,OperationId},operations::{Claim,Outcome,notification::Notification,dispatch::{self,DeliveryAdapter,PreparedDelivery,DispatchRequest,DispatchResult}}};
+use herdr_farm::{migration,execution_guard::ProjectGuard,domain::{Operation,OperationId},operations::{Claim,Outcome,notification::Notification,dispatch::{self,DeliveryAdapter,PreparedDelivery,DispatchRequest,DispatchResult}}};
 #[cfg(test)]
-use herdr_projects::runtime;
+use herdr_farm::runtime;
 const JOB:&str="\0herdr-projects-canonical-notification";
 const BUDGET:Duration=Duration::from_secs(45);
 fn socket_identity(path:&Path)->Result<(u64,u64)>{let m=std::fs::symlink_metadata(path)?;ensure!(m.file_type().is_socket(),"notification endpoint must be a socket");Ok((m.dev(),m.ino()))}
@@ -37,7 +37,7 @@ impl Adapter<'_,'_> {
         let rows=migration::open_active_unchecked(&self.input.project)?.notification_rows(operation.task.as_ref(),None)?;
         ensure!(Path::new(&notification.validate_rows(operation,&rows,&self.input.config_reference)?.identity.socket)==self.input.socket,"notification route changed");self.control.check()
     }
-    fn run(&self,command:Cmd)->Result<Output>{herdr_projects::supervision::run(command,self.control.deadline,self.control.cancellation.clone(),self.locks)}
+    fn run(&self,command:Cmd)->Result<Output>{herdr_farm::supervision::run(command,self.control.deadline,self.control.cancellation.clone(),self.locks)}
 }
 impl<'a,'b> DeliveryAdapter for Adapter<'a,'b> {
     type Prepared=Prepared<'a,'b>;

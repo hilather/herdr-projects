@@ -13,7 +13,7 @@
 
 mod support;
 
-use herdr_projects::store::SqliteStore;
+use herdr_farm::store::SqliteStore;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{fs, io::Write as _, os::unix::fs::PermissionsExt, path::{Path, PathBuf}, process::{Command, Output, Stdio}, time::{Duration, Instant}};
@@ -511,9 +511,9 @@ impl<'a> Plugin<'a> {
         ok(run(&operator, &self.f.root, &["action", id], &self.env(), ""));
         let calls = fs::read_to_string(operator.join("herdr-calls")).unwrap();
         let line = calls.lines().rev().find(|l| l.starts_with("plugin pane open") && l.contains(&format!("--entrypoint {id} "))).unwrap_or_else(|| panic!("{calls}"));
-        let handoff = line.split_whitespace().find_map(|w| w.strip_prefix("HERDR_PROJECTS_HANDOFF=")).unwrap().to_owned();
+        let handoff = line.split_whitespace().find_map(|w| w.strip_prefix("HERDR_FARM_HANDOFF=")).unwrap().to_owned();
         let mut env = self.env();
-        env.push(("HERDR_PROJECTS_HANDOFF", &handoff));
+        env.push(("HERDR_FARM_HANDOFF", &handoff));
         let out = run(home, &self.f.root, &["pane", id], &env, answers);
         String::from_utf8(out.stdout).unwrap()
     }
@@ -537,7 +537,7 @@ fn owner_popups_refuse_worker_context_and_write_only_through_owner_commands() {
 
     // Race proposal.
     let text = plugin.popup("fleet-race", &f.home, "demo\nwork\ncodex, fast\ny\n");
-    assert!(text.contains("Runs: herdr-projects telemetry demo quality groups create work --arm codex --arm fast"), "{text}");
+    assert!(text.contains("Runs: herdr-farm telemetry demo quality groups create work --arm codex --arm fast"), "{text}");
     assert!(text.contains(refusal), "{text}");
     assert!(groups().is_empty(), "a worker context seals nothing");
     let text = plugin.popup("fleet-race", &operator, "demo\nwork\ncodex,fast\nn\n");
@@ -552,7 +552,7 @@ fn owner_popups_refuse_worker_context_and_write_only_through_owner_commands() {
     // Selection.
     let text = plugin.popup("fleet-select", &f.home, "demo\nrace#1\nnone\nnone_acceptable\ny\n");
     assert!(text.contains(&format!("race#1 {group} task work: arm 1 not_launched · arm 2 not_launched")), "{text}");
-    assert!(text.contains(&format!("Runs: herdr-projects telemetry demo quality groups select {group} --none --reason none_acceptable")), "{text}");
+    assert!(text.contains(&format!("Runs: herdr-farm telemetry demo quality groups select {group} --none --reason none_acceptable")), "{text}");
     assert!(text.contains(refusal) && groups()[0]["status"] == "open", "{text}");
     let text = plugin.popup("fleet-select", &operator, "demo\nrace#1\nnone\nnone_acceptable\ny\n");
     assert!(!text.contains("error:"), "{text}");
@@ -562,12 +562,12 @@ fn owner_popups_refuse_worker_context_and_write_only_through_owner_commands() {
 
     // Replay run: the preview already runs through the replay CLI and its refusal.
     let text = plugin.popup("fleet-replay", &f.home, "demo\nv1\nnew-config\nstratified:2\n7\ny\n");
-    assert!(text.contains("Preview: herdr-projects replay demo subset --suite v1 --subset stratified:2 --seed 7"), "{text}");
+    assert!(text.contains("Preview: herdr-farm replay demo subset --suite v1 --subset stratified:2 --seed 7"), "{text}");
     assert!(text.contains("the replay CLI records the project owner (operator:cli) and ".to_owned().as_str()) && text.contains(refusal), "{text}");
     let text = plugin.popup("fleet-replay", &operator, "demo\nv1\nnew-config\nstratified:2\n7\ny\n");
     let cli = run(&operator, &f.root, &["replay", "demo", "subset", "--suite", "v1", "--subset", "stratified:2", "--seed", "7"], &[], "");
     let cli_error = String::from_utf8(cli.stderr).unwrap();
-    let cli_error = cli_error.trim().trim_start_matches("herdr-projects: ");
+    let cli_error = cli_error.trim().trim_start_matches("herdr-farm: ");
     assert!(!cli.status.success() && text.contains(cli_error), "the popup answers as the CLI does ({cli_error}): {text}");
 
     // Nothing was launched, reserved or dispatched; the one selection is the confirmed one.

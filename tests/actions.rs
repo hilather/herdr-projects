@@ -7,7 +7,7 @@
 use serde_json::{json, Value};
 use std::{fs, io::Write, os::unix::fs::PermissionsExt, path::PathBuf, process::{Command, Output, Stdio}};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-projects");
+const BIN: &str = env!("CARGO_BIN_EXE_herdr-farm");
 
 const FAKE_HERDR: &str = "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/calls\"\ncase \"$1 $2\" in\n'agent list') cat \"$HOME/agents.json\";;\n*) echo '{\"result\":{}}';;\nesac\n";
 
@@ -35,9 +35,9 @@ impl Lab {
     fn opened(&self, entrypoint: &str) -> String {
         let calls = fs::read_to_string(self.path("calls")).unwrap();
         let line = calls.lines().rev().find(|l| l.starts_with("plugin pane open") && l.contains(&format!("--entrypoint {entrypoint} "))).unwrap_or_else(|| panic!("{calls}"));
-        line.split_whitespace().find_map(|w| w.strip_prefix("HERDR_PROJECTS_HANDOFF=")).unwrap().to_owned()
+        line.split_whitespace().find_map(|w| w.strip_prefix("HERDR_FARM_HANDOFF=")).unwrap().to_owned()
     }
-    fn popup(&self, entrypoint: &str, id: &str) -> Output { self.run(&["pane", entrypoint], &[("HERDR_PROJECTS_HANDOFF", id)], "\n\n") }
+    fn popup(&self, entrypoint: &str, id: &str) -> Output { self.run(&["pane", entrypoint], &[("HERDR_FARM_HANDOFF", id)], "\n\n") }
     fn status(&self) -> String {
         serde_json::from_slice::<Value>(&fs::read(self.path("root/demo/.state/project.json")).unwrap()).unwrap()["status"].as_str().unwrap().to_owned()
     }

@@ -78,18 +78,18 @@ pub struct Thread {
     pub last_state_change: String,
     pub last_group: String,
     pub status_notice_sequence: u64,
-    pub pending_status_notice: Option<herdr_projects::status_notice::StatusNotice>,
-    pub copy_receipt: Option<herdr_projects::copy_receipt::CopyReceipt>,
-    pub pending_copy_notice: Option<herdr_projects::copy_receipt::CopyNotice>,
+    pub pending_status_notice: Option<herdr_farm::status_notice::StatusNotice>,
+    pub copy_receipt: Option<herdr_farm::copy_receipt::CopyReceipt>,
+    pub pending_copy_notice: Option<herdr_farm::copy_receipt::CopyNotice>,
     pub review_notice_sequence: u64,
-    pub pending_review_notice: Option<herdr_projects::review_notice::ReviewNotice>,
+    pub pending_review_notice: Option<herdr_farm::review_notice::ReviewNotice>,
     pub last_review_execution: String,
     pub last_review_copy_sequence: u64,
     pub live_copy_sequence: u64,
-    pub pending_live_copy: Option<herdr_projects::live_copy_intent::LiveCopyIntent>,
+    pub pending_live_copy: Option<herdr_farm::live_copy_intent::LiveCopyIntent>,
     pub final_copy_sequence: u64,
-    pub pending_final_copy: Option<herdr_projects::final_copy_intent::FinalCopyIntent>,
-    pub pending_final_notice: Option<herdr_projects::final_copy_intent::Notice>,
+    pub pending_final_copy: Option<herdr_farm::final_copy_intent::FinalCopyIntent>,
+    pub pending_final_notice: Option<herdr_farm::final_copy_intent::Notice>,
     pub report_hash: String,
     pub last_report_change: String,
     pub last_review_item_hash: String,
@@ -378,11 +378,10 @@ fn brief_memory(project: &Project, thread: &Thread) -> Result<(String, Vec<(Stri
     {
         let marker = project.dir().join(".state/format.json");
         if std::fs::symlink_metadata(&marker).is_ok_and(|m| m.is_file()) {
-            if let Ok(fmt) = herdr_projects::migration::read_format(&project.dir()) {
-                if fmt.memory == "sqlite-v1" {
-                    return herdr_projects::memory::load_brief_memory(&project.dir(), &thread.agent_name, MEMORY_CAP_CHARS as u64)
+            if let Ok(fmt) = herdr_farm::migration::read_format(&project.dir())
+                && fmt.memory == "sqlite-v1" {
+                    return herdr_farm::memory::load_brief_memory(&project.dir(), &thread.agent_name, MEMORY_CAP_CHARS as u64)
                         .map_err(anyhow::Error::from);
-                }
             }
         }
     }
@@ -931,6 +930,6 @@ fn imported_receipt_fingerprint_matches_legacy_execution_identity() {
     for kind in [Kind::Worktree,Kind::Tab,Kind::Adopted] {
         let thread=Thread{id:"t-1".into(),kind,created:"created".into(),lifecycle_generation:42,repo:"repo".into(),origin:"origin".into(),branch:"branch".into(),machine:"remote".into(),worktree_path:"worktree".into(),thread_dir:"thread".into(),workspace_id:"workspace".into(),tab_id:"tab".into(),pane_id:"pane".into(),agent:"agent".into(),agent_name:"name".into(),cwd:"cwd".into(),pr:"pr".into(),..Default::default()};
         let value=toml::Value::try_from(&thread).unwrap();
-        assert_eq!(herdr_projects::operations::receipts::legacy_execution_fingerprint(&value).unwrap(),execution_fingerprint(&thread));
+        assert_eq!(herdr_farm::operations::receipts::legacy_execution_fingerprint(&value).unwrap(),execution_fingerprint(&thread));
     }
 }

@@ -10,7 +10,7 @@ use std::{
     path::PathBuf,
 };
 
-/// Hidden `herdr-projects` subcommand that consumes one launch spec.
+/// Hidden `herdr-farm` subcommand that consumes one launch spec.
 pub const SUBCOMMAND: &str = "launch-exec";
 const DIRECTORY: &str = "launch-specs";
 const LIMIT: u64 = 128 * 1024;

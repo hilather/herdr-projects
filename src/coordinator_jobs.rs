@@ -3,7 +3,7 @@ use std::{path::{Path,PathBuf},os::unix::fs::MetadataExt,sync::Arc,time::{Durati
 use anyhow::{Result,Context,ensure};
 use serde::{Serialize,Deserialize};
 use crate::{project::{self,Project,Coordinator},paths::{self,Ctx},runner::{Cmd,Output,Runner,InheritedLock},source_tree::Control,thread};
-use herdr_projects::{execution_guard::ProjectGuard,coordinator_prime::Claim,prompt_claim::Phase};
+use herdr_farm::{execution_guard::ProjectGuard,coordinator_prime::Claim,prompt_claim::Phase};
 const JOB:&str="\0herdr-projects-coordinator-prime";
 #[path="coordinator_start_jobs.rs"]
 mod start;
@@ -20,11 +20,11 @@ pub fn validate(c:&Coordinator)->Result<()> {ensure!(c.prime_request<=i64::MAX a
     ensure!(c.launch_sequence<=i64::MAX as u64,"coordinator launch sequence exhausted");
     if let Some(claim)=&c.launch_claim {
         claim.validate(c.launch_sequence)?;ensure!(claim.generation<=c.prime_request,"coordinator launch request is in the future");
-        ensure!(claim.phase!=herdr_projects::launch_claim::Phase::Pending||c.prime_claim.as_ref().is_none_or(|c|c.delivery.phase!=Phase::Pending),"coordinator has conflicting pending effects");
+        ensure!(claim.phase!=herdr_farm::launch_claim::Phase::Pending||c.prime_claim.as_ref().is_none_or(|c|c.delivery.phase!=Phase::Pending),"coordinator has conflicting pending effects");
     }Ok(())}
 pub fn ready(c:&Coordinator)->Result<()> {
     validate(c)?;
-    if let Some(claim)=&c.launch_claim {ensure!(claim.phase!=herdr_projects::launch_claim::Phase::Pending&&claim.notified&&(claim.phase!=herdr_projects::launch_claim::Phase::Uncertain||claim.generation!=c.prime_request),"coordinator launch requires reconciliation before priming");}
+    if let Some(claim)=&c.launch_claim {ensure!(claim.phase!=herdr_farm::launch_claim::Phase::Pending&&claim.notified&&(claim.phase!=herdr_farm::launch_claim::Phase::Uncertain||claim.generation!=c.prime_request),"coordinator launch requires reconciliation before priming");}
     ensure!(c.prime_pending&&!c.pane_id.is_empty(),"coordinator has no pending prime");
     if let Some(claim)=&c.prime_claim{ensure!(claim.delivery.phase!=Phase::Pending&&claim.delivery.notified&&claim.request!=c.prime_request,"coordinator priming already claimed; inspect the pane before open --reprime");}Ok(())
 }
@@ -35,7 +35,7 @@ fn current(input:&Input,p:&Project,guard:&ProjectGuard,control:&Control)->Result
     let md=paths::read_control_text(&p.project_md(),1024*1024)?.context("project settings missing")?;ensure!(thread::sha256_hex(md.as_bytes())==input.settings_digest,"coordinator project settings changed");let(settings,_)=project::parse_project_md(&md).map_err(|_|anyhow::anyhow!("invalid coordinator settings (contents withheld)"))?;
     ensure!(input.prompt==crate::coordinator::priming_prompt(&crate::coordinator::current_prefix(&p.root)?,&p.slug),"coordinator priming payload changed");control.check()?;Ok((c,settings.coordinator_agent))
 }
-fn run(cmd:Cmd,control:&Control,locks:&[InheritedLock])->Result<serde_json::Value>{let out=herdr_projects::supervision::run(cmd,control.deadline,control.cancellation.clone(),locks)?;control.check()?;ensure!(out.success(),"coordinator observation failed");let reply:serde_json::Value=serde_json::from_str(&out.stdout)?;ensure!(reply.get("error").is_none(),"coordinator observation rejected");reply.get("result").cloned().context("coordinator observation has no result")}
+fn run(cmd:Cmd,control:&Control,locks:&[InheritedLock])->Result<serde_json::Value>{let out=herdr_farm::supervision::run(cmd,control.deadline,control.cancellation.clone(),locks)?;control.check()?;ensure!(out.success(),"coordinator observation failed");let reply:serde_json::Value=serde_json::from_str(&out.stdout)?;ensure!(reply.get("error").is_none(),"coordinator observation rejected");reply.get("result").cloned().context("coordinator observation has no result")}
 fn execute(input:&Input,control:&Control)->Result<()> {execute_with(input,control,||Ok(()))}
 fn execute_with(input:&Input,control:&Control,after_claim:impl FnOnce()->Result<()>)->Result<()> {
     ensure!(input.project.is_absolute()&&input.config.is_absolute()&&input.socket.is_absolute()&&!input.herdr.is_empty()&&input.prompt.len()<=32768,"invalid coordinator worker input");control.check()?;let guard=ProjectGuard::acquire(&input.project)?;let locks=guard.inherit_transfer()?;
@@ -43,16 +43,16 @@ fn execute_with(input:&Input,control:&Control,after_claim:impl FnOnce()->Result<
     let(c,kind)=current(input,&p,&guard,control)?;ready(&c)?;ensure!(c.prime_sequence==input.sequence,"coordinator prime sequence changed");
     crate::brief_jobs::ownership::check_coordinator(&p,&c.pane_id,&input.socket,control)?;
     let h=crate::herdr::Herdr::new(&input.herdr,&input.socket,&crate::runner::RealRunner);
-    let probe=herdr_projects::supervision::run(h.cmd(crate::herdr::CALL_TIMEOUT).args(["remote-api-bridge","--check"]),control.deadline,control.cancellation.clone(),&locks)?;control.check()?;ensure!(probe.success()&&probe.stdout.trim()=="herdr-api-bridge-v1","coordinator JSON API bridge unavailable");
+    let probe=herdr_farm::supervision::run(h.cmd(crate::herdr::CALL_TIMEOUT).args(["remote-api-bridge","--check"]),control.deadline,control.cancellation.clone(),&locks)?;control.check()?;ensure!(probe.success()&&probe.stdout.trim()=="herdr-api-bridge-v1","coordinator JSON API bridge unavailable");
     let agents:Vec<crate::herdr::Agent>=serde_json::from_value(run(h.cmd(crate::herdr::CALL_TIMEOUT).args(["agent","list"]),control,&locks)?["agents"].clone())?;
     let agents=agents.iter().filter(|a|a.pane_id==c.pane_id).collect::<Vec<_>>();ensure!(agents.len()==1&&crate::coordinator::agent_matches(&c,agents[0])&&agents[0].agent==kind&&agents[0].ready(),"coordinator agent absent, ambiguous, changed or busy");
     let panes=run(h.cmd(crate::herdr::CALL_TIMEOUT).args(["pane","list"]),control,&locks)?;let panes=panes["panes"].as_array().context("coordinator pane inventory missing")?;let panes=panes.iter().filter(|v|v["pane_id"].as_str()==Some(&c.pane_id)).collect::<Vec<_>>();ensure!(panes.len()==1,"coordinator pane absent or ambiguous");let pane:crate::herdr::Pane=serde_json::from_value(panes[0].clone())?;ensure!(crate::coordinator::pane_matches(&c,&pane),"coordinator pane changed");let terminal=panes[0]["terminal_id"].as_str().filter(|s|!s.is_empty()&&s.len()<=256).context("coordinator terminal identity unavailable")?;
     let(c,_)=current(input,&p,&guard,control)?;ready(&c)?;
-    let claim=Claim{request:c.prime_request,delivery:herdr_projects::prompt_claim::Claim{sequence:c.prime_sequence.checked_add(1).context("prime sequence exhausted")?,execution:input.execution.clone(),prompt:input.prompt.clone(),phase:Phase::Pending,error:String::new(),notified:false}};claim.validate(claim.delivery.sequence,c.prime_request)?;
+    let claim=Claim{request:c.prime_request,delivery:herdr_farm::prompt_claim::Claim{sequence:c.prime_sequence.checked_add(1).context("prime sequence exhausted")?,execution:input.execution.clone(),prompt:input.prompt.clone(),phase:Phase::Pending,error:String::new(),notified:false}};claim.validate(claim.delivery.sequence,c.prime_request)?;
     p.update_coordinator_checked(|stored|{control.check()?;ensure!(stored==&c,"coordinator changed before claim");stored.prime_sequence=claim.delivery.sequence;stored.prime_claim=Some(claim.clone());Ok(())})?;after_claim()?;
     let(stored,_)=current(input,&p,&guard,control)?;ensure!(stored.prime_pending&&stored.prime_claim.as_ref()==Some(&claim),"coordinator claim changed before send");
     let id=format!("coordinator-prime-{}-{}",claim.request,claim.delivery.sequence);let payload=serde_json::to_string(&serde_json::json!({"id":id,"method":"agent.prompt","params":{"target":c.pane_id,"text":claim.delivery.prompt}}))?+"\n";ensure!(payload.len()<=64*1024,"coordinator prompt frame exceeds bounds");
-    let out=herdr_projects::supervision::run(h.cmd(crate::herdr::CALL_TIMEOUT).arg("remote-api-bridge").stdin(payload),control.deadline,control.cancellation.clone(),&locks)?;control.check()?;ensure!(out.success(),"coordinator priming command failed");let reply:serde_json::Value=serde_json::from_str(&out.stdout)?;ensure!(reply["id"].as_str()==Some(&id)&&reply.get("error").is_none()&&reply["result"]["type"].as_str()==Some("agent_prompted")&&reply["result"]["agent"]["terminal_id"].as_str()==Some(terminal),"coordinator priming acknowledgement mismatch");let agent:crate::herdr::Agent=serde_json::from_value(reply["result"]["agent"].clone())?;ensure!(crate::coordinator::agent_matches(&c,&agent)&&agent.agent==kind,"coordinator priming acknowledgement names another execution");
+    let out=herdr_farm::supervision::run(h.cmd(crate::herdr::CALL_TIMEOUT).arg("remote-api-bridge").stdin(payload),control.deadline,control.cancellation.clone(),&locks)?;control.check()?;ensure!(out.success(),"coordinator priming command failed");let reply:serde_json::Value=serde_json::from_str(&out.stdout)?;ensure!(reply["id"].as_str()==Some(&id)&&reply.get("error").is_none()&&reply["result"]["type"].as_str()==Some("agent_prompted")&&reply["result"]["agent"]["terminal_id"].as_str()==Some(terminal),"coordinator priming acknowledgement mismatch");let agent:crate::herdr::Agent=serde_json::from_value(reply["result"]["agent"].clone())?;ensure!(crate::coordinator::agent_matches(&c,&agent)&&agent.agent==kind,"coordinator priming acknowledgement names another execution");
     let(stored,_)=current(input,&p,&guard,control)?;ensure!(stored.prime_claim.as_ref()==Some(&claim)&&stored.prime_pending,"coordinator claim changed after send");
     p.update_coordinator_checked(|stored|{control.check()?;ensure!(stored.prime_claim.as_ref()==Some(&claim)&&execution(stored)==input.execution&&stored.prime_pending,"coordinator confirmation authority changed");let mut confirmed=claim.clone();confirmed.delivery.phase=Phase::Confirmed;confirmed.delivery.notified=true;stored.prime_claim=Some(confirmed);stored.prime_pending=false;Ok(())})?;Ok(())
 }
@@ -72,7 +72,7 @@ pub fn request(ctx:&Ctx,p:&Project,c:&Coordinator)->Result<crate::executor::Requ
 pub fn request_start(ctx:&Ctx,p:&Project,c:&Coordinator)->Result<crate::executor::Request>{request_mode(ctx,p,c,true,false)}
 /// Cheap eligibility only. A worker re-reads and validates the entire inventory.
 pub fn notification_needed(p:&Project,state:&crate::steps::State)->bool {
-    use herdr_projects::notification_claim::Phase;
+    use herdr_farm::notification_claim::Phase;
     if !state.notification_suppressed.is_empty()||!state.notification_retry.hash.is_empty()
         ||state.notification_claim.as_ref().is_some_and(|c|matches!(c.phase,Phase::Ready|Phase::Pending|Phase::Uncertain|Phase::NotShown)){return true;}
     let Ok(entries)=std::fs::read_dir(p.dir().join("inbox")) else{return true;};

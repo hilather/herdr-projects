@@ -17,7 +17,7 @@ case "$host" in
 esac
 cd "$repo"
 cargo build --release --locked --features state-store --target-dir "$repo/target/factory" --target "$host"
-binary="$repo/target/factory/$host/release/herdr-projects"
+binary="$repo/target/factory/$host/release/herdr-farm"
 # Refuse incompatible linked SQLite before creating any package. This command
 # reads only compiled/runtime library information; it does not open a project.
 "$binary" build-info --require-factory >/dev/null
@@ -27,12 +27,12 @@ trap 'rm -rf -- "$package"' EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
-install -m 755 "$binary" "$package/herdr-projects"
-"$package/herdr-projects" build-info --require-factory >"$package/build-info.json"
+install -m 755 "$binary" "$package/herdr-farm"
+"$package/herdr-farm" build-info --require-factory >"$package/build-info.json"
 install -m 644 docs/factory/packaging.md "$package/README.md"
 (
     cd "$package"
-    sha256sum herdr-projects build-info.json README.md >SHA256SUMS
+    sha256sum herdr-farm build-info.json README.md >SHA256SUMS
 )
 trap - EXIT HUP INT TERM
 printf '%s\n' "$package"
