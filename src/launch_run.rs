@@ -133,7 +133,6 @@ fn finish_instructions(root: &Path, slug: &str, contract: &Value, reference: &Ve
     let (task, repository, base, format) = (text("task_id")?, text("repository")?, text("base_oid")?, text("object_format")?);
     ensure!([task, repository, base, format, reference.digest.as_str()].iter().all(|v| safe(v)) && safe(&root.display().to_string()) && outputs.iter().all(|o| safe(o)),
         "a path or value in the task contract contains a character the submission script cannot carry");
-    let loose = format!("{}/{}", &base[..2], &base[2..]);
     let mut script = String::from("set -eu\nattempt=$(basename \"$HERDR_PROJECTS_SUBMISSION_SPOOL\")\n");
     script.push_str(&format!("git add --{}\n", outputs.iter().map(|o| format!(" '{o}'")).collect::<String>()));
     script.push_str("git -c user.name=worker -c user.email=worker@invalid commit -q -m 'Deliverable' || true\n");
@@ -143,9 +142,15 @@ fn finish_instructions(root: &Path, slug: &str, contract: &Value, reference: &Ve
         script.push_str(&format!("blob{index}=$(git rev-parse \"HEAD:{output}\")\n"));
         manifest.push(format!(r#"{{"path":"{output}","oid":"$blob{index}"}}"#));
     }
+    // The verifier materializes the base and the candidate in a fresh repository
+    // from the staged objects alone, so every tree and blob of both is listed.
+    script.push_str(&"list() { git rev-list --objects --no-object-names --no-walk 'BASE' \"$candidate\" | sort -u; }\n\
+n=$(list | wc -l)\n[ \"$n\" -le LIMIT ] || { echo \"the base and candidate trees hold $n objects; a submission carries at most LIMIT\" >&2; exit 1; }\n\
+objects=$(list | sed 's#^\\(..\\)\\(.*\\)$#{\"oid\":\"\\1\\2\",\"relative_path\":\"\\1/\\2\"}#' | paste -sd, -)\n"
+        .replace("BASE", base).replace("LIMIT", &herdr_projects::store::SUBMISSION_OBJECT_LIMIT.to_string()));
     script.push_str("key=result-$(printf %s \"$attempt\" | cut -c1-100)\ndocument=$(mktemp)\ncat > \"$document\" <<EOF\n");
     script.push_str(&format!(
-        r#"{{"idempotency_key":"$key","task_id":"{task}","contract_revision":{},"contract_digest":"{}","attempt_id":"$attempt","repository":"{repository}","base_oid":"{base}","candidate_oid":"$candidate","object_format":"{format}","artifact_manifest":[{}],"claimed_checks":[],"objects":[{{"oid":"{base}","relative_path":"{loose}"}},{{"oid":"$candidate","relative_path":"$(printf %s "$candidate" | cut -c1-2)/$(printf %s "$candidate" | cut -c3-)"}}]}}"#,
+        r#"{{"idempotency_key":"$key","task_id":"{task}","contract_revision":{},"contract_digest":"{}","attempt_id":"$attempt","repository":"{repository}","base_oid":"{base}","candidate_oid":"$candidate","object_format":"{format}","artifact_manifest":[{}],"claimed_checks":[],"objects":[$objects]}}"#,
         reference.revision, reference.digest, manifest.join(",")));
     script.push_str(&format!("\nEOF\nherdr-projects --root '{}' result {slug} submit --input-file \"$document\"\n", root.display()));
     Ok(format!(

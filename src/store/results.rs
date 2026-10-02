@@ -19,6 +19,9 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+/// The most Git objects one result submission may stage.
+pub const SUBMISSION_OBJECT_LIMIT: usize = 64;
+
 // Bound the total pack/index snapshot bytes per submission, copied lazily once.
 const PACK_COPY_LIMIT: u64 = 1024 * 1024 * 1024;
 const OBJECT_LIMIT: u64 = 16 * 1024 * 1024;
@@ -159,7 +162,7 @@ fn parse_submission(raw: &[u8]) -> Result<ParsedSubmission> {
         }
     }
     if document.objects.is_empty()
-        || document.objects.len() > 64
+        || document.objects.len() > SUBMISSION_OBJECT_LIMIT
         || document.artifact_manifest.len() > 64
         || document.claimed_checks.len() > 32
     {

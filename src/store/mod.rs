@@ -545,7 +545,7 @@ pub use observability::FactoryNumbers;
 mod native_profiles;
 
 mod results;
-pub use results::{show_results, submit_untrusted_result};
+pub use results::{show_results, submit_untrusted_result, SUBMISSION_OBJECT_LIMIT};
 pub(crate) use results::{record_spool_denial, submit_untrusted_result_bytes};
 
 mod feedback;

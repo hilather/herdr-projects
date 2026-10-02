@@ -3,7 +3,7 @@
 //! attempt's own worktree into a commit on the attempt's own branch with a fixed
 //! identity. The commit is still an untrusted candidate; only verification of a
 //! submission that names it counts as evidence.
-use crate::{domain::*, runner::Cancellation, worktree_preparation::Git};
+use crate::{domain::*, runner::Cancellation, store::SUBMISSION_OBJECT_LIMIT, worktree_preparation::Git};
 use anyhow::{bail, ensure, Context, Result};
 use serde::Serialize;
 use std::{
@@ -176,14 +176,19 @@ pub fn submit_captured(project: &Path, attempt: &str, message: Option<&str>) -> 
         artifacts.push((output.clone(), oid));
     }
     let loose = |oid: &str| format!("{}/{}", &oid[..2], &oid[2..]);
-    // Stage every object the candidate adds over its base (the capture commit,
-    // its trees and blobs, all written loose by the capture), not only the two
-    // commits: verification checks the candidate out from the staged objects.
-    let mut objects = vec![capture.base_oid.clone()];
-    for oid in git(&["rev-list", "--objects", "--no-object-names", &format!("{}..{}", capture.base_oid, capture.candidate_oid)])?.lines() {
+    // Stage the base and the candidate with every tree and blob of each: the
+    // verifier materializes them in a fresh repository holding only the staged
+    // objects, checks the candidate out and diffs it against the base.
+    // Staging reads packed objects too.
+    let mut objects: Vec<String> = Vec::new();
+    for oid in git(&["rev-list", "--objects", "--no-object-names", "--no-walk", &capture.base_oid, &capture.candidate_oid])?.lines() {
         if !objects.iter().any(|o| o == oid) { objects.push(oid.to_owned()); }
     }
-    let key = format!("captured-{}", &format!("{:x}", Sha256::digest(format!("{attempt}\0{}", capture.candidate_oid).as_bytes()))[..32]);
+    ensure!(objects.len() <= SUBMISSION_OBJECT_LIMIT,
+        "the base and candidate trees hold {} objects; a submission carries at most {SUBMISSION_OBJECT_LIMIT}", objects.len());
+    // The key binds the staged object set as well as the candidate, so a
+    // submission recorded with a different set is not replayed for this one.
+    let key = format!("captured-{}", &format!("{:x}", Sha256::digest(format!("{attempt}\0{}\0{}", capture.candidate_oid, objects.join(",")).as_bytes()))[..32]);
     let mut document = serde_json::to_vec(&serde_json::json!({
         "idempotency_key": key,
         "task_id": capture.task,

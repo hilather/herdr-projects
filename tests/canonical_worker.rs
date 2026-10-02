@@ -554,6 +554,12 @@ fn main() {
 fn an_operator_finishes_a_worker_that_never_submitted_and_the_result_lands_automatically() {
     let mut lab = Lab::new("unknown_usage='allow_with_warning'\n");
     lab.write_agent(EDITING_AGENT, &[]);
+    // The base holds a subtree the worker leaves untouched: the verifier needs
+    // it too, since it rebuilds the base and the candidate from staged objects.
+    fs::create_dir_all(lab.repo.join("docs/plan")).unwrap();
+    fs::write(lab.repo.join("docs/plan/00-readme.md"), "the plan\n").unwrap();
+    lab.git(&["add", "docs"]);
+    lab.git(&["commit", "-q", "-m", "plan"]);
     let (contract, base) = lab.install_work_contract("verify_then_integrate");
     let (_, attempt) = lab.reserve("Retained instructions");
     let worktree = lab.planned_worktree(&attempt);
