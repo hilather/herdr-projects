@@ -173,7 +173,7 @@ impl Lab {
     }
     fn cli(&self, args: &[&str]) -> Output {
         // Verification's disposable server socket lives under the temporary directory.
-        Command::new(BIN).env_clear().env("HOME", &self.home).env("PATH", "/usr/bin:/bin").env("HERDR_BIN_PATH", self.home.join("bin/herdr"))
+        Command::new(BIN).env_clear().env("HOME", &self.home).env("HERDR_PROJECTS_OWNER_HOME", &self.home).env("PATH", "/usr/bin:/bin").env("HERDR_BIN_PATH", self.home.join("bin/herdr"))
             .env("TMPDIR", std::env::var_os("TMPDIR").unwrap_or("/tmp".into()))
             .args(["--root", self.root.to_str().unwrap()]).args(args).output().unwrap()
     }
@@ -251,7 +251,7 @@ fn launch_run_refuses_loudly_at_the_first_failing_step_and_changes_nothing() {
     assert_eq!(herdr_projects::runtime::snapshot(&lab.project).unwrap(), before, "a refused run must not write");
     assert!(!lab.root.join(".herdr-run").exists(), "no Herdr server directory before the first step passes");
     // HERDR_BIN_PATH must name the verified Herdr by absolute path.
-    let out = Command::new(BIN).env_clear().env("HOME", &lab.home).env("PATH", "/usr/bin:/bin").env("HERDR_BIN_PATH", "herdr")
+    let out = Command::new(BIN).env_clear().env("HOME", &lab.home).env("HERDR_PROJECTS_OWNER_HOME", &lab.home).env("PATH", "/usr/bin:/bin").env("HERDR_BIN_PATH", "herdr")
         .args(["--root", lab.root.to_str().unwrap()]).args(lab.run_args("plan-codex", "codex-sol", "docs/plan-codex.md", prompt.to_str().unwrap())).output().unwrap();
     assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("HERDR_BIN_PATH"), "{}", String::from_utf8_lossy(&out.stderr));
 }

@@ -50,10 +50,23 @@ impl Fixture {
     fn with_handoff(mode: &str, handoff: impl FnOnce(&Path, &AttemptId)) -> Self {
         Self::with_native(mode, handoff, None)
     }
+    /// Declare a fixture owner home with no logins, once per test process: a
+    /// launch built by production code never looks for, binds or hides the
+    /// real owner's login or home (the fixture agent needs no login).
+    fn declare_owner_home() {
+        static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        HOME.get_or_init(|| {
+            let home = tempfile::tempdir().unwrap();
+            // SAFETY: set once, inside the initializer, before any launch reads it.
+            unsafe { std::env::set_var("HERDR_PROJECTS_OWNER_HOME", home.path()) };
+            home
+        });
+    }
     fn with_native(mode: &str, handoff: impl FnOnce(&Path, &AttemptId), native: Option<(&Path, &Path)>) -> Self {
         Self::with_project(mode,handoff,native,None,None)
     }
     fn with_project(mode: &str, handoff: impl FnOnce(&Path, &AttemptId), native: Option<(&Path, &Path)>,project_path:Option<&Path>,signer:Option<&Path>) -> Self {
+        Self::declare_owner_home();
         let live = native.is_some() && signer.is_some();
         let root = tempfile::tempdir().unwrap();
         let project = project_path.map(Path::to_owned).unwrap_or_else(||root.path().join("project"));

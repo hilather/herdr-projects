@@ -117,8 +117,10 @@ fn the_worker_shares_the_owners_single_login_file_and_nothing_else_of_the_agent_
     let base = Path::new(env!("CARGO_TARGET_TMPDIR"));
     fs::create_dir_all(base).unwrap();
     let world = world(base);
+    // The fixture owner home is declared explicitly: the real owner's home
+    // (passwd entry or HOME) is never consulted for logins or hidden paths.
     // SAFETY: this binary has one test and no other thread reads the environment.
-    unsafe { std::env::set_var("HOME", &world.owner) };
+    unsafe { std::env::set_var("HERDR_PROJECTS_OWNER_HOME", &world.owner) };
 
     // Codex: the login is the owner's file itself, written in place by the
     // worker; every other file under ~/.codex and ~/.claude, and the other

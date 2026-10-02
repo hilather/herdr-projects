@@ -254,12 +254,13 @@ pub fn screen_shows_model(kind: &str, model: &str, screen: &str) -> bool {
 }
 
 /// Where an owner login lives for `kind`: `override_path` (absolute, from the
-/// pinned owner configuration), or the first owner home holding the file.
+/// pinned owner configuration), or the first owner home holding the file; no
+/// source when none exists.
 pub fn login_source(kind: &str, owner_homes: &[String], override_path: Option<&Path>) -> Option<PathBuf> {
     if let Some(path) = override_path {
         return Some(path.to_owned());
     }
     let relative = login_file(kind)?;
     let candidates: Vec<PathBuf> = owner_homes.iter().map(|h| Path::new(h).join(relative)).collect();
-    candidates.iter().find(|p| p.is_file()).or(candidates.first()).cloned()
+    candidates.into_iter().find(|p| p.is_file())
 }

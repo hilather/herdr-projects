@@ -505,8 +505,14 @@ fn executable_dependencies(executable: &Path) -> Vec<std::path::PathBuf> {
 }
 
 /// The owner's home directories: the account's passwd entry and, when it
-/// differs, the controller's `HOME`. Both are hidden-secret anchors.
+/// differs, the controller's `HOME`. Both are hidden-secret anchors and the
+/// places an owner login is looked up. `HERDR_PROJECTS_OWNER_HOME` (absolute)
+/// replaces both: the end-to-end suites declare a fixture owner home with it,
+/// so no test ever reads, binds or hides the real owner's home.
 fn owner_homes() -> Result<Vec<String>> {
+    if let Some(home) = std::env::var_os("HERDR_PROJECTS_OWNER_HOME") {
+        return Ok(vec![normal(Path::new(&home))?]);
+    }
     let mut homes = Vec::new();
     let mut buffer = vec![0u8; 16384];
     let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
