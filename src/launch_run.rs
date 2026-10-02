@@ -119,21 +119,26 @@ fn planning_contract(args: &Args, repository: &Path, head: u64, kind: &str, proj
 }
 
 /// Record current observations and make the project active, unless it already
-/// is and needs no reconciliation (or `force` after a new binding).
+/// is, needs no reconciliation and acknowledges the owner configuration as it is
+/// now (or `force` after a new binding). A configuration edited since control
+/// was last made active is re-acknowledged: the signed contract, approvals and
+/// reservations all require the active control to carry the current digest.
 fn activate(run: &mut Run, name: &'static str, force: bool) -> Result<()> {
     let project = run.project.clone();
+    let config = std::path::absolute(run.ctx.config_dir.join("config.toml"))?;
+    let current = migration::config_reference(&config)?.digest;
     let control = runtime::snapshot(&project)?.control.context("project has no control state")?;
-    if !force && control.state == ProjectState::Active && !control.reconciliation_required {
+    if !force && control.state == ProjectState::Active && !control.reconciliation_required && control.config_digest == current {
         run.skipped(name, json!({"state":"active"}));
         return Ok(());
     }
+    let reacknowledged = control.state == ProjectState::Active && control.config_digest != current;
     crate::reconcile_live::run(run.ctx, &project, true)?;
     let control = runtime::snapshot(&project)?.control.context("project has no control state")?;
-    if control.state != ProjectState::Active {
-        let config = std::path::absolute(run.ctx.config_dir.join("config.toml"))?;
+    if control.state != ProjectState::Active || control.config_digest != current {
         runtime::set_state(&project, run.head()?, control.revision, ProjectState::Active, &config)?;
     }
-    run.done(name, json!({"state":"active"}));
+    run.done(name, json!({"state":"active","owner_configuration_reacknowledged":reacknowledged}));
     Ok(())
 }
 

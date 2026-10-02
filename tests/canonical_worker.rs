@@ -458,6 +458,26 @@ fn a_brief_the_agent_never_accepts_is_left_ambiguous_not_confirmed() {
     assert_eq!(lab.count("agent.prompt"), 3);
 }
 
+/// The permission mode is the profile's, set on every launch: a stale mode an
+/// earlier run left in the execution home (Claude's `auto`) is replaced, other
+/// settings stay.
+#[test]
+fn launch_sets_the_intended_permission_mode_over_a_stale_one_in_the_home() {
+    let mut lab = Lab::new("unknown_usage='allow_with_warning'");
+    lab.reserve("Retained instructions");
+    let settings = lab.path("agent-home/.claude/settings.json");
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    fs::write(&settings, r#"{"permissions":{"defaultMode":"auto"},"env":{"DISABLE_AUTOUPDATER":"0"},"owner_extra":"kept"}"#).unwrap();
+    lab.serve();
+    let mut ticker = lab.spawn();
+    lab.wait(&mut ticker, 60, &|| lab.count("workspace.create_command") == 1);
+    lab.stop(ticker);
+    let written: Value = serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(written["permissions"]["defaultMode"], "acceptEdits", "{written}");
+    assert_eq!(written["env"]["DISABLE_AUTOUPDATER"], "1", "{written}");
+    assert_eq!(written["owner_extra"], "kept", "{written}");
+}
+
 #[test]
 fn ticker_recovers_a_lost_creation_reply_without_creating_again() {
     let mut lab = Lab::new("unknown_usage='allow_with_warning'");

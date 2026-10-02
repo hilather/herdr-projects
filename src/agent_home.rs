@@ -1,7 +1,7 @@
 //! Execution-home preparation for supported canonical worker kinds (Codex and
 //! Claude Code). It writes the agent's own configuration inside the isolated
 //! execution home: the pinned model and reasoning effort, a permission mode
-//! suited to the worker sandbox, trust for exact working directories, and a
+//! suited to the worker sandbox (set on every launch), trust for exact working directories, and a
 //! quiet startup. It never copies a login; the sandbox binds the owner's single
 //! login file into the home (see `worker_supervision::Isolation::with_login`).
 //! Profiles stay free of passthrough arguments: model and effort reach the
@@ -139,8 +139,9 @@ fn trusted_paths(paths: &[&Path]) -> Result<Vec<String>> {
 }
 
 /// Prepare `home` for `kind`: pin `model`/`effort` (when given), set the
-/// sandbox-suited permission defaults (only where the owner has not set them
-/// in this home), trust exactly `trusted` (absolute directories) and, for
+/// sandbox-suited permission mode and the other keys this product owns
+/// (every time, replacing what an earlier run or the agent itself left in the
+/// home; only the owner's pinned profile decides them), trust exactly `trusted` (absolute directories) and, for
 /// Claude Code (whose edit tools stop at the working directory; Codex gets
 /// the same list as a launch argument), name the extra `writable` directories
 /// the worker sandbox already makes writable. Safe to repeat; unrelated settings in the home's configuration are preserved.
@@ -168,10 +169,12 @@ fn prepare_codex(home: &Path, pins: &Pins, trusted: &[String]) -> Result<()> {
         Some(text) => toml::from_str(&text).map_err(|_| anyhow::anyhow!("invalid Codex configuration (contents withheld)"))?,
         None => toml::Table::new(),
     };
+    // Set on every launch: a value left in the home by an earlier run must not
+    // widen what the worker may do.
     for (key, value) in [("approval_policy", "never"), ("sandbox_mode", "workspace-write")] {
-        table.entry(key).or_insert_with(|| value.into());
+        table.insert(key.into(), value.into());
     }
-    table.entry("check_for_update_on_startup").or_insert(false.into());
+    table.insert("check_for_update_on_startup".into(), false.into());
     if let Some(model) = &pins.model {
         table.insert("model".into(), model.clone().into());
     }
@@ -180,7 +183,7 @@ fn prepare_codex(home: &Path, pins: &Pins, trusted: &[String]) -> Result<()> {
     }
     let workspace = table.entry("sandbox_workspace_write").or_insert_with(|| toml::Table::new().into());
     let workspace = workspace.as_table_mut().context("invalid Codex sandbox_workspace_write table")?;
-    workspace.entry("network_access").or_insert(false.into());
+    workspace.insert("network_access".into(), false.into());
     let projects = table.entry("projects").or_insert_with(|| toml::Table::new().into());
     let projects = projects.as_table_mut().context("invalid Codex projects table")?;
     for directory in trusted {
@@ -214,7 +217,7 @@ fn prepare_claude(home: &Path, pins: &Pins, trusted: &[String], writable: &[Stri
     }
     let permissions = settings.entry("permissions").or_insert_with(|| json!({}));
     let permissions = permissions.as_object_mut().context("invalid Claude permissions")?;
-    permissions.entry("defaultMode").or_insert_with(|| json!("acceptEdits"));
+    permissions.insert("defaultMode".into(), json!("acceptEdits"));
     let allow = permissions.entry("allow").or_insert_with(|| json!([]));
     let allow = allow.as_array_mut().context("invalid Claude permission allow list")?;
     for tool in CLAUDE_ALLOW {
@@ -231,13 +234,13 @@ fn prepare_claude(home: &Path, pins: &Pins, trusted: &[String], writable: &[Stri
         }
     }
     let env = settings.entry("env").or_insert_with(|| json!({}));
-    env.as_object_mut().context("invalid Claude env")?.entry("DISABLE_AUTOUPDATER").or_insert_with(|| json!("1"));
+    env.as_object_mut().context("invalid Claude env")?.insert("DISABLE_AUTOUPDATER".into(), json!("1"));
     write_config(&path, (serde_json::to_string_pretty(&Value::Object(settings))? + "\n").as_bytes())?;
 
     // Onboarding and per-directory trust live beside the directory, not in it.
     let state_path = home.join(".claude.json");
     let mut state = json_object(read_config(&state_path)?)?;
-    state.entry("hasCompletedOnboarding").or_insert_with(|| json!(true));
+    state.insert("hasCompletedOnboarding".into(), json!(true));
     state.entry("theme").or_insert_with(|| json!("dark"));
     let projects = state.entry("projects").or_insert_with(|| json!({}));
     let projects = projects.as_object_mut().context("invalid Claude projects")?;

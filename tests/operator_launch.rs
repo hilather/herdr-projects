@@ -468,6 +468,47 @@ fn a_claude_profile_without_a_setup_token_file_is_refused_by_verification_and_la
     assert!(error.contains("claude_token_file"), "{error}");
 }
 
+/// The owner edits the configuration after the project was made active: the next
+/// `launch run` must re-acknowledge it (not report `project_control` as already
+/// done and then fail at the contract with "owner configuration is not
+/// acknowledged by project control").
+#[test]
+fn launch_run_reacknowledges_an_owner_configuration_edited_since_control_was_activated() {
+    let lab = Lab::with_herdr(STATIC_HERDR);
+    let prompt = lab.home.join("prompt.txt");
+    fs::write(&prompt, "Plan the next milestone of the tactics game.").unwrap();
+    let prepare = |lab: &Lab, task: &str| {
+        let socket = lab.socket_inode_once(&format!("{task}.sock"));
+        let mut args: Vec<String> = lab.run_args(task, "codex-sol", &format!("docs/{task}.md"), prompt.to_str().unwrap()).into_iter().map(str::to_owned).collect();
+        args.extend(["--herdr-socket".into(), socket.display().to_string(), "--prepare-only".into()]);
+        lab.ok(&args.iter().map(String::as_str).collect::<Vec<_>>())
+    };
+    let step = |report: &Value, name: &str| report["steps"].as_array().unwrap().iter().find(|s| s["step"] == name).cloned().unwrap();
+    let acknowledged = |lab: &Lab| herdr_projects::runtime::snapshot(&lab.project).unwrap().control.unwrap().config_digest;
+    lab.plant_launchable("codex-sol", "codex", "gpt-6.1-sol");
+    let first = prepare(&lab, "plan-one");
+    assert_eq!(step(&first, "project_control")["outcome"], "done", "{first}");
+    let before = acknowledged(&lab);
+    assert!(before.is_some());
+
+    // The owner edits the configuration; the profile is prepared against the new bytes.
+    let config = lab.home.join(".config/herdr-projects/config.toml");
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str("\n# edited by the owner after the project was activated\n");
+    fs::write(&config, text).unwrap();
+    lab.plant_launchable("codex-sol", "codex", "gpt-6.1-sol");
+    let second = prepare(&lab, "plan-two");
+    let control = step(&second, "project_control");
+    assert_eq!((control["outcome"].as_str(), control["detail"]["owner_configuration_reacknowledged"].as_bool()), (Some("done"), Some(true)), "{second}");
+    assert_eq!(step(&second, "contract")["outcome"], "done", "{second}");
+    let after = acknowledged(&lab);
+    assert_ne!(after, before, "control acknowledges the edited configuration");
+    assert_eq!(after, herdr_projects::migration::config_reference(&config).unwrap().digest);
+    // Repeating changes nothing: the configuration is acknowledged now.
+    let again = prepare(&lab, "plan-two");
+    assert_eq!(step(&again, "project_control")["outcome"], "already_done", "{again}");
+}
+
 /// A control socket that could not be bound is refused before any server
 /// starts, naming the path and its length, never as a vague "server exited".
 #[test]
