@@ -31,7 +31,7 @@ while True:
  if os.path.exists(os.path.join(root,'changed-terminal')):pane['terminal_id']='replacement-terminal'
  kind=open(os.path.join(root,'agent-kind')).read() if os.path.exists(os.path.join(root,'agent-kind')) else 'claude'
  status=open(os.path.join(root,'agent-status')).read() if os.path.exists(os.path.join(root,'agent-status')) else 'idle'
- if s.get('accepted'):status='working'
+ if s.get('accepted') and not os.path.exists(os.path.join(root,'agent-status')):status='working'
  agent=dict(pane,agent=kind,interactive_ready=True,agent_status=status,**({'name':s['name']} if 'name' in s else {}))
  res=None
  if m=='ping':
@@ -540,6 +540,7 @@ fn an_operator_finishes_a_worker_that_never_submitted_and_the_result_lands_autom
     let (_, attempt) = lab.reserve("Retained instructions");
     let worktree = lab.planned_worktree(&attempt);
     let repository = lab.repo.canonicalize().unwrap().display().to_string();
+    lab.git(&["branch", "integration"]);
     lab.ok(&["result", "demo", "configure-integration", "--repository", &repository, "--reference", "refs/heads/integration"]);
     lab.ok(&["result", "demo", "auto", "--verify", "on", "--integrate", "on", "--expected-head", &lab.head().to_string()]);
     lab.serve();
@@ -2095,7 +2096,7 @@ fn canonical_attempt_sidebar_uses_collected_usage_and_observed_waiting() {
         .and_then(|t| t.strip_prefix("codex ● ")).is_some_and(|w| !w.is_empty() && w.ends_with(['s', 'm'])));
     let mut ticker = lab.spawn();
     lab.wait(&mut ticker, 150, &waiting);
-    fs::write(lab.path("lab/agent-status"), "idle").unwrap();
+    fs::remove_file(lab.path("lab/agent-status")).unwrap();
     assert_eq!((lab.count("workspace.create_command"), lab.count("agent.prompt")), (1, 1));
     // Collector revocation keeps historical counters but clears the decoration
     // while the worker and its runtime ownership remain live.

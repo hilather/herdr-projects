@@ -43,7 +43,7 @@ def serve(path):
   kind=s.get('kind','claude')
   screen={'codex':'model: gpt-6.1-sol low   /model to change','claude':'Sonnet 5.5 · Claude Max'}[kind]
   pane={'pane_id':'w1:p1','workspace_id':'w1','tab_id':'w1:t1','terminal_id':'term1','cwd':s.get('cwd')}
-  agent=dict(pane,agent=kind,interactive_ready=True,agent_status='idle',**({'name':s['name']} if 'name' in s else {}))
+  agent=dict(pane,agent=kind,interactive_ready=True,agent_status='working' if s.get('accepted') else 'idle',**({'name':s['name']} if 'name' in s else {}))
   res=None
   if m=='ping':res={'type':'pong','version':'0.9.1','capabilities':{'workspace_create_command':True}}
   elif m=='workspace.create_command' and not live:
@@ -62,7 +62,7 @@ def serve(path):
   elif m=='agent.explain':res={'type':'agent_explain','explain':{'agent':kind,'state':'idle','manifest_source':'bundled','manifest_version':'2026.09.14.1',
    'matched_rule':{'id':'prompt','state':'idle'},'visible_idle':True,'visible_blocker':False,'visible_working':False,'screen_detection_skipped':False,
    'skip_state_update':False,'local_override_shadowing_remote':False,'fallback_reason':None,'warning':None}}
-  elif m=='agent.prompt':res={'type':'agent_prompted','agent':agent}
+  elif m=='agent.prompt':s['accepted']=True;res={'type':'agent_prompted','agent':agent}
   if res is not None:f.write(json.dumps({'id':r['id'],'result':res})+'\n');f.flush()
   c.close()
 if args==['server']:serve(os.environ['HERDR_SOCKET_PATH']);sys.exit(0)
