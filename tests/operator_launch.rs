@@ -106,6 +106,7 @@ struct Lab {
     project: PathBuf,
     repo: PathBuf,
     key: PathBuf,
+    extra_env: Vec<(String, PathBuf)>,
 }
 
 impl Lab {
@@ -138,7 +139,7 @@ impl Lab {
             "[authority]\nversion=1\nrevision=1\napproval_public_key={public:?}\n\
 [profiles.codex-sol]\nkind='codex'\npermission_policy='interactive'\nmodel='gpt-6.1-sol'\nreasoning_effort='low'\n[profiles.codex-sol.budget]\n{budget}\
 [profiles.claude-sonnet]\nkind='claude'\npermission_policy='interactive'\nmodel='claude-sonnet-5-5'\nreasoning_effort='low'\n[profiles.claude-sonnet.budget]\n{budget}")).unwrap();
-        let lab = Lab { root: home.join("root"), project: home.join("root/demo"), repo: home.join("repo"), home, key, _top: top };
+        let lab = Lab { root: home.join("root"), project: home.join("root/demo"), repo: home.join("repo"), home, key, _top: top, extra_env: Vec::new() };
         for command in ["new", "pause"] {
             lab.ok(&[command, "demo"]);
         }
@@ -175,6 +176,7 @@ impl Lab {
         // Verification's disposable server socket lives under the temporary directory.
         Command::new(BIN).env_clear().env("HOME", &self.home).env("HERDR_PROJECTS_OWNER_HOME", &self.home).env("PATH", "/usr/bin:/bin").env("HERDR_BIN_PATH", self.home.join("bin/herdr"))
             .env("TMPDIR", std::env::var_os("TMPDIR").unwrap_or("/tmp".into()))
+            .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_path())))
             .args(["--root", self.root.to_str().unwrap()]).args(args).output().unwrap()
     }
     fn ok(&self, args: &[&str]) -> Value {
@@ -355,6 +357,22 @@ fn launch_run_reserves_a_planning_task_for_each_kind_and_reruns_safely() {
     let after = herdr_projects::runtime::snapshot(&lab.project).unwrap();
     assert_eq!(after.control.as_ref().unwrap().state, ProjectState::Active, "the project must stay active");
     assert_eq!(after.runtime_bindings.len(), before.runtime_bindings.len(), "no binding was created");
+}
+
+/// A control socket that could not be bound is refused before any server
+/// starts, naming the path and its length, never as a vague "server exited".
+#[test]
+fn verify_interaction_refuses_a_too_long_socket_path_naming_path_and_length() {
+    let mut lab = Lab::new();
+    let long = lab.home.join("a-runtime-directory-name-that-is-deliberately-far-too-long-for-a-unix-socket-path-to-fit-in-sun-path");
+    fs::create_dir(&long).unwrap();
+    fs::set_permissions(&long, fs::Permissions::from_mode(0o700)).unwrap();
+    lab.extra_env.push(("XDG_RUNTIME_DIR".into(), long.clone()));
+    let (herdr, agent, home) = (lab.home.join("bin/herdr"), lab.home.join("bin/codex"), lab.home.join("agent-home-codex"));
+    let error = lab.fail(&["profile", "verify-interaction", "demo", "codex-sol", "--herdr-executable", herdr.to_str().unwrap(),
+        "--agent-executable", agent.to_str().unwrap(), "--execution-home", home.to_str().unwrap(), "--retain"]);
+    assert!(error.contains("Unix socket path") && error.contains(long.to_str().unwrap()) && error.contains("bytes; the limit is 107"), "{error}");
+    assert!(fs::read_dir(&long).unwrap().next().is_none(), "no socket directory is left behind");
 }
 
 /// socket: the same operator sequence after real `verify-interaction`, with a

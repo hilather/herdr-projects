@@ -66,6 +66,9 @@ pub mod canonical_worker;
 
 pub mod profile_config;
 
+#[cfg(target_os = "linux")]
+pub mod short_socket;
+
 #[cfg(feature = "state-store")]
 pub mod profile_preparation;
 

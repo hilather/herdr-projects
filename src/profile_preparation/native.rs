@@ -112,6 +112,8 @@ pub struct PinEvidence {
 
 pub(super) struct Lab {
     pub(super) root: PathBuf,
+    /// Short private directory holding only the control socket.
+    socket_dir: PathBuf,
     server: Option<Child>,
     worker: Option<SupervisorIdentity>,
 }
@@ -123,8 +125,16 @@ impl Lab {
             .canonicalize()?
             .join(format!("hp-native-{}", digest(&bytes)));
         fs::DirBuilder::new().mode(0o700).create(&root)?;
+        let socket_dir = match crate::short_socket::fresh() {
+            Ok(dir) => dir,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                return Err(error);
+            }
+        };
         let lab = Self {
             root,
+            socket_dir,
             server: None,
             worker: None,
         };
@@ -172,6 +182,7 @@ impl Drop for Lab {
             }
         }
         let _ = fs::remove_dir_all(&self.root);
+        let _ = fs::remove_dir_all(&self.socket_dir);
     }
 }
 
@@ -356,7 +367,8 @@ pub(super) fn verify(
         "native verification requires empty extra_args until argument mappings are verified"
     );
     crate::supervision::trusted_helpers()?;
-    let socket = lab.root.join("native.sock");
+    let socket = lab.socket_dir.join("s");
+    crate::short_socket::check_length(&socket)?;
     let binary = executable(Path::new(&profile.herdr.path), deadline, &cancellation)?;
     ensure!(
         binary.1 == profile.herdr.digest,

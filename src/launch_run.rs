@@ -148,7 +148,10 @@ fn herdr_server(run: &mut Run, herdr: &Path, task: &str, existing: Option<&Path>
     for part in ["", "home", "runtime"] {
         fs::DirBuilder::new().recursive(true).mode(0o700).create(directory.join(part))?;
     }
-    let socket = directory.join("herdr.sock");
+    // The socket lives in a short private directory (sun_path is 108 bytes);
+    // logs and configuration stay beside the run.
+    let socket = herdr_projects::short_socket::stable(&directory)?.join("s");
+    herdr_projects::short_socket::check_length(&socket)?;
     if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
         run.skipped("herdr_server", json!({"socket":socket}));
         return Ok(socket);
