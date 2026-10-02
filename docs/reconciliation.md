@@ -72,7 +72,8 @@ control without dual-writing legacy status. Inspect provides the control revisio
 and epoch. Restore an archived project to paused before requesting active.
 
 Admission requires ownership of recorded local resources, no unfinished delivery,
-and fresh matching observations for every binding. Retained attempts and running
+and fresh matching observations for bindings without proven terminal task history
+(see relaunch below). Retained attempts and running
 tasks block admission unless they exactly match a live adopted ownership claim.
 Unowned resources and remote resources continue to block admission. Observations must be at most 30 seconds
 old and match the current config fingerprint. Active control pins that fingerprint;
@@ -195,3 +196,21 @@ so pause/archive and new work remain available while ticker leadership is held.
 Stop the ticker before migration, restore or upgrade maintenance. Automatic external
 observation probes share a 15-second deadline; exhausted collections are not
 persisted. Adapter failures are logged separately from observed reachability.
+
+## Relaunch after proven termination
+
+Admission exempts a task binding from fresh resource evidence only when the task
+has no active attempt and is not running, has at least one recorded attempt, and
+all its attempts are terminal with termination observed (none retains capacity).
+Dedicated servers and panes may then be gone without preventing owner config
+re-acknowledgment at `launch PROJECT run` step 2. Unused bindings, coordinators,
+and any unobserved worker still require current ownership and fresh evidence.
+A failed state alone, pane absence, or a stopped server never proves termination.
+
+Relaunch pauses control, audits relinquishment of any remaining old claim, and
+rebinds the task to the new local session route before drafting. The
+`runtime.finished_route_reset` event retains the complete previous binding identity. The old worktree
+registration and files remain evidence; attempt launch inputs retain its identity.
+The new attempt uses its own worktree path and branch. This resets a finished
+binding rather than adopting its old pane or reusing its old worktree. No schema
+or retention classification changes are needed.

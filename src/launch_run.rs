@@ -7,7 +7,7 @@
 use crate::paths::Ctx;
 use anyhow::{Context, Result, bail, ensure};
 use herdr_projects::{
-    authority, domain::{ProjectState, RuntimeRoute, TaskId, VersionedReference}, execution_guard::GatedSpawn,
+    authority, domain::{AttemptState, ProjectState, RuntimeRoute, TaskId, VersionedReference}, execution_guard::GatedSpawn,
     launch_preparation::{self, LaunchSelection}, migration, runtime,
 };
 use serde_json::{Value, json};
@@ -303,7 +303,7 @@ fn steps(run: &mut Run, args: &Args) -> Result<Value> {
     // 4. Capacity, queue and the integration target.
     let snapshot = runtime::snapshot(&project)?;
     let scheduler = snapshot.scheduler.as_ref().context("project has no scheduler state: migrate it first")?;
-    if snapshot.scheduler.as_ref().is_some_and(|s| s.queue.iter().any(|q| q.task == task_id)) {
+    if snapshot.scheduler.as_ref().is_some_and(|s| s.queue.iter().any(|q| q.task == task_id) && snapshot.tasks.iter().any(|t| t.id == task_id && (t.state == herdr_projects::domain::TaskState::Queued || t.active_attempt.is_some()))) {
         run.skipped("queue", json!({"task":args.task}));
     } else {
         let task = snapshot.tasks.iter().find(|t| t.id == task_id).context("task missing")?;
@@ -326,6 +326,22 @@ fn steps(run: &mut Run, args: &Args) -> Result<Value> {
 
     // 5. Herdr server, binding, reconciliation and activation.
     let socket = herdr_server(run, &herdr, &args.task, args.herdr_socket.as_deref())?;
+    let snapshot = runtime::snapshot(&project)?;
+    if let Some(old) = snapshot.runtime_bindings.iter().find(|b| b.task.as_ref() == Some(&task_id)) {
+        let history: Vec<_> = snapshot.attempts.iter().filter(|a| a.task == task_id).collect();
+        if !history.is_empty() && history.iter().all(|a| !a.retains_capacity()
+            && matches!(a.state, AttemptState::Completed | AttemptState::Failed | AttemptState::Cancelled | AttemptState::Lost))
+            && (!old.identity.pane_id.is_empty() || !old.identity.worktree_path.is_empty() || old.identity.socket != socket.display().to_string()) {
+            let control = snapshot.control.as_ref().context("project has no control state")?;
+            runtime::set_state(&project, run.head()?, control.revision, ProjectState::Paused,
+                &run.ctx.config_dir.join("config.toml"))?;
+            if let Some(owned) = snapshot.ownership.iter().find(|o| o.binding == old.id) {
+                runtime::relinquish(&project, &old.id, owned.revision, run.head()?, "relaunch after observed worker termination; retain old worktree")?;
+            }
+            let route = RuntimeRoute { socket: socket.display().to_string(), cwd: repository.display().to_string(), ..Default::default() };
+            runtime::rebind(&project, &old.id, old.revision, run.head()?, &route)?;
+        }
+    }
     let snapshot = runtime::snapshot(&project)?;
     let existing = snapshot.runtime_bindings.iter().find(|b| b.task.as_ref() == Some(&task_id) && b.identity.socket == socket.display().to_string());
     let (binding, created) = match existing {

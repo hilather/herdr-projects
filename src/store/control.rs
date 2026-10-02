@@ -43,6 +43,15 @@ fn blockers(db:&Connection,now:i64,config:Option<&str>)->Result<Vec<String>> {
     for binding in super::runtime::read_all(db)? {
         let task=binding.task.as_ref().and_then(|id|tasks.iter().find(|t|&t.id==id));
         let task_revision=task.map(|t|t.revision);
+        // Proven terminal task history is evidence of worker quiescence even
+        // after the dedicated session has been stopped. Never exempt an unused
+        // binding or any task with unresolved execution.
+        if task.is_some_and(|t|t.active_attempt.is_none()&&t.state!=TaskState::Running)
+            && attempts.iter().any(|a|binding.task.as_ref()==Some(&a.task))
+            && attempts.iter().filter(|a|binding.task.as_ref()==Some(&a.task)).all(|a|
+                !a.retains_capacity()&&matches!(a.state,AttemptState::Completed|AttemptState::Failed|AttemptState::Cancelled|AttemptState::Lost)) {
+            continue;
+        }
         if !binding.identity.pane_id.is_empty()||!binding.identity.worktree_path.is_empty()||!binding.identity.machine.is_empty() {
             let observed=observations.iter().find(|o|super::ownership::observed(&binding,task_revision,o,now,config));
             let owned=ownership.iter().find(|owned|owned.binding==binding.id);
@@ -74,7 +83,7 @@ impl SqliteStore {
         let tx=self.connection.transaction()?;schema(&tx)?;let report=AdmissionReport{head:head(&tx)?,blockers:blockers(&tx,now,config)?};tx.commit()?;Ok(report)
     }
     /// Lifecycle changes are atomic with their audit and fence epoch. Resume is
-    /// supported only with fresh evidence for every existing resource/attempt.
+    /// supported with fresh resource evidence or proven terminal task history.
     pub fn set_project_state(&mut self,expected_head:u64,expected_revision:u64,state:ProjectState,now:i64,config:Option<&str>)->Result<ControlChange> {
         let tx=self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;schema(&tx)?;
         if head(&tx)?!=expected_head{return Err(StoreError::Conflict);}

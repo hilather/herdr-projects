@@ -125,17 +125,30 @@ impl SqliteStore {
             let unresolved:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM attempts WHERE task_id=?1 AND termination_observed=0)",[task.id.as_str()],|r|r.get(0))?;
             if unresolved{return Err(StoreError::Invalid("reconcile every retained attempt before rebinding".into()));}
         }
-        if RuntimeRoute::from_identity(&binding.identity)==*route {
+        if RuntimeRoute::from_identity(&binding.identity)==*route
+            && (binding.identity.worktree_path.is_empty()||!route.pane_id.is_empty()) {
             return Ok(RouteChange{head:expected_head,binding,task_revision:task.map(|t|t.revision)});
         }
         if schema>=9&&tx.query_row("SELECT EXISTS(SELECT 1 FROM runtime_ownership WHERE binding_id=?1)",[id],|r|r.get::<_,bool>(0))? {return Err(StoreError::Invalid("relinquish owned resources before rebinding; existing references are retained".into()));}
         if !route.pane_id.is_empty() && bindings.iter().any(|other|other.id!=id && other.identity.socket==route.socket && other.identity.machine==route.machine && other.identity.pane_id==route.pane_id) {
             return Err(StoreError::Invalid("pane already referenced by another binding in this project".into()));
         }
+        let attempts=read_attempts(&tx)?;
+        let reset_finished=route.machine.is_empty()&&route.pane_id.is_empty()&&route.tab_id.is_empty()
+            && task.as_ref().is_some_and(|t|attempts.iter().any(|a|a.task==t.id)
+                && attempts.iter().filter(|a|a.task==t.id).all(|a|!a.retains_capacity()
+                    && matches!(a.state,AttemptState::Completed|AttemptState::Failed|AttemptState::Cancelled|AttemptState::Lost)));
+        if reset_finished {
+            tx.execute("INSERT INTO events(kind,entity,revision,payload_version,payload) VALUES('runtime.finished_route_reset',?1,?2,1,?3)",
+                params![id,integer(binding.revision)?,serde_json::to_string(&binding).map_err(|e|StoreError::Invalid(e.to_string()))?])?;
+        }
         binding.revision=binding.revision.checked_add(1).ok_or_else(||StoreError::Invalid("binding revision exhausted".into()))?;
         binding.verification=RuntimeVerification::Unverified;
         let identity=&mut binding.identity;
         identity.machine=route.machine.clone();identity.socket=route.socket.clone();identity.workspace_id=route.workspace_id.clone();identity.tab_id=route.tab_id.clone();identity.pane_id=route.pane_id.clone();identity.cwd=route.cwd.clone();identity.execution_fingerprint=None;
+        if reset_finished {
+            identity.worktree_path.clear();identity.branch.clear();identity.repo.clear();
+        }
         let payload=serde_json::to_string(&binding).map_err(|e|StoreError::Invalid(e.to_string()))?;
         tx.execute("UPDATE runtime_bindings SET revision=?2,payload=?3,payload_hash=?4 WHERE id=?1",params![id,integer(binding.revision)?,payload,format!("{:x}",Sha256::digest(payload.as_bytes()))])?;
         tx.execute("DELETE FROM runtime_observations WHERE binding_id=?1",[id])?;

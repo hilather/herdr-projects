@@ -545,6 +545,79 @@ fn launch_run_reacknowledges_an_owner_configuration_edited_since_control_was_act
     assert_eq!(step(&again, "project_control")["outcome"], "already_done", "{again}");
 }
 
+/// socket: budget termination permits owner re-acknowledgment and a new attempt,
+/// while an unobserved live worker still fences step 2.
+#[test]
+fn launch_run_retries_after_termination_but_refuses_an_unobserved_live_worker() {
+    struct FixtureTicker(std::process::Child);
+    impl Drop for FixtureTicker {
+        fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+    }
+    let lab = Lab::new();
+    let config = lab.home.join(".config/herdr-projects/config.toml");
+    let text = fs::read_to_string(&config).unwrap().replace("max_wall_seconds=600", "max_wall_seconds=15");
+    fs::write(&config, text).unwrap();
+    lab.verify("codex-sol", "codex");
+    let prompt = lab.home.join("prompt.txt");
+    fs::write(&prompt, "Plan the next milestone.").unwrap();
+    let args = lab.run_args("plan-retry", "codex-sol", "docs/retry.md", prompt.to_str().unwrap());
+    let first = lab.ok(&args);
+    let attempt = first["attempt"].as_str().unwrap();
+    let mut ticker = FixtureTicker(Command::new(BIN).env_clear().env("HOME", &lab.home)
+        .env("HERDR_PROJECTS_OWNER_HOME", &lab.home).env("PATH", "/usr/bin:/bin")
+        .env("HERDR_BIN_PATH", lab.home.join("bin/herdr"))
+        .env("XDG_RUNTIME_DIR", lab.runtime.path())
+        .args(["--root", lab.root.to_str().unwrap(), "ticker", "run"])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap());
+    let wait = |done: &dyn Fn() -> bool| {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !done() {
+            assert!(std::time::Instant::now() < until, "ticker workflow timed out");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    };
+    wait(&|| herdr_projects::runtime::snapshot(&lab.project).is_ok_and(|s|
+        s.attempts.iter().any(|a| a.id.as_str() == attempt && a.state == AttemptState::Running)));
+    // Stop only this fixture's ticker: the worker remains alive and its old
+    // observation cannot acknowledge edited owner configuration.
+    ticker.0.kill().unwrap();ticker.0.wait().unwrap();
+    let config = lab.home.join(".config/herdr-projects/config.toml");
+    let original = fs::read_to_string(&config).unwrap();
+    fs::write(&config, format!("{original}\n# owner edit\n")).unwrap();
+    lab.plant_launchable("codex-sol", "codex", "gpt-6.1-sol");
+    let error = lab.fail(&args);
+    assert!(error.contains("step 2") && error.contains("fresh resource identity evidence required"), "{error}");
+    // Return to the launch's authorized config so the controller can stop it.
+    fs::write(&config, &original).unwrap();
+    let mut ticker = FixtureTicker(Command::new(BIN).env_clear().env("HOME", &lab.home)
+        .env("HERDR_PROJECTS_OWNER_HOME", &lab.home).env("PATH", "/usr/bin:/bin")
+        .env("HERDR_BIN_PATH", lab.home.join("bin/herdr"))
+        .env("XDG_RUNTIME_DIR", lab.runtime.path())
+        .args(["--root", lab.root.to_str().unwrap(), "ticker", "run"])
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap());
+    wait(&|| herdr_projects::runtime::snapshot(&lab.project).is_ok_and(|s|
+        s.attempts.iter().any(|a| a.id.as_str() == attempt && a.termination_observed)));
+    ticker.0.kill().unwrap();ticker.0.wait().unwrap();
+    lab.ok(&["launch", "demo", "stop", "--task", "plan-retry"]);
+    let old_worktree = PathBuf::from(first["worktree"].as_str().unwrap());
+    assert!(old_worktree.is_dir());
+    let ended = herdr_projects::runtime::snapshot(&lab.project).unwrap();
+    assert_eq!(ended.attempts.iter().find(|a| a.id.as_str() == attempt).unwrap().state, AttemptState::Failed);
+    assert_eq!(ended.tasks.iter().find(|t| t.id.as_str() == "plan-retry").unwrap().state, TaskState::Blocked);
+    fs::write(&config, format!("{original}\n# owner edit after termination\n")).unwrap();
+    lab.plant_launchable("codex-sol", "codex", "gpt-6.1-sol");
+    let second = lab.ok(&args);
+    assert_ne!(second["attempt"], first["attempt"]);
+    assert_ne!(second["worktree"], first["worktree"]);
+    assert!(old_worktree.is_dir(), "old attempt worktree remains evidence");
+    let state = herdr_projects::runtime::snapshot(&lab.project).unwrap();
+    assert_eq!(state.attempts.len(), 2);
+    let binding = state.runtime_bindings.iter().find(|b| b.task.as_ref().is_some_and(|t| t.as_str() == "plan-retry")).unwrap();
+    assert!(binding.identity.pane_id.is_empty() && binding.identity.worktree_path.is_empty(), "reservation uses the reset binding");
+    assert!(state.attempts.iter().any(|a| a.id.as_str() == attempt && a.termination_observed));
+    assert_eq!(state.tasks.iter().find(|t| t.id.as_str() == "plan-retry").unwrap().active_attempt.as_ref().unwrap().as_str(), second["attempt"].as_str().unwrap());
+}
+
 /// A control socket that could not be bound is refused before any server
 /// starts, naming the path and its length, never as a vague "server exited".
 #[test]
